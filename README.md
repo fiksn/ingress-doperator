@@ -1,22 +1,23 @@
 # ingress-operator
-Ingress operator is a way to transition from `nginx-ingress` to `nginx-fabric` and use `Gateway` and `Httproute` resources instead of `Ingress`.
+Ingress operator is a way to transition from [ingress-nginx](https://github.com/kubernetes/ingress-nginx) to [nginx-gateway-fabric](https://github.com/nginx/nginx-gateway-fabric)
+and get started with the [Gateway API](https://gateway-api.sigs.k8s.io/guides/getting-started/).
 
-Check [Ingress2Gateway](https://github.com/kubernetes-sigs/ingress2gateway) out too.
-
-The difference is that this operator will transparently create new resources. Those can of course be retrieved from Kubernetes and put into source control
-so you can use this tool like Ingress2Gateway with an extra step.
-But the real benefit comes from changing the stuff over which you do not have direct control, for instance a
-new `Ingress` resource might be provisioned automatically and you cannot change that simply. At the same
-time you cannot run `nginx-ingress` controller anymore as most of the infrastructure is already migrated.
+It can transparently create `Gateway` and `Httproute` resources from `Ingress` (and possibly even delete the `Ingress` altogether afterwards).
 
 !!! Nginx ingress controller is [deprecated](https://kubernetes.io/blog/2025/11/11/ingress-nginx-retirement/) and
 will not get security updates after March 2026 !!!
 
-Additionally the operator enables a "shared mode" (unless you start it with `--one-gateway-per-ingress`) which means you do not need a new `Gateway` for each `Ingress` but
-can aggregate multiple vhosts in one thereby saving cluster resources. This way you just get one (or if you change `nginxproxies` crd also more)
-Nginx instance(s) which is consistent with previous `nginx-ingress` behaviour. Of course you get less isolation which depending on your case can also be bad for security.
+## Related tools
 
-Actually the tools support invoking Ingress2Gateway as a library as well which means you can benefit from all the optimizations there too.
+* [Ingress2Gateway](https://github.com/kubernetes-sigs/ingress2gateway) is a similar tool if you have control over your YAML files and want to update them.
+Unfortunately that is not always the case and an `Ingress` might be provisioned without your control. Ingress-operator includes the mentioned tool as a library
+so you can benefit from all translation quirks implemented there.
+
+However the tool is primarily meant for `ingress-nginx` audience and comes with a few opinionated but sane defaults.
+
+For instance operator enables a "shared mode" (unless you start it with `--one-gateway-per-ingress`) which means you do not need a new `Gateway` for each `Ingress` but
+can aggregate multiple vhosts in one thereby save cluster resources. This way you just get one (or if you change `nginxproxies` crd also more)
+Nginx instance(s) which is consistent with previous behaviour. Of course you get less isolation which depending on your case might also be bad for security.
 
 ## Build
 

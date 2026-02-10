@@ -96,7 +96,9 @@ func (t *Translator) translateWithIngress2Gateway(
 	scheme := runtime.NewScheme()
 	_ = networkingv1.AddToScheme(scheme)
 	_ = corev1.AddToScheme(scheme)
-	gatewayv1.Install(scheme)
+	if err := gatewayv1.Install(scheme); err != nil {
+		panic(fmt.Sprintf("failed to install Gateway API scheme: %v", err))
+	}
 
 	// Create a fake client with our Ingress and mock Services
 	// We need to create Service objects for the backends referenced by the Ingress
