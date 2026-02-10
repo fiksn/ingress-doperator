@@ -79,6 +79,7 @@ func main() {
 	var tlsOpts []func(*tls.Config)
 	var gatewayNamespace string
 	var gatewayName string
+	var gatewayClassName string
 	var watchNamespace string
 	var oneGatewayPerIngress bool
 	var gatewayAnnotationFilters string
@@ -96,6 +97,8 @@ func main() {
 		"The namespace where the Gateway resource will be created")
 	flag.StringVar(&gatewayName, "gateway-name", "ingress-gateway",
 		"The name of the Gateway resource (only used when one-gateway-per-ingress is false)")
+	flag.StringVar(&gatewayClassName, "gateway-class-name", "nginx",
+		"The GatewayClass to use for created Gateway resources")
 	flag.StringVar(&watchNamespace, "watch-namespace", "",
 		"If specified, only watch Ingresses in this namespace (default: watch all namespaces)")
 	flag.BoolVar(&oneGatewayPerIngress, "one-gateway-per-ingress", false,
@@ -125,6 +128,15 @@ func main() {
 	flag.StringVar(&httpRouteAnnotationFilters, "httproute-annotation-filters",
 		controller.DefaultHTTPRouteAnnotationFilters,
 		"Comma-separated list of annotation prefixes to exclude from HTTPRoute resources")
+	var useIngress2Gateway bool
+	var ingress2GatewayProvider string
+	var ingress2GatewayIngressClass string
+	flag.BoolVar(&useIngress2Gateway, "use-ingress2gateway", false,
+		"If true, use the ingress2gateway library for translation (disables hostname/certificate mangling)")
+	flag.StringVar(&ingress2GatewayProvider, "ingress2gateway-provider", "ingress-nginx",
+		"Provider to use with ingress2gateway (e.g., ingress-nginx, istio, kong)")
+	flag.StringVar(&ingress2GatewayIngressClass, "ingress2gateway-ingress-class", "nginx",
+		"Ingress class name for provider-specific filtering in ingress2gateway")
 	flag.StringVar(&metricsAddr, "metrics-bind-address", "0", "The address the metrics endpoint binds to. "+
 		"Use :8443 for HTTPS or :8080 for HTTP, or leave as 0 to disable the metrics service.")
 	flag.StringVar(&probeAddr, "health-probe-bind-address", ":8081", "The address the probe endpoint binds to.")
@@ -300,6 +312,7 @@ func main() {
 		Scheme:                           mgr.GetScheme(),
 		GatewayNamespace:                 gatewayNamespace,
 		GatewayName:                      gatewayName,
+		GatewayClassName:                 gatewayClassName,
 		WatchNamespace:                   watchNamespace,
 		OneGatewayPerIngress:             oneGatewayPerIngress,
 		EnableDeletion:                   enableDeletion,
@@ -313,6 +326,9 @@ func main() {
 		PrivateInfrastructureAnnotations: privateInfraAnnotations,
 		ApplyPrivateToAll:                private,
 		PrivateIngressClassPattern:       privateIngressClassPattern,
+		UseIngress2Gateway:               useIngress2Gateway,
+		Ingress2GatewayProvider:          ingress2GatewayProvider,
+		Ingress2GatewayIngressClass:      ingress2GatewayIngressClass,
 	}).SetupWithManager(mgr); err != nil {
 		setupLog.Error(err, "unable to create controller", "controller", "Ingress")
 		os.Exit(1)

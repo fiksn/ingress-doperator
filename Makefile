@@ -105,25 +105,37 @@ lint-config: golangci-lint ## Verify golangci-lint linter configuration
 ##@ Build
 
 .PHONY: build
-build: manifests generate fmt vet ## Build manager binary.
-	go build -o bin/manager cmd/main.go
+build: manifests generate fmt vet ## Build operator binary.
+	go build -o bin/operator cmd/operator/main.go
+
+.PHONY: build-webhook
+build-webhook: ## Build webhook binary.
+	go build -o bin/webhook cmd/webhook/main.go
 
 .PHONY: run
 run: manifests generate fmt vet ## Run a controller from your host.
-	go run ./cmd/main.go
+	go run ./cmd/operator/main.go
 
 # If you wish to build the manager image targeting other platforms you can use the --platform flag.
 # (i.e. docker build --platform linux/arm64). However, you must enable docker buildKit for it.
 # More info: https://docs.docker.com/develop/develop-images/build_enhancements/
 .PHONY: docker-build
-docker-build: ## Build docker image with the manager.
+docker-build: ## Build docker image with the operator.
 	$(CONTAINER_TOOL) build -t ${IMG} .
 
+.PHONY: docker-build-webhook
+docker-build-webhook: ## Build docker image with the webhook.
+	$(CONTAINER_TOOL) build -f Dockerfile.webhook -t ${IMG}-webhook .
+
 .PHONY: docker-push
-docker-push: ## Push docker image with the manager.
+docker-push: ## Push docker image with the operator.
 	$(CONTAINER_TOOL) push ${IMG}
 
-# PLATFORMS defines the target platforms for the manager image be built to provide support to multiple
+.PHONY: docker-push-webhook
+docker-push-webhook: ## Push docker image with the webhook.
+	$(CONTAINER_TOOL) push ${IMG}-webhook
+
+# PLATFORMS defines the target platforms for the operator image be built to provide support to multiple
 # architectures. (i.e. make docker-buildx IMG=myregistry/mypoperator:0.0.1). To use this option you need to:
 # - be able to use docker buildx. More info: https://docs.docker.com/build/buildx/
 # - have enabled BuildKit. More info: https://docs.docker.com/develop/develop-images/build_enhancements/
@@ -131,7 +143,7 @@ docker-push: ## Push docker image with the manager.
 # To adequately provide solutions that are compatible with multiple platforms, you should consider using this option.
 PLATFORMS ?= linux/arm64,linux/amd64,linux/s390x,linux/ppc64le
 .PHONY: docker-buildx
-docker-buildx: ## Build and push docker image for the manager for cross-platform support
+docker-buildx: ## Build and push docker image for the operator for cross-platform support
 	# copy existing Dockerfile and insert --platform=${BUILDPLATFORM} into Dockerfile.cross, and preserve the original Dockerfile
 	sed -e '1 s/\(^FROM\)/FROM --platform=\$$\{BUILDPLATFORM\}/; t' -e ' 1,// s//FROM --platform=\$$\{BUILDPLATFORM\}/' Dockerfile > Dockerfile.cross
 	- $(CONTAINER_TOOL) buildx create --name ingress-operator-builder

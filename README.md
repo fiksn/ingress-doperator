@@ -16,11 +16,24 @@ Additionally the operator enables a "shared mode" (unless you start it with `--o
 can aggregate multiple vhosts in one thereby saving cluster resources. This way you just get one (or if you change `nginxproxies` crd also more)
 Nginx instance(s) which is consistent with previous `nginx-ingress` behaviour. Of course you get less isolation which depending on your case can also be bad for security.
 
+Actually the tools support invoking Ingress2Gateway as a library as well which means you can benefit from all the optimizations there too.
+
 ## Build
 
 ```bash
 nix-shell -p operator-sdk kubebuilder
-CGO_ENABLED=0 go build -o bin/manager ./cmd/main.go
+
+# Build operator
+CGO_ENABLED=0 go build -o bin/operator ./cmd/operator/main.go
+
+# Build webhook
+CGO_ENABLED=0 go build -o bin/webhook ./cmd/webhook/main.go
+```
+
+Or use the Makefile:
+```bash
+make build          # Build bin/operator
+make build-webhook  # Build bin/webhook
 ```
 
 ## Features
@@ -46,21 +59,400 @@ The operator reuses TLS configurations from Ingress resources:
 - Hostnames from Ingress rules
 - Certificate references from Ingress TLS specs
 
-## Configuration
+## Webhook Mode
+
+### Overview
+
+The ingress-operator includes an **admission webhook** that intercepts Ingress creation requests and:
+1. Translates the Ingress to Gateway + HTTPRoute resources
+2. Creates the Gateway and HTTPRoute in the cluster
+3. **Rejects the Ingress** by default (prevents it from being stored)
+
+This mode is useful when you want to completely block Ingress resources from being created while automatically creating the equivalent Gateway API resources.
+However it is not best practice since creating other resources is a side-effect - if possible stay with operator approach.
+
+### Why Use Webhook Mode?
+
+- **Prevent Ingress creation entirely**: No Ingress resources in your cluster
+- **Automatic translation**: Happens synchronously during admission
+- **No operator watching**: Webhook is stateless, no reconciliation loop needed
+- **Migration enforcement**: Forces users to use Gateway API by blocking Ingress
+
+### Deploying the Webhook
+
+#### Step 1: Build the Webhook Binary
+
+```bash
+CGO_ENABLED=0 go build -o bin/webhook ./cmd/webhook/main.go
+```
+
+#### Step 2: Create TLS Certificates
+
+The webhook requires TLS certificates. You can use cert-manager:
+
+```yaml
+apiVersion: cert-manager.io/v1
+kind: Certificate
+metadata:
+  name: ingress-webhook-cert
+  namespace: ingress-operator-system
+spec:
+  secretName: ingress-webhook-tls
+  dnsNames:
+    - ingress-webhook.ingress-operator-system.svc
+    - ingress-webhook.ingress-operator-system.svc.cluster.local
+  issuerRef:
+    name: selfsigned-issuer
+    kind: ClusterIssuer
+---
+apiVersion: cert-manager.io/v1
+kind: ClusterIssuer
+metadata:
+  name: selfsigned-issuer
+spec:
+  selfSigned: {}
+```
+
+#### Step 3: Deploy the Webhook Server
+
+```yaml
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: ingress-webhook
+  namespace: ingress-operator-system
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: ingress-webhook
+  template:
+    metadata:
+      labels:
+        app: ingress-webhook
+    spec:
+      containers:
+      - name: webhook
+        image: your-registry/ingress-operator-webhook:latest
+        imagePullPolicy: Always
+        command:
+          - /webhook
+        args:
+          - --gateway-namespace=nginx-fabric
+          - --gateway-name=ingress-gateway
+          - --webhook-port=9443
+          - --cert-dir=/tmp/k8s-webhook-server/serving-certs
+          - --use-ingress2gateway=false
+          - --hostname-rewrite-from=
+          - --hostname-rewrite-to=
+        ports:
+        - containerPort: 9443
+          name: webhook
+          protocol: TCP
+        - containerPort: 8080
+          name: metrics
+          protocol: TCP
+        volumeMounts:
+        - name: cert
+          mountPath: /tmp/k8s-webhook-server/serving-certs
+          readOnly: true
+        resources:
+          limits:
+            cpu: 500m
+            memory: 256Mi
+          requests:
+            cpu: 100m
+            memory: 128Mi
+      volumes:
+      - name: cert
+        secret:
+          secretName: ingress-webhook-tls
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: ingress-webhook
+  namespace: ingress-operator-system
+spec:
+  ports:
+  - name: webhook
+    port: 443
+    targetPort: 9443
+  - name: metrics
+    port: 8080
+    targetPort: 8080
+  selector:
+    app: ingress-webhook
+```
+
+#### Step 4: Create the ValidatingWebhookConfiguration
+
+```yaml
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingWebhookConfiguration
+metadata:
+  name: ingress-to-gateway-webhook
+  annotations:
+    cert-manager.io/inject-ca-from: ingress-operator-system/ingress-webhook-cert
+webhooks:
+  - name: vingress.fiction.si
+    admissionReviewVersions: ["v1"]
+    clientConfig:
+      service:
+        name: ingress-webhook
+        namespace: ingress-operator-system
+        path: /mutate-v1-ingress
+      # CA bundle will be injected by cert-manager
+    rules:
+      - operations: ["CREATE", "UPDATE"]
+        apiGroups: ["networking.k8s.io"]
+        apiVersions: ["v1"]
+        resources: ["ingresses"]
+        scope: "*"
+    failurePolicy: Fail
+    sideEffects: None
+    timeoutSeconds: 10
+    namespaceSelector:
+      matchExpressions:
+        # Exclude kube-system and ingress-operator-system namespaces
+        - key: kubernetes.io/metadata.name
+          operator: NotIn
+          values: ["kube-system", "ingress-operator-system"]
+```
+
+### Webhook Configuration Flags
+
+```bash
+--gateway-namespace string              Namespace where Gateway resources will be created (default: "default")
+--gateway-name string                   Name of the Gateway resource (default: "ingress-gateway")
+--webhook-port int                      The port the webhook server binds to (default: 9443)
+--cert-dir string                       Directory containing TLS certificates (default: "/tmp/k8s-webhook-server/serving-certs")
+--metrics-bind-address string           Metrics endpoint address (default: ":8080")
+--health-probe-bind-address string      Health probe endpoint address (default: ":8081")
+--hostname-rewrite-from string          Domain suffix to match for rewriting
+--hostname-rewrite-to string            Replacement domain suffix
+--gateway-annotations string            Comma-separated key=value pairs for Gateway annotations
+--gateway-annotation-filters string     Comma-separated list of annotation prefixes to exclude from Gateway
+--httproute-annotation-filters string   Comma-separated list of annotation prefixes to exclude from HTTPRoute
+--use-ingress2gateway                   Use ingress2gateway library for translation (default: false)
+--ingress2gateway-provider string       Provider for ingress2gateway (default: "ingress-nginx")
+--ingress2gateway-ingress-class string  Ingress class for ingress2gateway filtering (default: "nginx")
+```
+
+### Translation Modes
+
+The webhook supports two translation modes:
+
+#### Built-in Translation (default)
+```bash
+--use-ingress2gateway=false
+--hostname-rewrite-from=domain.cc
+--hostname-rewrite-to=migration.domain.cc
+```
+
+- Uses custom translation logic
+- Supports hostname rewriting for migration
+- Supports certificate mangling for transformed hostnames
+- Full control over Gateway/HTTPRoute structure
+
+#### ingress2gateway Library Mode
+```bash
+--use-ingress2gateway=true
+--ingress2gateway-provider=ingress-nginx
+--ingress2gateway-ingress-class=nginx
+```
+
+- Uses the official [ingress2gateway](https://github.com/kubernetes-sigs/ingress2gateway) library
+- Provider-specific translation (ingress-nginx, istio, kong, etc.)
+- **NO hostname rewriting** - uses translation as-is
+- **NO certificate mangling** - preserves original TLS configuration
+- Annotation copying still works (filters and defaults applied)
+- Infrastructure annotations still applied
+
+**When to use ingress2gateway mode:**
+- You want standardized, provider-specific translation
+- You don't need hostname rewriting
+- You want to leverage upstream ingress2gateway logic
+- You need provider-specific features (e.g., ingress-nginx canary, istio virtualservice)
+
+### Special Annotations
+
+The webhook recognizes these annotations on Ingress resources:
+
+#### `ingress-operator.fiction.si/ignore-ingress: "true"`
+Skip all webhook processing - the Ingress is allowed through unchanged.
+
+```yaml
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: legacy-app
+  annotations:
+    ingress-operator.fiction.si/ignore-ingress: "true"
+spec:
+  # This Ingress will be created as-is, no Gateway/HTTPRoute created
+```
+
+#### `ingress-operator.fiction.si/allow-ingress: "true"`
+Create Gateway/HTTPRoute AND allow the Ingress to be created (for compatibility mode).
+
+```yaml
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: hybrid-app
+  annotations:
+    ingress-operator.fiction.si/allow-ingress: "true"
+spec:
+  # Both Ingress and Gateway+HTTPRoute will be created
+```
+
+### Behavior
+
+**Default behavior (no annotations):**
+1. Webhook receives Ingress creation request
+2. Translates Ingress → Gateway + HTTPRoute
+3. Creates Gateway and HTTPRoute resources
+4. **Rejects the Ingress** with message:
+   ```
+   Error from server: admission webhook "vingress.fiction.si" denied the request:
+   Ingress resources are not allowed - Gateway and HTTPRoute have been created instead.
+   Use annotation 'ingress-operator.fiction.si/allow-ingress=true' to allow Ingress creation.
+   ```
+
+**With `allow-ingress=true`:**
+1. Creates Gateway and HTTPRoute
+2. Allows the Ingress to be created
+3. Both resource types exist in the cluster
+
+**With `ignore-ingress=true`:**
+1. No translation occurs
+2. Ingress is created as-is
+3. No Gateway or HTTPRoute created
+
+### Testing the Webhook
+
+```bash
+# This will be rejected (Gateway/HTTPRoute created instead)
+kubectl apply -f - <<EOF
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: test-ingress
+  namespace: default
+spec:
+  ingressClassName: nginx
+  rules:
+  - host: test.example.com
+    http:
+      paths:
+      - path: /
+        pathType: Prefix
+        backend:
+          service:
+            name: test-service
+            port:
+              number: 80
+EOF
+
+# Check that Gateway and HTTPRoute were created
+kubectl get gateway -n nginx-fabric
+kubectl get httproute -n default
+
+# This will be allowed (compatibility mode)
+kubectl apply -f - <<EOF
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: test-ingress-allowed
+  namespace: default
+  annotations:
+    ingress-operator.fiction.si/allow-ingress: "true"
+spec:
+  ingressClassName: nginx
+  rules:
+  - host: test.example.com
+    http:
+      paths:
+      - path: /
+        pathType: Prefix
+        backend:
+          service:
+            name: test-service
+            port:
+              number: 80
+EOF
+```
+
+### Webhook vs Operator Mode
+
+| Feature | Webhook Mode | Operator Mode |
+|---------|-------------|---------------|
+| Blocks Ingress creation | ✅ Yes (default) | ❌ No |
+| Synchronous | ✅ Yes | ❌ No (async reconciliation) |
+| Stateless | ✅ Yes | ❌ No (watches resources) |
+| Supports deletion | ❌ No | ✅ Yes (with `--enable-deletion`) |
+| Shared Gateways | ❌ No | ✅ Yes |
+| Requires certificates | ✅ Yes | ❌ No |
+| Failure handling | Blocks on failure | Retries on failure |
+
+### Troubleshooting
+
+**Webhook not being called:**
+- Check webhook service is running: `kubectl get pods -n ingress-operator-system`
+- Verify service endpoints: `kubectl get endpoints -n ingress-operator-system`
+- Check ValidatingWebhookConfiguration exists: `kubectl get validatingwebhookconfiguration`
+- Verify CA bundle injected: `kubectl get validatingwebhookconfigurations ingress-to-gateway-webhook -o yaml | grep caBundle`
+
+**Certificate errors:**
+- Check cert-manager is installed: `kubectl get pods -n cert-manager`
+- Verify certificate is ready: `kubectl get certificate -n ingress-operator-system`
+- Check secret created: `kubectl get secret ingress-webhook-tls -n ingress-operator-system`
+
+**Webhook rejecting everything:**
+- Check logs: `kubectl logs -n ingress-operator-system -l app=ingress-webhook`
+- Verify gateway namespace exists: `kubectl get namespace nginx-fabric`
+- Check RBAC permissions for creating Gateway/HTTPRoute
+
+## Operator Configuration
 
 The operator accepts the following command-line flags:
 
 ```bash
---gateway-namespace string              Namespace where the Gateway resource will be created (default: "nginx-fabric")
---gateway-name string                   Name of the Gateway resource when not using ingressClassName (default: "ingress-gateway")
---watch-namespace string                If specified, only watch Ingresses in this namespace (default: watch all namespaces)
---one-gateway-per-ingress               Create a separate Gateway for each Ingress with the same name (default: false)
---enable-deletion                       Delete HTTPRoute and Gateway when Ingress is deleted (default: false)
---hostname-rewrite-from string          Domain suffix to match for rewriting (e.g., 'domain.cc')
---hostname-rewrite-to string            Replacement domain suffix (e.g., 'foo.domain.cc'). Transforms 'a.b.domain.cc' to 'a.b.foo.domain.cc'
---disable-source-ingress                Disable the source Ingress by removing ingressClassName (default: false)
---gateway-annotation-filters string     Comma-separated list of annotation prefixes to exclude from Gateway (default: "ingress.kubernetes.io,cert-manager.io,nginx.ingress.kubernetes.io")
---httproute-annotation-filters string   Comma-separated list of annotation prefixes to exclude from HTTPRoute (default: "ingress.kubernetes.io,cert-manager.io,nginx.ingress.kubernetes.io")
+--gateway-namespace string                    Namespace where the Gateway resource will be created (default: "nginx-fabric")
+--gateway-name string                         Name of the Gateway resource when not using ingressClassName (default: "ingress-gateway")
+--watch-namespace string                      If specified, only watch Ingresses in this namespace (default: watch all namespaces)
+--one-gateway-per-ingress                     Create a separate Gateway for each Ingress with the same name (default: false)
+--enable-deletion                             Delete HTTPRoute and Gateway when Ingress is deleted (default: false)
+--hostname-rewrite-from string                Domain suffix to match for rewriting (e.g., 'domain.cc')
+--hostname-rewrite-to string                  Replacement domain suffix (e.g., 'foo.domain.cc'). Transforms 'a.b.domain.cc' to 'a.b.foo.domain.cc'
+--disable-source-ingress                      Disable the source Ingress by removing ingressClassName (default: false)
+--gateway-annotation-filters string           Comma-separated list of annotation prefixes to exclude from Gateway (default: "ingress.kubernetes.io,cert-manager.io,nginx.ingress.kubernetes.io")
+--httproute-annotation-filters string         Comma-separated list of annotation prefixes to exclude from HTTPRoute (default: "ingress.kubernetes.io,cert-manager.io,nginx.ingress.kubernetes.io")
+--use-ingress2gateway                         Use ingress2gateway library for translation (disables hostname/certificate mangling) (default: false)
+--ingress2gateway-provider string             Provider to use with ingress2gateway (e.g., ingress-nginx, istio, kong) (default: "ingress-nginx")
+--ingress2gateway-ingress-class string        Ingress class name for provider-specific filtering in ingress2gateway (default: "nginx")
+--gateway-annotations string                  Comma-separated key=value pairs for Gateway metadata annotations
+--gateway-infrastructure-annotations string   Comma-separated key=value pairs for Gateway infrastructure annotations
+--private-annotations string                  Comma-separated key=value pairs defining what 'private' means for infrastructure annotations
+--private                                     If true, apply private annotations to all Gateways (default: false)
+--private-ingress-class-pattern string        Glob pattern for ingress class names that should get private infrastructure annotations (default: "*private*")
+```
+
+### Translation Modes in Operator
+
+The operator supports the same two translation modes as the webhook:
+
+**Built-in mode (default):** Full control with hostname rewriting and certificate mangling
+**ingress2gateway mode:** Uses upstream library, no hostname/cert mangling, annotation copying still works
+
+Example using ingress2gateway mode:
+```bash
+./bin/operator \
+  --use-ingress2gateway=true \
+  --ingress2gateway-provider=ingress-nginx \
+  --ingress2gateway-ingress-class=nginx \
+  --gateway-namespace=nginx-fabric
 ```
 
 ## Operating Modes
@@ -70,7 +462,7 @@ The operator accepts the following command-line flags:
 Multiple Ingresses share Gateways based on their `ingressClassName` (or annotation):
 
 ```bash
-./bin/manager
+./bin/operator
 ```
 
 **Behavior:**
@@ -84,7 +476,7 @@ Multiple Ingresses share Gateways based on their `ingressClassName` (or annotati
 Each Ingress gets its own dedicated Gateway:
 
 ```bash
-./bin/manager --one-gateway-per-ingress
+./bin/operator --one-gateway-per-ingress
 ```
 
 **Behavior:**
@@ -99,7 +491,7 @@ By default, the operator watches Ingresses in **all namespaces**. You can restri
 
 ```bash
 # Watch only the test-namespace
-./bin/manager --watch-namespace=test-namespace
+./bin/operator --watch-namespace=test-namespace
 ```
 
 This is useful for:
@@ -118,7 +510,7 @@ When migrating from nginx-ingress to nginx-fabric (Gateway API), you'll face a D
 Use `--hostname-rewrite-from` and `--hostname-rewrite-to` to transform hostnames in Gateway and HTTPRoute resources:
 
 ```bash
-./bin/manager \
+./bin/operator \
   --hostname-rewrite-from=domain.cc \
   --hostname-rewrite-to=migration.domain.cc
 ```
@@ -157,7 +549,7 @@ This allows you to:
 Use `--disable-source-ingress` to automatically disable the original Ingress:
 
 ```bash
-./bin/manager --disable-source-ingress
+./bin/operator --disable-source-ingress
 ```
 
 This will:
@@ -173,14 +565,14 @@ This prevents nginx-ingress from processing the Ingress while keeping it in the 
 
 ```bash
 # Step 1: Create Gateway/HTTPRoute with transformed hostnames (no DNS conflict)
-./bin/manager \
+./bin/operator \
   --hostname-rewrite-from=domain.cc \
   --hostname-rewrite-to=migration.domain.cc
 
 # Step 2: Test the Gateway setup at migration.domain.cc hostnames
 
 # Step 3: When ready, disable source Ingress and use original hostnames
-./bin/manager --disable-source-ingress
+./bin/operator --disable-source-ingress
 
 # Step 4: Update DNS to point to Gateway
 
@@ -201,10 +593,10 @@ When `--enable-deletion=true`:
 **Example:**
 ```bash
 # Deletion disabled (default) - resources remain after Ingress deletion
-./bin/manager
+./bin/operator
 
 # Deletion enabled - resources are cleaned up when Ingress is deleted
-./bin/manager --enable-deletion
+./bin/operator --enable-deletion
 ```
 
 ## Behavior
@@ -290,7 +682,7 @@ Following the options to release and provide this solution to the users.
 1. Build the installer for the image built and published in the registry:
 
 ```sh
-make build-installer IMG=<some-registry>/ingress-operator:tag
+make build-installer IMG=fiksn/ingress-operator:0.0.1
 ```
 
 **NOTE:** The makefile target mentioned above generates an 'install.yaml'
@@ -326,7 +718,8 @@ previously added to 'dist/chart/values.yaml' or 'dist/chart/manager/manager.yaml
 is manually re-applied afterwards.
 
 ## Contributing
-// TODO(user): Add detailed information on how you would like others to contribute to this project
+
+Feel free to contribute pull requests.
 
 **NOTE:** Run `make help` for more information on all potential `make` targets
 
