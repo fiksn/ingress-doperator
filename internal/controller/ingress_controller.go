@@ -43,8 +43,10 @@ const (
 	OriginalIngressClassNameAnnotation = "ingress-operator.fiction.si/original-ingress-classname"
 	MismatchedCertAnnotation           = "ingress-operator.fiction.si/certificate-mismatch"
 	FinalizerName                      = "ingress-operator.fiction.si/finalizer"
-	DefaultGatewayAnnotationFilters    = "ingress.kubernetes.io,cert-manager.io,nginx.ingress.kubernetes.io,kubectl.kubernetes.io,kubernetes.io/ingress.class,traefik.ingress.kubernetes.io"
-	DefaultHTTPRouteAnnotationFilters  = "ingress.kubernetes.io,cert-manager.io,nginx.ingress.kubernetes.io,kubectl.kubernetes.io,kubernetes.io/ingress.class,traefik.ingress.kubernetes.io"
+	DefaultGatewayAnnotationFilters    = "ingress.kubernetes.io,cert-manager.io," +
+		"nginx.ingress.kubernetes.io,kubectl.kubernetes.io,kubernetes.io/ingress.class,traefik.ingress.kubernetes.io"
+	DefaultHTTPRouteAnnotationFilters = "ingress.kubernetes.io,cert-manager.io," +
+		"nginx.ingress.kubernetes.io,kubectl.kubernetes.io,kubernetes.io/ingress.class,traefik.ingress.kubernetes.io"
 )
 
 type IngressReconciler struct {
@@ -84,13 +86,13 @@ func (r *IngressReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 	}
 
 	// Handle deletion
-	if !ingress.ObjectMeta.DeletionTimestamp.IsZero() {
+	if !ingress.DeletionTimestamp.IsZero() {
 		return r.handleDeletion(ctx, &ingress)
 	}
 
 	// Add finalizer if deletion is enabled and not already present
-	if r.EnableDeletion && !containsString(ingress.ObjectMeta.Finalizers, FinalizerName) {
-		ingress.ObjectMeta.Finalizers = append(ingress.ObjectMeta.Finalizers, FinalizerName)
+	if r.EnableDeletion && !containsString(ingress.Finalizers, FinalizerName) {
+		ingress.Finalizers = append(ingress.Finalizers, FinalizerName)
 		if err := r.Update(ctx, &ingress); err != nil {
 			logger.Error(err, "failed to add finalizer")
 			return ctrl.Result{}, err
@@ -127,7 +129,10 @@ func (r *IngressReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 	return r.reconcileSharedGateways(ctx, ingressList.Items)
 }
 
-func (r *IngressReconciler) reconcileOneGatewayPerIngress(ctx context.Context, ingresses []networkingv1.Ingress) (ctrl.Result, error) {
+func (r *IngressReconciler) reconcileOneGatewayPerIngress(
+	ctx context.Context,
+	ingresses []networkingv1.Ingress,
+) (ctrl.Result, error) {
 	logger := log.FromContext(ctx)
 
 	for _, ingress := range ingresses {
@@ -166,7 +171,10 @@ func (r *IngressReconciler) reconcileOneGatewayPerIngress(ctx context.Context, i
 	return ctrl.Result{}, nil
 }
 
-func (r *IngressReconciler) reconcileSharedGateways(ctx context.Context, ingresses []networkingv1.Ingress) (ctrl.Result, error) {
+func (r *IngressReconciler) reconcileSharedGateways(
+	ctx context.Context,
+	ingresses []networkingv1.Ingress,
+) (ctrl.Result, error) {
 	logger := log.FromContext(ctx)
 
 	// Group Ingresses by IngressClass
@@ -373,7 +381,9 @@ func (r *IngressReconciler) disableIngress(ctx context.Context, ingress *network
 	return nil
 }
 
-func (r *IngressReconciler) checkCertificateMatch(originalHostname, transformedHostname string, tlsHosts []string) bool {
+func (r *IngressReconciler) checkCertificateMatch(
+	originalHostname, transformedHostname string, tlsHosts []string,
+) bool {
 	// If hostname wasn't transformed, cert should match
 	if originalHostname == transformedHostname {
 		return true
@@ -448,7 +458,8 @@ func (r *IngressReconciler) shouldApplyPrivateAnnotations(ingressClass string) b
 	matched, err := filepath.Match(r.PrivateIngressClassPattern, ingressClass)
 	if err != nil {
 		// Invalid pattern, log and return false
-		log.Log.WithName("shouldApplyPrivateAnnotations").Error(err, "Invalid pattern", "pattern", r.PrivateIngressClassPattern)
+		log.Log.WithName("shouldApplyPrivateAnnotations").Error(
+			err, "Invalid pattern", "pattern", r.PrivateIngressClassPattern)
 		return false
 	}
 	return matched
@@ -576,7 +587,8 @@ func (r *IngressReconciler) synthesizeGatewayForIngress(ingress *networkingv1.In
 	applyPrivateAnnotations := r.shouldApplyPrivateAnnotations(ingressClass)
 
 	// Add infrastructure annotations if any are configured
-	if len(r.GatewayInfrastructureAnnotations) > 0 || (applyPrivateAnnotations && len(r.PrivateInfrastructureAnnotations) > 0) {
+	if len(r.GatewayInfrastructureAnnotations) > 0 ||
+		(applyPrivateAnnotations && len(r.PrivateInfrastructureAnnotations) > 0) {
 		gateway.Spec.Infrastructure = &gatewayv1.GatewayInfrastructure{
 			Annotations: make(map[gatewayv1.AnnotationKey]gatewayv1.AnnotationValue),
 		}
@@ -615,8 +627,8 @@ func (r *IngressReconciler) synthesizeGatewayForIngress(ingress *networkingv1.In
 	}
 
 	// Create listeners for each unique hostname
-	var listeners []gatewayv1.Listener
-	var certMismatches []string
+	listeners := make([]gatewayv1.Listener, 0, len(hostnameMap))
+	certMismatches := make([]string, 0)
 	logger := log.Log.WithName("synthesizeGateway")
 
 	for hostname, tlsConfig := range hostnameMap {
@@ -657,7 +669,8 @@ func (r *IngressReconciler) synthesizeGatewayForIngress(ingress *networkingv1.In
 					"originalSecret", tlsConfig.SecretName,
 					"newSecret", newSecretName,
 					"certHosts", tlsConfig.Hosts)
-				certMismatches = append(certMismatches, fmt.Sprintf("%s->%s: %s->%s", hostname, transformedHostname, tlsConfig.SecretName, newSecretName))
+				certMismatches = append(certMismatches,
+					fmt.Sprintf("%s->%s: %s->%s", hostname, transformedHostname, tlsConfig.SecretName, newSecretName))
 				secretName = newSecretName
 			}
 
@@ -718,7 +731,8 @@ func (r *IngressReconciler) synthesizeGateway(ingresses []networkingv1.Ingress, 
 	}
 
 	// Add infrastructure annotations if any are configured
-	if len(r.GatewayInfrastructureAnnotations) > 0 || (applyPrivateAnnotations && len(r.PrivateInfrastructureAnnotations) > 0) {
+	if len(r.GatewayInfrastructureAnnotations) > 0 ||
+		(applyPrivateAnnotations && len(r.PrivateInfrastructureAnnotations) > 0) {
 		gateway.Spec.Infrastructure = &gatewayv1.GatewayInfrastructure{
 			Annotations: make(map[gatewayv1.AnnotationKey]gatewayv1.AnnotationValue),
 		}
@@ -770,14 +784,14 @@ func (r *IngressReconciler) synthesizeGateway(ingresses []networkingv1.Ingress, 
 	}
 
 	// Convert namespaces set to slice for label selector
-	var namespacesList []string
+	namespacesList := make([]string, 0, len(namespacesSet))
 	for ns := range namespacesSet {
 		namespacesList = append(namespacesList, ns)
 	}
 
 	// Create listeners for each unique hostname
-	var listeners []gatewayv1.Listener
-	var certMismatches []string
+	listeners := make([]gatewayv1.Listener, 0, len(hostnameMap))
+	certMismatches := make([]string, 0)
 	logger := log.Log.WithName("synthesizeGateway")
 
 	for hostname, info := range hostnameMap {
@@ -822,7 +836,9 @@ func (r *IngressReconciler) synthesizeGateway(ingresses []networkingv1.Ingress, 
 					"originalSecret", info.tlsConfig.SecretName,
 					"newSecret", newSecretName,
 					"certHosts", info.tlsConfig.Hosts)
-				certMismatches = append(certMismatches, fmt.Sprintf("%s->%s: %s->%s", hostname, transformedHostname, info.tlsConfig.SecretName, newSecretName))
+				certMismatches = append(certMismatches,
+					fmt.Sprintf("%s->%s: %s->%s", hostname, transformedHostname,
+						info.tlsConfig.SecretName, newSecretName))
 				secretName = newSecretName
 			}
 
@@ -850,7 +866,9 @@ func (r *IngressReconciler) synthesizeGateway(ingresses []networkingv1.Ingress, 
 	return gateway
 }
 
-func (r *IngressReconciler) synthesizeHTTPRoute(ingress *networkingv1.Ingress, gatewayName string) *gatewayv1.HTTPRoute {
+func (r *IngressReconciler) synthesizeHTTPRoute(
+	ingress *networkingv1.Ingress, gatewayName string,
+) *gatewayv1.HTTPRoute {
 	logger := log.Log.WithName("synthesizeHTTPRoute")
 	httpRoute := &gatewayv1.HTTPRoute{}
 	httpRoute.Name = ingress.Name
@@ -874,7 +892,7 @@ func (r *IngressReconciler) synthesizeHTTPRoute(ingress *networkingv1.Ingress, g
 	httpRoute.Spec.Hostnames = hostnames
 
 	// Create parent refs to the Gateway, using transformed hostname as section name
-	var parentRefs []gatewayv1.ParentReference
+	parentRefs := make([]gatewayv1.ParentReference, 0, len(hostnames))
 	for _, hostname := range hostnames {
 		sectionName := gatewayv1.SectionName(hostname) // Already transformed
 		parentRef := gatewayv1.ParentReference{
@@ -894,7 +912,7 @@ func (r *IngressReconciler) synthesizeHTTPRoute(ingress *networkingv1.Ingress, g
 				var backendRefs []gatewayv1.HTTPBackendRef
 
 				if path.Backend.Service != nil {
-					port := gatewayv1.PortNumber(path.Backend.Service.Port.Number)
+					port := path.Backend.Service.Port.Number
 					backendRef := gatewayv1.HTTPBackendRef{
 						BackendRef: gatewayv1.BackendRef{
 							BackendObjectReference: gatewayv1.BackendObjectReference{
@@ -954,7 +972,9 @@ func (r *IngressReconciler) isManagedByUs(obj client.Object) bool {
 	return annotations[ManagedByAnnotation] == ManagedByValue
 }
 
-func (r *IngressReconciler) canUpdateResource(ctx context.Context, obj client.Object, namespacedName types.NamespacedName) (bool, error) {
+func (r *IngressReconciler) canUpdateResource(
+	ctx context.Context, obj client.Object, namespacedName types.NamespacedName,
+) (bool, error) {
 	logger := log.FromContext(ctx)
 
 	// Try to get the existing resource
@@ -981,7 +1001,9 @@ func (r *IngressReconciler) canUpdateResource(ctx context.Context, obj client.Ob
 	return true, nil
 }
 
-func (r *IngressReconciler) applyGateway(ctx context.Context, desired *gatewayv1.Gateway, existing *gatewayv1.Gateway) error {
+func (r *IngressReconciler) applyGateway(
+	ctx context.Context, desired *gatewayv1.Gateway, existing *gatewayv1.Gateway,
+) error {
 	logger := log.FromContext(ctx)
 
 	// Check if Gateway exists
@@ -1013,7 +1035,9 @@ func (r *IngressReconciler) applyGateway(ctx context.Context, desired *gatewayv1
 	return nil
 }
 
-func (r *IngressReconciler) applyHTTPRoute(ctx context.Context, desired *gatewayv1.HTTPRoute, existing *gatewayv1.HTTPRoute) error {
+func (r *IngressReconciler) applyHTTPRoute(
+	ctx context.Context, desired *gatewayv1.HTTPRoute, existing *gatewayv1.HTTPRoute,
+) error {
 	logger := log.FromContext(ctx)
 
 	// Check if HTTPRoute exists

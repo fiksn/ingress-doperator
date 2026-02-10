@@ -1,19 +1,20 @@
 # ingress-operator
 Ingress operator is a way to transition from `nginx-ingress` to `nginx-fabric` and use `Gateway` and `Httproute` resources instead of `Ingress`.
 
-You might want to check-out [Ingress2Gateway](https://github.com/kubernetes-sigs/ingress2gateway).
+Check-out [Ingress2Gateway](https://github.com/kubernetes-sigs/ingress2gateway) too.
 
-The difference is that this operator will transparently create new resources. Those can of course be retrieved from Kubernetes and put into source control so think of this tool like Ingress2Gateway with an extra step.
-But the benefit comes from changing the stuff over which you do not have direct control, for instance a
-new `Ingress` resource might be provisioned by some dependency and you cannot directly update it. At the same
-time you cannot run `nginx-ingress` controller anymore.
+The difference is that this operator will transparently create new resources. Those can of course be retrieved from Kubernetes and put into source control
+so you can think of this tool like Ingress2Gateway with an extra step.
+But the real benefit comes from changing the stuff over which you do not have direct control, for instance a
+new `Ingress` resource might be provisioned automatically and you cannot change that simply. At the same
+time you cannot run `nginx-ingress` controller anymore as most of the infrastructure is already migrated.
 
 !!! Nginx ingress controller is [deprecated](https://kubernetes.io/blog/2025/11/11/ingress-nginx-retirement/) and
 will not get security updates after March 2026 !!!
 
-Additionally this enables a shared mode which means you do not need a new `Gateway` for each `Ingress` but
-can instead aggregate all vhosts. This way you just get one (or if you change `nginxproxies` crd also more)
-Nginx instance(s) which is consistent with previous behavior. Of course you get less isolation which can be bad for security.
+Additionally the operator enables a "shared mode" (unless you start it with `--one-gateway-per-ingress`) which means you do not need a new `Gateway` for each `Ingress` but
+can aggregate multiple vhosts in one thereby saving cluster resources. This way you just get one (or if you change `nginxproxies` crd also more)
+Nginx instance(s) which is consistent with previous `nginx-ingress` behaviour. Of course you get less isolation which depending on your case can also be bad for security.
 
 ## Build
 

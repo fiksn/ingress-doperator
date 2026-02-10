@@ -51,14 +51,18 @@ var (
 )
 
 const (
-	DefaultPrivateInfraAnnotations = "service.beta.kubernetes.io/aws-load-balancer-internal=true,service.beta.kubernetes.io/aws-load-balancer-nlb-target-type=ip,service.beta.kubernetes.io/aws-load-balancer-type=nlb"
-	DefaultGatewayInfraAnnotations = "cert-manager.io/acme-challenge-type=dns01,cert-manager.io/acme-dns01-provider=default,cert-manager.io/cluster-issuer=letsencrypt-cert-manager"
-	DefaultGatewayAnnotations      = "cert-manager.io/acme-challenge-type=dns01,cert-manager.io/acme-dns01-provider=default,cert-manager.io/cluster-issuer=letsencrypt-cert-manager"
+	DefaultPrivateInfraAnnotations = "service.beta.kubernetes.io/aws-load-balancer-internal=true," +
+		"service.beta.kubernetes.io/aws-load-balancer-nlb-target-type=ip," +
+		"service.beta.kubernetes.io/aws-load-balancer-type=nlb"
+	DefaultGatewayInfraAnnotations = ""
+	DefaultGatewayAnnotations      = "cert-manager.io/acme-challenge-type=dns01," +
+		"cert-manager.io/acme-dns01-provider=default," +
+		"cert-manager.io/cluster-issuer=letsencrypt-cert-manager"
 )
 
 func init() {
 	utilruntime.Must(clientgoscheme.AddToScheme(scheme))
-	utilruntime.Must(gatewayv1.AddToScheme(scheme))
+	utilruntime.Must(gatewayv1.Install(scheme))
 
 	// +kubebuilder:scaffold:scheme
 }
@@ -88,21 +92,39 @@ func main() {
 	var private bool
 	var privateAnnotations string
 	var privateIngressClassPattern string
-	flag.StringVar(&gatewayNamespace, "gateway-namespace", "nginx-fabric", "The namespace where the Gateway resource will be created")
-	flag.StringVar(&gatewayName, "gateway-name", "ingress-gateway", "The name of the Gateway resource (only used when one-gateway-per-ingress is false)")
-	flag.StringVar(&watchNamespace, "watch-namespace", "", "If specified, only watch Ingresses in this namespace (default: watch all namespaces)")
-	flag.BoolVar(&oneGatewayPerIngress, "one-gateway-per-ingress", false, "If true, create a separate Gateway for each Ingress with the same name")
-	flag.BoolVar(&enableDeletion, "enable-deletion", false, "If true, delete HTTPRoute (and Gateway in one-gateway-per-ingress mode) when Ingress is deleted")
-	flag.StringVar(&hostnameRewriteFrom, "hostname-rewrite-from", "", "Domain suffix to match for rewriting (e.g., 'domain.cc'). Used with --hostname-rewrite-to.")
-	flag.StringVar(&hostnameRewriteTo, "hostname-rewrite-to", "", "Replacement domain suffix (e.g., 'foo.domain.cc'). Transforms 'a.b.domain.cc' to 'a.b.foo.domain.cc' to avoid DNS conflicts.")
-	flag.BoolVar(&disableSourceIngress, "disable-source-ingress", false, "If true, disable the source Ingress by removing its ingressClassName to prevent nginx-ingress from processing it")
-	flag.StringVar(&gatewayAnnotations, "gateway-annotations", DefaultGatewayAnnotations, "Comma-separated key=value pairs for Gateway metadata annotations (applied to all Gateways)")
-	flag.StringVar(&gatewayInfraAnnotations, "gateway-infrastructure-annotations", DefaultGatewayInfraAnnotations, "Comma-separated key=value pairs for Gateway infrastructure annotations (applied to all Gateways)")
-	flag.StringVar(&privateAnnotations, "private-annotations", DefaultPrivateInfraAnnotations, "Comma-separated key=value pairs defining what 'private' means for Gateway infrastructure annotations")
+	flag.StringVar(&gatewayNamespace, "gateway-namespace", "nginx-fabric",
+		"The namespace where the Gateway resource will be created")
+	flag.StringVar(&gatewayName, "gateway-name", "ingress-gateway",
+		"The name of the Gateway resource (only used when one-gateway-per-ingress is false)")
+	flag.StringVar(&watchNamespace, "watch-namespace", "",
+		"If specified, only watch Ingresses in this namespace (default: watch all namespaces)")
+	flag.BoolVar(&oneGatewayPerIngress, "one-gateway-per-ingress", false,
+		"If true, create a separate Gateway for each Ingress with the same name")
+	flag.BoolVar(&enableDeletion, "enable-deletion", false,
+		"If true, delete HTTPRoute (and Gateway in one-gateway-per-ingress mode) when Ingress is deleted")
+	flag.StringVar(&hostnameRewriteFrom, "hostname-rewrite-from", "",
+		"Domain suffix to match for rewriting (e.g., 'domain.cc'). Used with --hostname-rewrite-to.")
+	flag.StringVar(&hostnameRewriteTo, "hostname-rewrite-to", "",
+		"Replacement domain suffix (e.g., 'foo.domain.cc'). "+
+			"Transforms 'a.b.domain.cc' to 'a.b.foo.domain.cc' to avoid DNS conflicts.")
+	flag.BoolVar(&disableSourceIngress, "disable-source-ingress", false,
+		"If true, disable the source Ingress by removing its ingressClassName to prevent nginx-ingress from processing it")
+	flag.StringVar(&gatewayAnnotations, "gateway-annotations", DefaultGatewayAnnotations,
+		"Comma-separated key=value pairs for Gateway metadata annotations (applied to all Gateways)")
+	flag.StringVar(&gatewayInfraAnnotations, "gateway-infrastructure-annotations",
+		DefaultGatewayInfraAnnotations,
+		"Comma-separated key=value pairs for Gateway infrastructure annotations (applied to all Gateways)")
+	flag.StringVar(&privateAnnotations, "private-annotations", DefaultPrivateInfraAnnotations,
+		"Comma-separated key=value pairs defining what 'private' means for Gateway infrastructure annotations")
 	flag.BoolVar(&private, "private", false, "If true, apply private annotations to all Gateways")
-	flag.StringVar(&privateIngressClassPattern, "private-ingress-class-pattern", "*private*", "Glob pattern for ingress class names (e.g., '*private') that should get private infrastructure annotations")
-	flag.StringVar(&gatewayAnnotationFilters, "gateway-annotation-filters", controller.DefaultGatewayAnnotationFilters, "Comma-separated list of annotation prefixes to exclude from Gateway resources")
-	flag.StringVar(&httpRouteAnnotationFilters, "httproute-annotation-filters", controller.DefaultHTTPRouteAnnotationFilters, "Comma-separated list of annotation prefixes to exclude from HTTPRoute resources")
+	flag.StringVar(&privateIngressClassPattern, "private-ingress-class-pattern", "*private*",
+		"Glob pattern for ingress class names (e.g., '*private') that should get private infrastructure annotations")
+	flag.StringVar(&gatewayAnnotationFilters, "gateway-annotation-filters",
+		controller.DefaultGatewayAnnotationFilters,
+		"Comma-separated list of annotation prefixes to exclude from Gateway resources")
+	flag.StringVar(&httpRouteAnnotationFilters, "httproute-annotation-filters",
+		controller.DefaultHTTPRouteAnnotationFilters,
+		"Comma-separated list of annotation prefixes to exclude from HTTPRoute resources")
 	flag.StringVar(&metricsAddr, "metrics-bind-address", "0", "The address the metrics endpoint binds to. "+
 		"Use :8443 for HTTPS or :8080 for HTTP, or leave as 0 to disable the metrics service.")
 	flag.StringVar(&probeAddr, "health-probe-bind-address", ":8081", "The address the probe endpoint binds to.")
@@ -224,7 +246,8 @@ func main() {
 	var ns corev1.Namespace
 	if err := mgr.GetAPIReader().Get(ctx, client.ObjectKey{Name: gatewayNamespace}, &ns); err != nil {
 		setupLog.Error(err, "Gateway namespace does not exist", "namespace", gatewayNamespace)
-		setupLog.Info("Please create the namespace first", "command", fmt.Sprintf("kubectl create namespace %s", gatewayNamespace))
+		cmd := fmt.Sprintf("kubectl create namespace %s", gatewayNamespace)
+		setupLog.Info("Please create the namespace first", "command", cmd)
 		os.Exit(1)
 	}
 	setupLog.Info("Verified Gateway namespace exists", "namespace", gatewayNamespace)
