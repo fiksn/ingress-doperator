@@ -1,11 +1,11 @@
-# Default values for ingress-operator
+# Default values for ingress-doperator
 
 replicaCount: 1
 
 image:
-  repository: fiksn/ingress-operator
+  repository: fiksn/ingress-doperator
   pullPolicy: IfNotPresent
-  tag: "latest"
+  tag: v0.0.1
 
 imagePullSecrets: []
 nameOverride: ""
@@ -90,8 +90,8 @@ operator:
   privateIngressClassPattern: "*private*"
 
   # Annotation filters (comma-separated prefixes to exclude)
-  gatewayAnnotationFilters: "ingress.kubernetes.io,cert-manager.io,nginx.ingress.kubernetes.io,kubectl.kubernetes.io,kubernetes.io/ingress.class,traefik.ingress.kubernetes.io,ingress-operator.fiction.si"
-  httpRouteAnnotationFilters: "ingress.kubernetes.io,cert-manager.io,nginx.ingress.kubernetes.io,kubectl.kubernetes.io,kubernetes.io/ingress.class,traefik.ingress.kubernetes.io,ingress-operator.fiction.si"
+  gatewayAnnotationFilters: "ingress.kubernetes.io,cert-manager.io,nginx.ingress.kubernetes.io,kubectl.kubernetes.io,kubernetes.io/ingress.class,traefik.ingress.kubernetes.io,ingress-doperator.fiction.si"
+  httpRouteAnnotationFilters: "ingress.kubernetes.io,cert-manager.io,nginx.ingress.kubernetes.io,kubectl.kubernetes.io,kubernetes.io/ingress.class,traefik.ingress.kubernetes.io,ingress-doperator.fiction.si"
 
   # ingress2gateway configuration
   useIngress2Gateway: false

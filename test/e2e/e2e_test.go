@@ -31,20 +31,20 @@ import (
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
 
-	"github.com/fiksn/ingress-operator/test/utils"
+	"github.com/fiksn/ingress-doperator/test/utils"
 )
 
 // namespace where the project is deployed in
-const namespace = "ingress-operator-system"
+const namespace = "ingress-doperator-system"
 
 // serviceAccountName created for the project
-const serviceAccountName = "ingress-operator-controller-manager"
+const serviceAccountName = "ingress-doperator-controller-manager"
 
 // metricsServiceName is the name of the metrics service of the project
-const metricsServiceName = "ingress-operator-controller-manager-metrics-service"
+const metricsServiceName = "ingress-doperator-controller-manager-metrics-service"
 
 // metricsRoleBindingName is the name of the RBAC that will be created to allow get the metrics data
-const metricsRoleBindingName = "ingress-operator-metrics-binding"
+const metricsRoleBindingName = "ingress-doperator-metrics-binding"
 
 var _ = Describe("Manager", Ordered, func() {
 	var controllerPodName string
@@ -64,7 +64,7 @@ var _ = Describe("Manager", Ordered, func() {
 		_, err = utils.Run(cmd)
 		Expect(err).NotTo(HaveOccurred(), "Failed to label namespace with restricted policy")
 
-		By("checking for operator CRDs (ingress-operator has no custom CRDs)")
+		By("checking for operator CRDs (ingress-doperator has no custom CRDs)")
 		cmd = exec.Command("make", "install")
 		_, _ = utils.Run(cmd) // This will output "No CRDs to install" - that's expected
 
@@ -172,7 +172,7 @@ var _ = Describe("Manager", Ordered, func() {
 		It("should ensure the metrics endpoint is serving metrics", func() {
 			By("creating a ClusterRoleBinding for the service account to allow access to metrics")
 			cmd := exec.Command("kubectl", "create", "clusterrolebinding", metricsRoleBindingName,
-				"--clusterrole=ingress-operator-metrics-reader",
+				"--clusterrole=ingress-doperator-metrics-reader",
 				fmt.Sprintf("--serviceaccount=%s:%s", namespace, serviceAccountName),
 			)
 			_, err := utils.Run(cmd)
@@ -324,7 +324,7 @@ spec:
 
 			By("verifying managed-by annotations are present")
 			cmd = exec.Command("kubectl", "get", "gateway", "nginx", "-n", gatewayNamespace,
-				"-o", "jsonpath={.metadata.annotations.ingress-operator\\.fiction\\.si/managed-by}")
+				"-o", "jsonpath={.metadata.annotations.ingress-doperator\\.fiction\\.si/managed-by}")
 			output, err := utils.Run(cmd)
 			Expect(err).NotTo(HaveOccurred())
 			Expect(output).To(Equal("ingress-controller"), "Gateway should have managed-by annotation")

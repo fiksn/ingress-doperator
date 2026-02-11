@@ -37,12 +37,12 @@ import (
 )
 
 const (
-	ManagedByAnnotation      = "ingress-operator.fiction.si/managed-by"
-	ManagedByValue           = "ingress-controller"
-	SourceAnnotation         = "ingress-operator.fiction.si/source"
-	MismatchedCertAnnotation = "ingress-operator.fiction.si/certificate-mismatch"
+	ManagedByAnnotation      = "ingress-doperator.fiction.si/managed-by"
+	ManagedByValue           = "ingress-doperator"
+	SourceAnnotation         = "ingress-doperator.fiction.si/source"
+	MismatchedCertAnnotation = "ingress-doperator.fiction.si/certificate-mismatch"
 	IngressClassAnnotation   = "kubernetes.io/ingress.class"
-	ReferenceGrantName       = "ingress-operator-gateway-secrets"
+	ReferenceGrantName       = "ingress-doperator-gateway-secrets"
 	MaxK8sNameLength         = 253 // Kubernetes resource name max length
 )
 
@@ -691,12 +691,12 @@ func (t *Translator) TranslateToHTTPRoute(ingress *networkingv1.Ingress) *gatewa
 					if path.Backend.Service.Port.Number > 0 {
 						// Use numeric port
 						port := path.Backend.Service.Port.Number
-						backendRef.BackendObjectReference.Port = &port
+						backendRef.Port = &port
 					} else if path.Backend.Service.Port.Name != "" {
 						// Named port - store port name temporarily as 0
 						// Controller will resolve it by looking up the Service
 						port := int32(0)
-						backendRef.BackendObjectReference.Port = &port
+						backendRef.Port = &port
 					}
 
 					backendRefs = append(backendRefs, backendRef)

@@ -28,7 +28,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/log"
 	gatewayv1beta1 "sigs.k8s.io/gateway-api/apis/v1beta1"
 
-	"github.com/fiksn/ingress-operator/internal/translator"
+	"github.com/fiksn/ingress-doperator/internal/translator"
 )
 
 // EnsureReferenceGrants creates ReferenceGrants for the given Ingresses

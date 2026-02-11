@@ -35,9 +35,9 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/webhook/admission"
 	gatewayv1 "sigs.k8s.io/gateway-api/apis/v1"
 
-	_ "github.com/fiksn/ingress-operator/internal/metrics" // Import to register metrics
-	"github.com/fiksn/ingress-operator/internal/translator"
-	webhookhandler "github.com/fiksn/ingress-operator/internal/webhook"
+	_ "github.com/fiksn/ingress-doperator/internal/metrics" // Import to register metrics
+	"github.com/fiksn/ingress-doperator/internal/translator"
+	webhookhandler "github.com/fiksn/ingress-doperator/internal/webhook"
 )
 
 var (
@@ -87,11 +87,11 @@ func main() {
 		"Comma-separated key=value pairs for Gateway metadata annotations")
 	flag.StringVar(&gatewayAnnotationFilters, "gateway-annotation-filters",
 		"ingress.kubernetes.io,cert-manager.io,nginx.ingress.kubernetes.io,"+
-			"kubectl.kubernetes.io,kubernetes.io/ingress.class,ingress-operator.fiction.si",
+			"kubectl.kubernetes.io,kubernetes.io/ingress.class,ingress-doperator.fiction.si",
 		"Comma-separated list of annotation prefixes to exclude from Gateway resources")
 	flag.StringVar(&httpRouteAnnotationFilters, "httproute-annotation-filters",
 		"ingress.kubernetes.io,cert-manager.io,nginx.ingress.kubernetes.io,"+
-			"kubectl.kubernetes.io,kubernetes.io/ingress.class,ingress-operator.fiction.si",
+			"kubectl.kubernetes.io,kubernetes.io/ingress.class,ingress-doperator.fiction.si",
 		"Comma-separated list of annotation prefixes to exclude from HTTPRoute resources")
 	flag.BoolVar(&useIngress2Gateway, "use-ingress2gateway", false,
 		"If true, use the ingress2gateway library for translation (disables hostname/certificate mangling)")
@@ -102,7 +102,8 @@ func main() {
 	flag.StringVar(&ingress2GatewayIngressClass, "ingress2gateway-ingress-class", "nginx",
 		"Ingress class name for provider-specific filtering in ingress2gateway")
 	flag.StringVar(&ingressClassFilter, "ingress-class-filter", "*",
-		"Glob pattern to filter which ingress classes to process (e.g., '*private*', 'nginx', '*'). Default '*' processes all classes.")
+		"Glob pattern to filter which ingress classes to process (e.g., '*private*', 'nginx', '*'). "+
+			"Default '*' processes all classes.")
 
 	opts := zap.Options{
 		Development: true,

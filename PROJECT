@@ -6,6 +6,6 @@ cliVersion: v4.10.1
 domain: fiction.si
 layout:
 - go.kubebuilder.io/v4
-projectName: ingress-operator
-repo: github.com/fiksn/ingress-operator
+projectName: ingress-doperator
+repo: github.com/fiksn/ingress-doperator
 version: "3"

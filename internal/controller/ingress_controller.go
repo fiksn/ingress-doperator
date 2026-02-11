@@ -31,24 +31,24 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/predicate"
 	gatewayv1 "sigs.k8s.io/gateway-api/apis/v1"
 
-	"github.com/fiksn/ingress-operator/internal/metrics"
-	"github.com/fiksn/ingress-operator/internal/translator"
-	"github.com/fiksn/ingress-operator/internal/utils"
+	"github.com/fiksn/ingress-doperator/internal/metrics"
+	"github.com/fiksn/ingress-doperator/internal/translator"
+	"github.com/fiksn/ingress-doperator/internal/utils"
 )
 
 const (
 	IngressClassAnnotation             = "kubernetes.io/ingress.class"
-	IngressDisabledAnnotation          = "ingress-operator.fiction.si/disabled"
-	IgnoreIngressAnnotation            = "ingress-operator.fiction.si/ignore-ingress"
-	OriginalIngressClassAnnotation     = "ingress-operator.fiction.si/original-ingress-class"
-	OriginalIngressClassNameAnnotation = "ingress-operator.fiction.si/original-ingress-classname"
-	FinalizerName                      = "ingress-operator.fiction.si/finalizer"
+	IngressDisabledAnnotation          = "ingress-doperator.fiction.si/disabled"
+	IgnoreIngressAnnotation            = "ingress-doperator.fiction.si/ignore-ingress"
+	OriginalIngressClassAnnotation     = "ingress-doperator.fiction.si/original-ingress-class"
+	OriginalIngressClassNameAnnotation = "ingress-doperator.fiction.si/original-ingress-classname"
+	FinalizerName                      = "ingress-doperator.fiction.si/finalizer"
 	DefaultGatewayAnnotationFilters    = "ingress.kubernetes.io,cert-manager.io," +
 		"nginx.ingress.kubernetes.io,kubectl.kubernetes.io,kubernetes.io/ingress.class," +
-		"traefik.ingress.kubernetes.io,ingress-operator.fiction.si"
+		"traefik.ingress.kubernetes.io,ingress-doperator.fiction.si"
 	DefaultHTTPRouteAnnotationFilters = "ingress.kubernetes.io,cert-manager.io," +
 		"nginx.ingress.kubernetes.io,kubectl.kubernetes.io,kubernetes.io/ingress.class," +
-		"traefik.ingress.kubernetes.io,ingress-operator.fiction.si"
+		"traefik.ingress.kubernetes.io,ingress-doperator.fiction.si"
 )
 
 type IngressReconciler struct {
@@ -327,7 +327,6 @@ func (r *IngressReconciler) reconcileSharedGateways(
 	return ctrl.Result{}, nil
 }
 
-
 func (r *IngressReconciler) handleDeletion(ctx context.Context, ingress *networkingv1.Ingress) (ctrl.Result, error) {
 	logger := log.FromContext(ctx)
 	logger.Info("Handling Ingress deletion", "namespace", ingress.Namespace, "name", ingress.Name)
@@ -548,11 +547,10 @@ func (r *IngressReconciler) getIngressClass(ingress *networkingv1.Ingress) strin
 	return ""
 }
 
-
 // matchesIngressClassFilter checks if the Ingress class matches the configured filter pattern
 func (r *IngressReconciler) matchesIngressClassFilter(ingress *networkingv1.Ingress) bool {
 	// Default filter "*" matches everything
-	if r.IngressClassFilter == "" || r.IngressClassFilter == "*" {
+	if r.IngressClassFilter == "*" {
 		return true
 	}
 
@@ -560,7 +558,7 @@ func (r *IngressReconciler) matchesIngressClassFilter(ingress *networkingv1.Ingr
 
 	// Empty ingress class matches empty filter or "*"
 	if ingressClass == "" {
-		return r.IngressClassFilter == "" || r.IngressClassFilter == "*"
+		return r.IngressClassFilter == "*"
 	}
 
 	// Use filepath.Match for glob pattern matching
@@ -573,8 +571,6 @@ func (r *IngressReconciler) matchesIngressClassFilter(ingress *networkingv1.Ingr
 
 	return matched
 }
-
-
 
 func (r *IngressReconciler) applyGateway(
 	ctx context.Context, desired *gatewayv1.Gateway, existing *gatewayv1.Gateway,
@@ -614,7 +610,6 @@ func (r *IngressReconciler) applyGateway(
 
 	return nil
 }
-
 
 func (r *IngressReconciler) SetupWithManager(mgr ctrl.Manager) error {
 	builder := ctrl.NewControllerManagedBy(mgr).

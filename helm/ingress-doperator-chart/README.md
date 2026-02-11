@@ -1,6 +1,6 @@
 # Ingress Operator Helm Chart
 
-This Helm chart deploys the ingress-operator, a Kubernetes operator that translates Ingress resources to Gateway API resources (Gateway and HTTPRoute).
+This Helm chart deploys the ingress-doperator, a Kubernetes operator that translates Ingress resources to Gateway API resources (Gateway and HTTPRoute).
 
 ## Prerequisites
 
@@ -28,13 +28,13 @@ kubectl create namespace nginx-fabric
 Install the chart:
 
 ```bash
-helm install ingress-operator ./helm/ingress-operator
+helm install ingress-doperator ./helm/ingress-doperator
 ```
 
 Or with custom values:
 
 ```bash
-helm install ingress-operator ./helm/ingress-operator \
+helm install ingress-doperator ./helm/ingress-doperator \
   --set operator.gatewayNamespace=my-gateway-namespace \
   --set operator.enableDeletion=true
 ```
@@ -42,19 +42,19 @@ helm install ingress-operator ./helm/ingress-operator \
 ## Uninstalling the Chart
 
 ```bash
-helm uninstall ingress-operator
+helm uninstall ingress-doperator
 ```
 
 ## Configuration
 
-The following table lists the configurable parameters of the ingress-operator chart and their default values.
+The following table lists the configurable parameters of the ingress-doperator chart and their default values.
 
 ### General Configuration
 
 | Parameter | Description | Default |
 |-----------|-------------|---------|
 | `replicaCount` | Number of operator replicas | `1` |
-| `image.repository` | Operator image repository | `fiksn/ingress-operator` |
+| `image.repository` | Operator image repository | `fiksn/ingress-doperator` |
 | `image.pullPolicy` | Image pull policy | `IfNotPresent` |
 | `image.tag` | Image tag (overrides chart appVersion) | `latest` |
 | `imagePullSecrets` | Image pull secrets | `[]` |
@@ -125,28 +125,28 @@ The following table lists the configurable parameters of the ingress-operator ch
 ### Watch a Specific Namespace
 
 ```bash
-helm install ingress-operator ./helm/ingress-operator \
+helm install ingress-doperator ./helm/ingress-doperator \
   --set operator.watchNamespace=my-app-namespace
 ```
 
 ### Enable Resource Deletion
 
 ```bash
-helm install ingress-operator ./helm/ingress-operator \
+helm install ingress-doperator ./helm/ingress-doperator \
   --set operator.enableDeletion=true
 ```
 
 ### Filter by Ingress Class
 
 ```bash
-helm install ingress-operator ./helm/ingress-operator \
+helm install ingress-doperator ./helm/ingress-doperator \
   --set operator.ingressClassFilter="nginx*"
 ```
 
 ### Enable Metrics
 
 ```bash
-helm install ingress-operator ./helm/ingress-operator \
+helm install ingress-doperator ./helm/ingress-doperator \
   --set operator.metricsBindAddress=":8080" \
   --set operator.metricsSecure=false
 ```
@@ -154,7 +154,7 @@ helm install ingress-operator ./helm/ingress-operator \
 ### One Gateway Per Ingress
 
 ```bash
-helm install ingress-operator ./helm/ingress-operator \
+helm install ingress-doperator ./helm/ingress-doperator \
   --set operator.oneGatewayPerIngress=true
 ```
 
@@ -175,7 +175,7 @@ The chart creates the following RBAC resources:
 ### Check operator logs
 
 ```bash
-kubectl logs -l app.kubernetes.io/name=ingress-operator -n <namespace>
+kubectl logs -l app.kubernetes.io/name=ingress-doperator -n <namespace>
 ```
 
 ### Verify Gateway namespace exists

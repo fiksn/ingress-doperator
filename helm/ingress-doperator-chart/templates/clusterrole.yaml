@@ -1,9 +1,9 @@
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRole
 metadata:
-  name: {{ include "ingress-operator.fullname" . }}
+  name: {{ include "ingress-doperator.fullname" . }}
   labels:
-    {{- include "ingress-operator.labels" . | nindent 4 }}
+    {{- include "ingress-doperator.labels" . | nindent 4 }}
 rules:
   # Ingress resources
   - apiGroups:

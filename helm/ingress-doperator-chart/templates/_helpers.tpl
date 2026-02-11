@@ -1,7 +1,7 @@
 {{/*
 Expand the name of the chart.
 */}}
-{{- define "ingress-operator.name" -}}
+{{- define "ingress-doperator.name" -}}
 {{- default .Chart.Name .Values.nameOverride | trunc 63 | trimSuffix "-" }}
 {{- end }}
 
@@ -10,7 +10,7 @@ Create a default fully qualified app name.
 We truncate at 63 chars because some Kubernetes name fields are limited to this (by the DNS naming spec).
 If release name contains chart name it will be used as a full name.
 */}}
-{{- define "ingress-operator.fullname" -}}
+{{- define "ingress-doperator.fullname" -}}
 {{- if .Values.fullnameOverride }}
 {{- .Values.fullnameOverride | trunc 63 | trimSuffix "-" }}
 {{- else }}
@@ -26,16 +26,16 @@ If release name contains chart name it will be used as a full name.
 {{/*
 Create chart name and version as used by the chart label.
 */}}
-{{- define "ingress-operator.chart" -}}
+{{- define "ingress-doperator.chart" -}}
 {{- printf "%s-%s" .Chart.Name .Chart.Version | replace "+" "_" | trunc 63 | trimSuffix "-" }}
 {{- end }}
 
 {{/*
 Common labels
 */}}
-{{- define "ingress-operator.labels" -}}
-helm.sh/chart: {{ include "ingress-operator.chart" . }}
-{{ include "ingress-operator.selectorLabels" . }}
+{{- define "ingress-doperator.labels" -}}
+helm.sh/chart: {{ include "ingress-doperator.chart" . }}
+{{ include "ingress-doperator.selectorLabels" . }}
 {{- if .Chart.AppVersion }}
 app.kubernetes.io/version: {{ .Chart.AppVersion | quote }}
 {{- end }}
@@ -45,17 +45,17 @@ app.kubernetes.io/managed-by: {{ .Release.Service }}
 {{/*
 Selector labels
 */}}
-{{- define "ingress-operator.selectorLabels" -}}
-app.kubernetes.io/name: {{ include "ingress-operator.name" . }}
+{{- define "ingress-doperator.selectorLabels" -}}
+app.kubernetes.io/name: {{ include "ingress-doperator.name" . }}
 app.kubernetes.io/instance: {{ .Release.Name }}
 {{- end }}
 
 {{/*
 Create the name of the service account to use
 */}}
-{{- define "ingress-operator.serviceAccountName" -}}
+{{- define "ingress-doperator.serviceAccountName" -}}
 {{- if .Values.serviceAccount.create }}
-{{- default (include "ingress-operator.fullname" .) .Values.serviceAccount.name }}
+{{- default (include "ingress-doperator.fullname" .) .Values.serviceAccount.name }}
 {{- else }}
 {{- default "default" .Values.serviceAccount.name }}
 {{- end }}

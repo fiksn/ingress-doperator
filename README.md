@@ -1,8 +1,8 @@
-# ingress-operator
-Ingress operator is a way to transition from [ingress-nginx](https://github.com/kubernetes/ingress-nginx) to [nginx-gateway-fabric](https://github.com/nginx/nginx-gateway-fabric)
+# ingress-doperator
+Ingress deprecation operator is a way to transition from [ingress-nginx](https://github.com/kubernetes/ingress-nginx) to [nginx-gateway-fabric](https://github.com/nginx/nginx-gateway-fabric)
 and get started with the [Gateway API](https://gateway-api.sigs.k8s.io/guides/getting-started/)
 
-It can transparently create `Gateway` and `Httproute` resources from `Ingress` (and possibly even delete the `Ingress` altogether afterwards).
+It can transparently create `Gateway`, `Httproute` (and possibly `ReferenceGrant` to allow access to TLS secrets in other namespaces) from `Ingress` resources (and possibly even delete the `Ingress` altogether afterwards).
 
 !!! Nginx ingress controller is [deprecated](https://kubernetes.io/blog/2025/11/11/ingress-nginx-retirement/) and
 will not get security updates after March 2026 !!!
@@ -10,7 +10,7 @@ will not get security updates after March 2026 !!!
 ## Related tools
 
 * [Ingress2Gateway](https://github.com/kubernetes-sigs/ingress2gateway) is a similar tool if you have control over your YAML files and want to update them.
-Unfortunately that is not always the case and an `Ingress` might be provisioned without your control. Ingress-operator includes the mentioned tool as a library
+Unfortunately that is not always the case and an `Ingress` might be provisioned without your control. Ingress-doperator includes the mentioned tool as a library
 so you can benefit from all translation quirks implemented there.
 
 However this tool is primarily meant for `ingress-nginx` audience and comes with a few opinionated (but sane) defaults.
@@ -46,7 +46,7 @@ The operator monitors all Ingress resources across all namespaces and aggregates
 All synthesized resources are annotated with:
 ```yaml
 annotations:
-  ingress-operator.fiction.si/managed-by: ingress-controller
+  ingress-doperator.fiction.si/managed-by: ingress-controller
 ```
 
 **Important:** The operator will NOT overwrite existing Gateway or HTTPRoute resources unless they have this annotation. This prevents conflicts with manually created resources.
@@ -64,7 +64,7 @@ The operator reuses TLS configurations from Ingress resources:
 
 ### Overview
 
-The ingress-operator includes an **admission webhook** that intercepts Ingress creation requests and:
+The ingress-doperator includes an **admission webhook** that intercepts Ingress creation requests and:
 1. Translates the Ingress to Gateway + HTTPRoute resources
 2. Creates the Gateway and HTTPRoute in the cluster
 3. **Rejects the Ingress** by default (prevents it from being stored)
@@ -96,12 +96,12 @@ apiVersion: cert-manager.io/v1
 kind: Certificate
 metadata:
   name: ingress-webhook-cert
-  namespace: ingress-operator-system
+  namespace: ingress-doperator-system
 spec:
   secretName: ingress-webhook-tls
   dnsNames:
-    - ingress-webhook.ingress-operator-system.svc
-    - ingress-webhook.ingress-operator-system.svc.cluster.local
+    - ingress-webhook.ingress-doperator-system.svc
+    - ingress-webhook.ingress-doperator-system.svc.cluster.local
   issuerRef:
     name: selfsigned-issuer
     kind: ClusterIssuer
@@ -121,7 +121,7 @@ apiVersion: apps/v1
 kind: Deployment
 metadata:
   name: ingress-webhook
-  namespace: ingress-operator-system
+  namespace: ingress-doperator-system
 spec:
   replicas: 2
   selector:
@@ -134,7 +134,7 @@ spec:
     spec:
       containers:
       - name: webhook
-        image: your-registry/ingress-operator-webhook:latest
+        image: fiksn/ingress-doperator-webhook:v0.0.1
         imagePullPolicy: Always
         command:
           - /webhook
@@ -173,7 +173,7 @@ apiVersion: v1
 kind: Service
 metadata:
   name: ingress-webhook
-  namespace: ingress-operator-system
+  namespace: ingress-doperator-system
 spec:
   ports:
   - name: webhook
@@ -194,14 +194,14 @@ kind: ValidatingWebhookConfiguration
 metadata:
   name: ingress-to-gateway-webhook
   annotations:
-    cert-manager.io/inject-ca-from: ingress-operator-system/ingress-webhook-cert
+    cert-manager.io/inject-ca-from: ingress-doperator-system/ingress-webhook-cert
 webhooks:
   - name: vingress.fiction.si
     admissionReviewVersions: ["v1"]
     clientConfig:
       service:
         name: ingress-webhook
-        namespace: ingress-operator-system
+        namespace: ingress-doperator-system
         path: /mutate-v1-ingress
       # CA bundle will be injected by cert-manager
     rules:
@@ -215,10 +215,10 @@ webhooks:
     timeoutSeconds: 10
     namespaceSelector:
       matchExpressions:
-        # Exclude kube-system and ingress-operator-system namespaces
+        # Exclude kube-system and ingress-doperator-system namespaces
         - key: kubernetes.io/metadata.name
           operator: NotIn
-          values: ["kube-system", "ingress-operator-system"]
+          values: ["kube-system", "ingress-doperator-system"]
 ```
 
 ### Webhook Configuration Flags
@@ -280,7 +280,7 @@ The webhook supports two translation modes:
 
 The webhook recognizes these annotations on Ingress resources:
 
-#### `ingress-operator.fiction.si/ignore-ingress: "true"`
+#### `ingress-doperator.fiction.si/ignore-ingress: "true"`
 Skip all webhook processing - the Ingress is allowed through unchanged.
 
 ```yaml
@@ -289,12 +289,12 @@ kind: Ingress
 metadata:
   name: legacy-app
   annotations:
-    ingress-operator.fiction.si/ignore-ingress: "true"
+    ingress-doperator.fiction.si/ignore-ingress: "true"
 spec:
   # This Ingress will be created as-is, no Gateway/HTTPRoute created
 ```
 
-#### `ingress-operator.fiction.si/allow-ingress: "true"`
+#### `ingress-doperator.fiction.si/allow-ingress: "true"`
 Create Gateway/HTTPRoute AND allow the Ingress to be created (for compatibility mode).
 
 ```yaml
@@ -303,7 +303,7 @@ kind: Ingress
 metadata:
   name: hybrid-app
   annotations:
-    ingress-operator.fiction.si/allow-ingress: "true"
+    ingress-doperator.fiction.si/allow-ingress: "true"
 spec:
   # Both Ingress and Gateway+HTTPRoute will be created
 ```
@@ -318,7 +318,7 @@ spec:
    ```
    Error from server: admission webhook "vingress.fiction.si" denied the request:
    Ingress resources are not allowed - Gateway and HTTPRoute have been created instead.
-   Use annotation 'ingress-operator.fiction.si/allow-ingress=true' to allow Ingress creation.
+   Use annotation 'ingress-doperator.fiction.si/allow-ingress=true' to allow Ingress creation.
    ```
 
 **With `allow-ingress=true`:**
@@ -368,7 +368,7 @@ metadata:
   name: test-ingress-allowed
   namespace: default
   annotations:
-    ingress-operator.fiction.si/allow-ingress: "true"
+    ingress-doperator.fiction.si/allow-ingress: "true"
 spec:
   ingressClassName: nginx
   rules:
@@ -400,18 +400,18 @@ EOF
 ### Troubleshooting
 
 **Webhook not being called:**
-- Check webhook service is running: `kubectl get pods -n ingress-operator-system`
-- Verify service endpoints: `kubectl get endpoints -n ingress-operator-system`
+- Check webhook service is running: `kubectl get pods -n ingress-doperator-system`
+- Verify service endpoints: `kubectl get endpoints -n ingress-doperator-system`
 - Check ValidatingWebhookConfiguration exists: `kubectl get validatingwebhookconfiguration`
 - Verify CA bundle injected: `kubectl get validatingwebhookconfigurations ingress-to-gateway-webhook -o yaml | grep caBundle`
 
 **Certificate errors:**
 - Check cert-manager is installed: `kubectl get pods -n cert-manager`
-- Verify certificate is ready: `kubectl get certificate -n ingress-operator-system`
-- Check secret created: `kubectl get secret ingress-webhook-tls -n ingress-operator-system`
+- Verify certificate is ready: `kubectl get certificate -n ingress-doperator-system`
+- Check secret created: `kubectl get secret ingress-webhook-tls -n ingress-doperator-system`
 
 **Webhook rejecting everything:**
-- Check logs: `kubectl logs -n ingress-operator-system -l app=ingress-webhook`
+- Check logs: `kubectl logs -n ingress-doperator-system -l app=ingress-webhook`
 - Verify gateway namespace exists: `kubectl get namespace nginx-fabric`
 - Check RBAC permissions for creating Gateway/HTTPRoute
 
@@ -529,7 +529,7 @@ When hostname rewriting is enabled, the operator automatically handles TLS certi
 2. **Wildcard Support**: Recognizes wildcard certificates (e.g., `*.domain.cc` matches `foo.domain.cc`)
 3. **Auto Secret Rename**: If the certificate doesn't match the transformed hostname:
    - Generates a new secret name: `<transformed-hostname>-tls` (e.g., `api-service-migration-domain-cc-tls`)
-   - Adds annotation `ingress-operator.fiction.si/certificate-mismatch` with details
+   - Adds annotation `ingress-doperator.fiction.si/certificate-mismatch` with details
    - cert-manager will detect the new secret reference and issue a certificate for the transformed hostname
 
 **Example:**
@@ -554,11 +554,11 @@ Use `--disable-source-ingress` to automatically disable the original Ingress:
 ```
 
 This will:
-- Save the original `spec.ingressClassName` to annotation `ingress-operator.fiction.si/original-ingress-classname`
+- Save the original `spec.ingressClassName` to annotation `ingress-doperator.fiction.si/original-ingress-classname`
 - Remove `spec.ingressClassName` from the Ingress
-- Save the original `kubernetes.io/ingress.class` annotation to `ingress-operator.fiction.si/original-ingress-class`
+- Save the original `kubernetes.io/ingress.class` annotation to `ingress-doperator.fiction.si/original-ingress-class`
 - Remove `kubernetes.io/ingress.class` annotation
-- Add `ingress-operator.fiction.si/disabled: "true"` annotation
+- Add `ingress-doperator.fiction.si/disabled: "true"` annotation
 
 This prevents nginx-ingress from processing the Ingress while keeping it in the cluster for reference.
 
@@ -674,7 +674,7 @@ The operator:
 **Build and push your image to the location specified by `IMG`:**
 
 ```sh
-make docker-build docker-push IMG=fiksn/ingress-operator:v0.0.1
+make docker-build docker-push IMG=fiksn/ingress-doperator:v0.0.1
 ```
 
 **NOTE:** This image ought to be published in the personal registry you specified.
@@ -690,7 +690,7 @@ make install
 **Deploy the Manager to the cluster with the image specified by `IMG`:**
 
 ```sh
-make deploy IMG=fiksn/ingress-operator:tag
+make deploy IMG=fiksn/ingress-doperator:tag
 ```
 
 > **NOTE**: If you encounter RBAC errors, you may need to grant yourself cluster-admin
@@ -733,7 +733,7 @@ Following the options to release and provide this solution to the users.
 1. Build the installer for the image built and published in the registry:
 
 ```sh
-make build-installer IMG=fiksn/ingress-operator:0.0.1
+make build-installer IMG=fiksn/ingress-doperator:0.0.1
 ```
 
 **NOTE:** The makefile target mentioned above generates an 'install.yaml'
@@ -747,7 +747,7 @@ Users can just run 'kubectl apply -f <URL for YAML BUNDLE>' to install
 the project, i.e.:
 
 ```sh
-kubectl apply -f https://raw.githubusercontent.com/fiksn/ingress-operator/master/dist/install.yaml
+kubectl apply -f https://raw.githubusercontent.com/fiksn/ingress-doperator/master/dist/install.yaml
 ```
 
 ### By providing a Helm Chart

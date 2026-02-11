@@ -1,4 +1,4 @@
-module github.com/fiksn/ingress-operator
+module github.com/fiksn/ingress-doperator
 
 go 1.25.0
 

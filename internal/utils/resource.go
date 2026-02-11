@@ -28,9 +28,9 @@ import (
 )
 
 const (
-	ManagedByAnnotation = "ingress-operator.fiction.si/managed-by"
+	ManagedByAnnotation = "ingress-doperator.fiction.si/managed-by"
 	ManagedByValue      = "ingress-controller"
-	SourceAnnotation    = "ingress-operator.fiction.si/source"
+	SourceAnnotation    = "ingress-doperator.fiction.si/source"
 )
 
 // IsManagedByUs checks if a resource is managed by the ingress operator

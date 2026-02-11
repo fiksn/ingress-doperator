@@ -28,15 +28,15 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/log"
 	"sigs.k8s.io/controller-runtime/pkg/webhook/admission"
 
-	"github.com/fiksn/ingress-operator/internal/metrics"
-	"github.com/fiksn/ingress-operator/internal/translator"
-	"github.com/fiksn/ingress-operator/internal/utils"
+	"github.com/fiksn/ingress-doperator/internal/metrics"
+	"github.com/fiksn/ingress-doperator/internal/translator"
+	"github.com/fiksn/ingress-doperator/internal/utils"
 )
 
 const (
-	IgnoreIngressAnnotation = "ingress-operator.fiction.si/ignore-ingress"
-	AllowIngressAnnotation  = "ingress-operator.fiction.si/allow-ingress"
-	WebhookAnnotation       = "ingress-operator.fiction.si/webhook"
+	IgnoreIngressAnnotation = "ingress-doperator.fiction.si/ignore-ingress"
+	AllowIngressAnnotation  = "ingress-doperator.fiction.si/allow-ingress"
+	WebhookAnnotation       = "ingress-doperator.fiction.si/webhook"
 )
 
 // +kubebuilder:webhook:path=/mutate-v1-ingress,mutating=true,failurePolicy=ignore,groups="networking.k8s.io",resources=ingresses,verbs=create;update,versions=v1,name=mingress.fiction.si,admissionReviewVersions=v1,sideEffects=None
@@ -147,7 +147,7 @@ func (m *IngressMutator) Handle(ctx context.Context, req admission.Request) admi
 			"gateway", gateway.Name,
 			"httpRoute", httpRoute.Name)
 		return admission.Denied("Ingress resources are not allowed - Gateway and HTTPRoute have been created instead. " +
-			"Use annotation 'ingress-operator.fiction.si/allow-ingress=true' to allow Ingress creation.")
+			"Use annotation 'ingress-doperator.fiction.si/allow-ingress=true' to allow Ingress creation.")
 	}
 
 	// If allow annotation is set, mutate and allow the Ingress
@@ -215,4 +215,3 @@ func (m *IngressMutator) matchesIngressClassFilter(ingress *networkingv1.Ingress
 
 	return matched
 }
-
