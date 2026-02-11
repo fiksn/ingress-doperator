@@ -51,9 +51,7 @@ spec:
             {{- if .Values.operator.hostnameRewriteTo }}
             - --hostname-rewrite-to={{ .Values.operator.hostnameRewriteTo }}
             {{- end }}
-            {{- if .Values.operator.disableSourceIngress }}
-            - --disable-source-ingress=true
-            {{- end }}
+            - --ingress-postprocessing={{ .Values.operator.ingressPostProcessing }}
             {{- if .Values.operator.gatewayAnnotations }}
             - --gateway-annotations={{ .Values.operator.gatewayAnnotations }}
             {{- end }}

@@ -39,6 +39,7 @@ import (
 const (
 	IngressClassAnnotation             = "kubernetes.io/ingress.class"
 	IngressDisabledAnnotation          = "ingress-doperator.fiction.si/disabled"
+	IngressRemovedAnnotation           = "ingress-doperator.fiction.si/removed"
 	IgnoreIngressAnnotation            = "ingress-doperator.fiction.si/ignore-ingress"
 	OriginalIngressClassAnnotation     = "ingress-doperator.fiction.si/original-ingress-class"
 	OriginalIngressClassNameAnnotation = "ingress-doperator.fiction.si/original-ingress-classname"
@@ -49,6 +50,18 @@ const (
 	DefaultHTTPRouteAnnotationFilters = "ingress.kubernetes.io,cert-manager.io," +
 		"nginx.ingress.kubernetes.io,kubectl.kubernetes.io,kubernetes.io/ingress.class," +
 		"traefik.ingress.kubernetes.io,ingress-doperator.fiction.si"
+)
+
+// ingressPostProcessing
+type IngressPostProcessingMode string
+
+const (
+	// IngressPostProcessingModeNone leaves the source Ingress unchanged
+	IngressPostProcessingModeNone IngressPostProcessingMode = "as-is"
+	// IngressPostProcessingModeDisable removes the ingress class to disable processing
+	IngressPostProcessingModeDisable IngressPostProcessingMode = "disable"
+	// IngressPostProcessingModeRemove deletes the source Ingress resource
+	IngressPostProcessingModeRemove IngressPostProcessingMode = "remove"
 )
 
 type IngressReconciler struct {
@@ -62,7 +75,7 @@ type IngressReconciler struct {
 	EnableDeletion                   bool
 	HostnameRewriteFrom              string
 	HostnameRewriteTo                string
-	DisableSourceIngress             bool
+	IngressPostProcessingMode        IngressPostProcessingMode
 	GatewayAnnotationFilters         []string
 	HTTPRouteAnnotationFilters       []string
 	DefaultGatewayAnnotations        map[string]string
@@ -148,13 +161,21 @@ func (r *IngressReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 		logger.Info("Added finalizer to Ingress")
 	}
 
-	// Disable source Ingress if requested
-	if r.DisableSourceIngress {
+	// Handle source Ingress based on configured mode
+	if r.IngressPostProcessingMode == IngressPostProcessingModeDisable {
 		if err := r.disableIngress(ctx, &ingress); err != nil {
 			logger.Error(err, "failed to disable source Ingress")
 			return ctrl.Result{}, err
 		}
+	} else if r.IngressPostProcessingMode == IngressPostProcessingModeRemove {
+		if err := r.removeIngress(ctx, &ingress); err != nil {
+			logger.Error(err, "failed to remove source Ingress")
+			return ctrl.Result{}, err
+		}
+		// After removal, no further processing needed
+		return ctrl.Result{}, nil
 	}
+	// IngressPostProcessingModeNone: do nothing, continue with normal processing
 
 	// List Ingresses (all or filtered by namespace)
 	var ingressList networkingv1.IngressList
@@ -509,6 +530,49 @@ func (r *IngressReconciler) disableIngress(ctx context.Context, ingress *network
 		}
 		logger.Info("Successfully disabled source Ingress", "namespace", ingress.Namespace, "name", ingress.Name)
 	}
+
+	return nil
+}
+
+func (r *IngressReconciler) removeIngress(ctx context.Context, ingress *networkingv1.Ingress) error {
+	logger := log.FromContext(ctx)
+
+	// Check if already marked for removal to avoid re-deletion
+	if ingress.Annotations != nil && ingress.Annotations[IngressRemovedAnnotation] == fmt.Sprintf("%t", true) {
+		logger.Info("Ingress already marked for removal, proceeding with deletion")
+		// Delete the Ingress resource
+		if err := r.Delete(ctx, ingress); err != nil {
+			if apierrors.IsNotFound(err) {
+				return nil // Already deleted
+			}
+			return fmt.Errorf("failed to delete source Ingress: %w", err)
+		}
+		logger.Info("Successfully deleted source Ingress", "namespace", ingress.Namespace, "name", ingress.Name)
+		return nil
+	}
+
+	// First, mark the Ingress with removal annotation
+	if ingress.Annotations == nil {
+		ingress.Annotations = make(map[string]string)
+	}
+	ingress.Annotations[IngressRemovedAnnotation] = fmt.Sprintf("%t", true)
+
+	// Also add ignore annotation to prevent re-reconciliation
+	ingress.Annotations[IgnoreIngressAnnotation] = fmt.Sprintf("%t", true)
+
+	if err := r.Update(ctx, ingress); err != nil {
+		return fmt.Errorf("failed to mark Ingress for removal: %w", err)
+	}
+	logger.Info("Marked source Ingress for removal", "namespace", ingress.Namespace, "name", ingress.Name)
+
+	// Delete the Ingress resource
+	if err := r.Delete(ctx, ingress); err != nil {
+		if apierrors.IsNotFound(err) {
+			return nil // Already deleted
+		}
+		return fmt.Errorf("failed to delete source Ingress: %w", err)
+	}
+	logger.Info("Successfully deleted source Ingress", "namespace", ingress.Namespace, "name", ingress.Name)
 
 	return nil
 }

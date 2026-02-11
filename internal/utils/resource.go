@@ -29,7 +29,7 @@ import (
 
 const (
 	ManagedByAnnotation = "ingress-doperator.fiction.si/managed-by"
-	ManagedByValue      = "ingress-controller"
+	ManagedByValue      = "ingress-doperator"
 	SourceAnnotation    = "ingress-doperator.fiction.si/source"
 )
 

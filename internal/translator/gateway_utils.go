@@ -27,17 +27,22 @@ import (
 // Listeners are merged by hostname (unique by listener name)
 // Annotations are merged (desired overwrites existing on conflict, except for special cases)
 func MergeGatewaySpec(existing, desired *gatewayv1.Gateway) {
-	// Merge annotations - desired annotations overwrite existing ones
+	// Merge annotations
 	if existing.Annotations == nil {
 		existing.Annotations = make(map[string]string)
 	}
 	for k, v := range desired.Annotations {
-		// Special handling for certificate-mismatch annotation - merge instead of overwrite
+		// Special handling for certificate-mismatch annotation - merge with semicolon separator
 		if k == MismatchedCertAnnotation {
 			existing.Annotations[k] = MergeCertificateMismatchAnnotation(
 				existing.Annotations[k], v)
-		} else {
+		} else if strings.HasPrefix(k, "ingress-doperator.fiction.si/") {
+			// Other ingress-doperator annotations are not merged, just overwrite
 			existing.Annotations[k] = v
+		} else {
+			// General annotations from Ingress resources - merge with comma separator
+			existing.Annotations[k] = MergeAnnotationValues(
+				existing.Annotations[k], v)
 		}
 	}
 
@@ -152,6 +157,62 @@ func MergeCertificateMismatchAnnotation(existing, desired string) string {
 
 	// Join with semicolon-space separator
 	return strings.Join(values, "; ")
+}
+
+// MergeAnnotationValues merges annotation values from multiple Ingresses
+// Values are comma-separated, and we deduplicate them
+func MergeAnnotationValues(existing, desired string) string {
+	if existing == "" {
+		return desired
+	}
+	if desired == "" {
+		return existing
+	}
+
+	// Split both by comma and collect unique values
+	valuesMap := make(map[string]bool)
+
+	// Add existing values
+	for _, val := range strings.Split(existing, ",") {
+		trimmed := strings.TrimSpace(val)
+		if trimmed != "" {
+			valuesMap[trimmed] = true
+		}
+	}
+
+	// Add desired values
+	for _, val := range strings.Split(desired, ",") {
+		trimmed := strings.TrimSpace(val)
+		if trimmed != "" {
+			valuesMap[trimmed] = true
+		}
+	}
+
+	// Convert back to slice (maintain insertion order by re-parsing)
+	// We'll preserve the order by checking which values appear first
+	var values []string
+	seenInResult := make(map[string]bool)
+
+	// Add from existing first (preserves original order)
+	for _, val := range strings.Split(existing, ",") {
+		trimmed := strings.TrimSpace(val)
+		if trimmed != "" && !seenInResult[trimmed] {
+			values = append(values, trimmed)
+			seenInResult[trimmed] = true
+		}
+	}
+
+	// Add from desired second (new values appear at end)
+	for _, val := range strings.Split(desired, ",") {
+		trimmed := strings.TrimSpace(val)
+		if trimmed != "" && !seenInResult[trimmed] {
+			values = append(values, trimmed)
+			seenInResult[trimmed] = true
+		}
+	}
+
+	// Join with comma separator
+	return strings.Join(values, ",")
 }
 
 // RemoveCertMismatchEntries removes certificate mismatch entries that match the given hostname mappings

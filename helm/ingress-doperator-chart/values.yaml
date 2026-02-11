@@ -71,8 +71,8 @@ operator:
   hostnameRewriteFrom: ""
   hostnameRewriteTo: ""
 
-  # If true, disable source Ingress by removing its ingressClassName
-  disableSourceIngress: false
+  # How to post process ingress
+  ingressPostProcessing: "none"
 
   # Gateway annotations (comma-separated key=value pairs)
   gatewayAnnotations: "cert-manager.io/acme-challenge-type=dns01,cert-manager.io/acme-dns01-provider=default,cert-manager.io/cluster-issuer=letsencrypt-cert-manager"

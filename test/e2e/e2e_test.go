@@ -327,7 +327,7 @@ spec:
 				"-o", "jsonpath={.metadata.annotations.ingress-doperator\\.fiction\\.si/managed-by}")
 			output, err := utils.Run(cmd)
 			Expect(err).NotTo(HaveOccurred())
-			Expect(output).To(Equal("ingress-controller"), "Gateway should have managed-by annotation")
+			Expect(output).To(Equal("ingress-doperator"), "Gateway should have managed-by annotation")
 
 			By("cleaning up test resources")
 			cmd = exec.Command("kubectl", "delete", "ns", testNamespace)

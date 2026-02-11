@@ -91,7 +91,7 @@ func main() {
 	var enableDeletion bool
 	var hostnameRewriteFrom string
 	var hostnameRewriteTo string
-	var disableSourceIngress bool
+	var ingressPostProcessing string
 	var gatewayAnnotations string
 	var gatewayInfraAnnotations string
 	var private bool
@@ -119,8 +119,9 @@ func main() {
 	flag.StringVar(&hostnameRewriteTo, "hostname-rewrite-to", "",
 		"Comma-separated list of replacement domain suffixes (e.g., 'foo.domain.cc,bar.other.com'). "+
 			"Transforms 'a.b.domain.cc' to 'a.b.foo.domain.cc'. Must have same number of items as --hostname-rewrite-from.")
-	flag.BoolVar(&disableSourceIngress, "disable-source-ingress", false,
-		"If true, disable the source Ingress by removing its ingressClassName to prevent nginx-ingress from processing it")
+	flag.StringVar(&ingressPostProcessing, "ingress-postprocessing", "none",
+		"How to handle the post processing of ingress: 'none' (no action), "+
+			"'disable' (remove ingress class), 'remove' (delete ingress)")
 	flag.StringVar(&gatewayAnnotations, "gateway-annotations", DefaultGatewayAnnotations,
 		"Comma-separated key=value pairs for Gateway metadata annotations (applied to all Gateways)")
 	flag.StringVar(&gatewayInfraAnnotations, "gateway-infrastructure-annotations",
@@ -170,6 +171,21 @@ func main() {
 	flag.Parse()
 
 	ctrl.SetLogger(zap.New(zap.UseFlagOptions(&opts)))
+
+	var ingressPostProcessingMode controller.IngressPostProcessingMode
+	switch ingressPostProcessing {
+	case "none":
+		ingressPostProcessingMode = controller.IngressPostProcessingModeNone
+	case "disable":
+		ingressPostProcessingMode = controller.IngressPostProcessingModeDisable
+	case "remove":
+		ingressPostProcessingMode = controller.IngressPostProcessingModeRemove
+	default:
+		setupLog.Error(nil, "Invalid ingress-post-processing value",
+			"value", ingressPostProcessingMode,
+			"allowed", "none, disable, remove")
+		os.Exit(1)
+	}
 
 	// if the enable-http2 flag is false (the default), http/2 should be disabled
 	// due to its vulnerabilities. More specifically, disabling http/2 will
@@ -327,7 +343,7 @@ func main() {
 		EnableDeletion:                   enableDeletion,
 		HostnameRewriteFrom:              hostnameRewriteFrom,
 		HostnameRewriteTo:                hostnameRewriteTo,
-		DisableSourceIngress:             disableSourceIngress,
+		IngressPostProcessingMode:        ingressPostProcessingMode,
 		GatewayAnnotationFilters:         gatewayFilters,
 		HTTPRouteAnnotationFilters:       httpRouteFilters,
 		DefaultGatewayAnnotations:        gwAnnotations,
@@ -385,8 +401,13 @@ func main() {
 		os.Exit(1)
 	}
 
-	if disableSourceIngress {
-		setupLog.Info("Source Ingress disabling enabled: ingressClassName will be removed from source Ingress")
+	switch ingressPostProcessingMode {
+	case controller.IngressPostProcessingModeNone:
+		setupLog.Info("Ingress post processing mode: none")
+	case controller.IngressPostProcessingModeDisable:
+		setupLog.Info("Ingress post processing mode: disable")
+	case controller.IngressPostProcessingModeRemove:
+		setupLog.Info("Ingress post processing mode: remove")
 	}
 
 	// +kubebuilder:scaffold:builder
