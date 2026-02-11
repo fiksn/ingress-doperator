@@ -162,20 +162,22 @@ func (r *IngressReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 	}
 
 	// Handle source Ingress based on configured mode
-	if r.IngressPostProcessingMode == IngressPostProcessingModeDisable {
+	switch r.IngressPostProcessingMode {
+	case IngressPostProcessingModeDisable:
 		if err := r.disableIngress(ctx, &ingress); err != nil {
 			logger.Error(err, "failed to disable source Ingress")
 			return ctrl.Result{}, err
 		}
-	} else if r.IngressPostProcessingMode == IngressPostProcessingModeRemove {
+	case IngressPostProcessingModeRemove:
 		if err := r.removeIngress(ctx, &ingress); err != nil {
 			logger.Error(err, "failed to remove source Ingress")
 			return ctrl.Result{}, err
 		}
 		// After removal, no further processing needed
 		return ctrl.Result{}, nil
+	case IngressPostProcessingModeNone:
+		// Do nothing, continue with normal processing
 	}
-	// IngressPostProcessingModeNone: do nothing, continue with normal processing
 
 	// List Ingresses (all or filtered by namespace)
 	var ingressList networkingv1.IngressList
