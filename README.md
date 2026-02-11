@@ -13,7 +13,7 @@ will not get security updates after March 2026 !!!
 Unfortunately that is not always the case and an `Ingress` might be provisioned without your control. Ingress-operator includes the mentioned tool as a library
 so you can benefit from all translation quirks implemented there.
 
-However this tool is primarily meant for `ingress-nginx` audience and comes with a few opinionated but sane defaults.
+However this tool is primarily meant for `ingress-nginx` audience and comes with a few opinionated (but sane) defaults.
 
 For instance operator enables a "shared mode" (unless you start it with `--one-gateway-per-ingress`) which means you do not need a new `Gateway` for each `Ingress` but
 can aggregate multiple vhosts in one thereby save cluster resources. This way you just get one (or if you change `nginxproxies` crd also more)
@@ -308,9 +308,9 @@ spec:
   # Both Ingress and Gateway+HTTPRoute will be created
 ```
 
-### Behavior
+### Behaviour
 
-**Default behavior (no annotations):**
+**Default behaviour (no annotations):**
 1. Webhook receives Ingress creation request
 2. Translates Ingress → Gateway + HTTPRoute
 3. Creates Gateway and HTTPRoute resources
@@ -466,7 +466,7 @@ Multiple Ingresses share Gateways based on their `ingressClassName` (or annotati
 ./bin/operator
 ```
 
-**Behavior:**
+**Behaviour:**
 - Ingresses with the same `spec.ingressClassName` (or `kubernetes.io/ingress.class` annotation) share a Gateway
 - Gateway name is determined by the IngressClass name
 - If no IngressClass is specified, uses the `--gateway-name` value
@@ -480,7 +480,7 @@ Each Ingress gets its own dedicated Gateway:
 ./bin/operator --one-gateway-per-ingress
 ```
 
-**Behavior:**
+**Behaviour:**
 - Each Ingress creates a Gateway with the same name
 - IngressClass is ignored
 - Gateway and HTTPRoute have the same name as the Ingress
@@ -580,7 +580,7 @@ This prevents nginx-ingress from processing the Ingress while keeping it in the 
 # Step 5: Clean up old Ingresses when satisfied
 ```
 
-## Deletion Behavior
+## Deletion behaviour
 
 By default (`--enable-deletion=false`), the operator **does NOT delete** Gateway and HTTPRoute resources when an Ingress is deleted. This is the safe default to prevent accidental deletion of resources that might be in use.
 
@@ -600,7 +600,57 @@ When `--enable-deletion=true`:
 ./bin/operator --enable-deletion
 ```
 
-## Behavior
+## Multiple replicas
+
+You need to change `NginxProxy` resource to add multiple replicas and anti-affinity rules.
+
+```yaml
+apiVersion: gateway.nginx.org/v1alpha2
+kind: NginxProxy
+metadata:
+  annotations:
+    meta.helm.sh/release-name: nginx-gateway
+    meta.helm.sh/release-namespace: nginx-gateway
+  labels:
+    app.kubernetes.io/instance: nginx-gateway
+    app.kubernetes.io/managed-by: Helm
+    app.kubernetes.io/name: nginx-gateway-fabric
+    app.kubernetes.io/version: 2.4.1
+    helm.sh/chart: nginx-gateway-fabric-2.4.1
+  name: nginx-gateway-proxy-config
+  namespace: nginx-gateway
+spec:
+  ipFamily: dual
+  kubernetes:
+    deployment:
+      container:
+        image:
+          pullPolicy: IfNotPresent
+          repository: ghcr.io/nginx/nginx-gateway-fabric/nginx
+          tag: 2.4.1
+      patches:
+      - type: StrategicMerge
+        value:
+          spec:
+            template:
+              spec:
+                affinity:
+                  podAntiAffinity:
+                    requiredDuringSchedulingIgnoredDuringExecution:
+                    - labelSelector:
+                        matchExpressions:
+                        - key: app
+                          operator: In
+                          values:
+                          - nginx-gateway
+                      topologyKey: kubernetes.io/hostname
+      replicas: 3
+    service:
+      externalTrafficPolicy: Local
+      type: LoadBalancer
+```
+
+## Behaviour
 
 The operator:
 1. **Watches** Ingress resources (all namespaces or filtered)
