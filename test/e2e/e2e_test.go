@@ -266,15 +266,12 @@ var _ = Describe("Manager", Ordered, func() {
 
 		It("should translate Ingress to Gateway API resources", func() {
 			testNamespace := "test-ingress-translation"
+			gatewayNamespace := "default" // Operator is configured with --gateway-namespace=default
 
 			By("creating test namespace")
 			cmd := exec.Command("kubectl", "create", "ns", testNamespace)
 			_, err := utils.Run(cmd)
 			Expect(err).NotTo(HaveOccurred(), "Failed to create test namespace")
-
-			By("creating the gateway namespace if it doesn't exist")
-			cmd = exec.Command("kubectl", "create", "ns", "nginx-fabric")
-			_, _ = utils.Run(cmd) // Ignore error if already exists
 
 			By("creating a sample Ingress resource")
 			sampleIngress := `
@@ -310,7 +307,7 @@ spec:
 
 			By("verifying Gateway resource is created")
 			Eventually(func(g Gomega) {
-				cmd := exec.Command("kubectl", "get", "gateway", "nginx", "-n", "nginx-fabric", "-o", "json")
+				cmd := exec.Command("kubectl", "get", "gateway", "nginx", "-n", gatewayNamespace, "-o", "json")
 				output, err := utils.Run(cmd)
 				g.Expect(err).NotTo(HaveOccurred(), "Gateway should be created")
 				g.Expect(output).To(ContainSubstring("test.example.com"), "Gateway should have the hostname")
@@ -326,7 +323,7 @@ spec:
 			}, 2*time.Minute, 5*time.Second).Should(Succeed())
 
 			By("verifying managed-by annotations are present")
-			cmd = exec.Command("kubectl", "get", "gateway", "nginx", "-n", "nginx-fabric",
+			cmd = exec.Command("kubectl", "get", "gateway", "nginx", "-n", gatewayNamespace,
 				"-o", "jsonpath={.metadata.annotations.ingress-operator\\.fiction\\.si/managed-by}")
 			output, err := utils.Run(cmd)
 			Expect(err).NotTo(HaveOccurred())

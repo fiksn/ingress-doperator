@@ -35,6 +35,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/webhook/admission"
 	gatewayv1 "sigs.k8s.io/gateway-api/apis/v1"
 
+	_ "github.com/fiksn/ingress-operator/internal/metrics" // Import to register metrics
 	"github.com/fiksn/ingress-operator/internal/translator"
 	webhookhandler "github.com/fiksn/ingress-operator/internal/webhook"
 )

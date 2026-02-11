@@ -27,7 +27,9 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/log"
 	"sigs.k8s.io/controller-runtime/pkg/webhook/admission"
 
+	"github.com/fiksn/ingress-operator/internal/metrics"
 	"github.com/fiksn/ingress-operator/internal/translator"
+	"github.com/fiksn/ingress-operator/internal/utils"
 )
 
 const (
@@ -85,9 +87,11 @@ func (m *IngressMutator) Handle(ctx context.Context, req admission.Request) admi
 			// Don't fail the admission, just log
 		} else {
 			logger.Info("Updated Gateway", "name", gateway.Name, "namespace", gateway.Namespace)
+			metrics.GatewayResourcesTotal.WithLabelValues("update", gateway.Namespace, gateway.Name).Inc()
 		}
 	} else {
 		logger.Info("Created Gateway", "name", gateway.Name, "namespace", gateway.Namespace)
+		metrics.GatewayResourcesTotal.WithLabelValues("create", gateway.Namespace, gateway.Name).Inc()
 	}
 
 	// Create the HTTPRoute resource
@@ -98,9 +102,26 @@ func (m *IngressMutator) Handle(ctx context.Context, req admission.Request) admi
 			// Don't fail the admission, just log
 		} else {
 			logger.Info("Updated HTTPRoute", "name", httpRoute.Name, "namespace", httpRoute.Namespace)
+			metrics.HTTPRouteResourcesTotal.WithLabelValues("update", httpRoute.Namespace, httpRoute.Name).Inc()
 		}
 	} else {
 		logger.Info("Created HTTPRoute", "name", httpRoute.Name, "namespace", httpRoute.Namespace)
+		metrics.HTTPRouteResourcesTotal.WithLabelValues("create", httpRoute.Namespace, httpRoute.Name).Inc()
+	}
+
+	// Create ReferenceGrant if needed (when Ingress has TLS and Gateway is in different namespace)
+	// Skip in ingress2gateway mode as it handles this itself
+	if !m.Translator.Config.UseIngress2Gateway && len(ingress.Spec.TLS) > 0 &&
+		ingress.Namespace != m.Translator.Config.GatewayNamespace {
+		recordMetric := func(operation, namespace, name string) {
+			metrics.ReferenceGrantResourcesTotal.WithLabelValues(operation, namespace, name).Inc()
+		}
+		if err := utils.ApplyReferenceGrant(ctx, m.Client, m.Translator, ingress.Namespace, recordMetric); err != nil {
+			logger.Error(err, "failed to apply ReferenceGrant", "namespace", ingress.Namespace)
+			// Don't fail the admission, just log
+		} else {
+			logger.Info("Applied ReferenceGrant", "namespace", ingress.Namespace)
+		}
 	}
 
 	// By default, reject the Ingress after creating Gateway/HTTPRoute

@@ -43,6 +43,7 @@ import (
 	gatewayv1beta1 "sigs.k8s.io/gateway-api/apis/v1beta1"
 
 	"github.com/fiksn/ingress-operator/internal/controller"
+	_ "github.com/fiksn/ingress-operator/internal/metrics" // Import to register metrics
 	// +kubebuilder:scaffold:imports
 )
 
