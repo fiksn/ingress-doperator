@@ -1200,7 +1200,7 @@ func (r *IngressReconciler) maybeRecordReconcile(
 	if ingress == nil {
 		return
 	}
-	if err != nil || result.Requeue || result.RequeueAfter != 0 {
+	if err != nil || result.RequeueAfter != 0 {
 		return
 	}
 	if r.ReconcileCache == nil {
