@@ -218,6 +218,7 @@ func main() {
 		HTTPRouteManager: &utils.HTTPRouteManager{
 			Client: mgr.GetClient(),
 		},
+		Recorder: mgr.GetEventRecorderFor("ingress-doperator-webhook"),
 	}
 
 	mgr.GetWebhookServer().Register("/mutate-v1-ingress",

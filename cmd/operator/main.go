@@ -104,6 +104,7 @@ func main() {
 	var ingressClassFilter string
 	var ingressClassSnippetsFilters string
 	var reconcileCachePersist bool
+	var reconcileCacheMaxEntries int
 	var useIngress2Gateway bool
 	var ingress2GatewayProvider string
 	var ingress2GatewayIngressClass string
@@ -148,6 +149,8 @@ func main() {
 			"If ingress class matches the glob, the SnippetsFilter is copied from the Gateway namespace and attached.")
 	flag.BoolVar(&reconcileCachePersist, "reconcile-cache-persist", true,
 		"If false, do not persist the reconcile cache to ConfigMaps.")
+	flag.IntVar(&reconcileCacheMaxEntries, "reconcile-cache-max-entries", 0,
+		"Maximum number of entries to keep in reconcile cache (0 = unlimited).")
 	flag.StringVar(&gatewayAnnotationFilters, "gateway-annotation-filters",
 		controller.DefaultGatewayAnnotationFilters,
 		"Comma-separated list of annotation prefixes to exclude from Gateway resources")
@@ -390,6 +393,7 @@ func main() {
 	if err = (&controller.IngressReconciler{
 		Client:                           mgr.GetClient(),
 		Scheme:                           mgr.GetScheme(),
+		Recorder:                         mgr.GetEventRecorderFor("ingress-doperator"),
 		GatewayNamespace:                 gatewayNamespace,
 		GatewayName:                      gatewayName,
 		GatewayClassName:                 gatewayClassName,
@@ -413,6 +417,7 @@ func main() {
 		ReconcileCacheBaseName:           utils.ReconcileCacheConfigMapBaseName,
 		ReconcileCacheShards:             utils.ReconcileCacheShardCount,
 		ReconcileCachePersist:            reconcileCachePersist,
+		ReconcileCacheMaxEntries:         reconcileCacheMaxEntries,
 		UseIngress2Gateway:               useIngress2Gateway,
 		Ingress2GatewayProvider:          ingress2GatewayProvider,
 		Ingress2GatewayIngressClass:      ingress2GatewayIngressClass,

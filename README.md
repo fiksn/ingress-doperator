@@ -2,8 +2,9 @@
 Ingress deprecation operator is a way to transition from [ingress-nginx](https://github.com/kubernetes/ingress-nginx) to [nginx-gateway-fabric](https://github.com/nginx/nginx-gateway-fabric)
 and get started with the [Gateway API](https://gateway-api.sigs.k8s.io/guides/getting-started/)
 
-It can transparently create `Gateway`, `Httproute` (and possibly `ReferenceGrant` to allow access to TLS secrets in other namespaces) from `Ingress` resources.
-Depending on `--ingress-postprocessing` it can either disable the original ingress, remove it completely or just leave it (for future reference).
+It can transparently create `Gateway`, `Httproute` (and possibly `ReferenceGrant` to allow access to TLS secrets in other namespaces or `SnippetsFilter` to translate known `nginx.ingress.kubernetes.io` annotations)
+from `Ingress` resources.
+Depending on `--ingress-postprocessing` it can either ("disable") disable the original ingress, remove it completely ("remove") or just leave it (for future reference).
 
 !!! Nginx ingress controller is [deprecated](https://kubernetes.io/blog/2025/11/11/ingress-nginx-retirement/) and
 will not get security updates after March 2026 !!!

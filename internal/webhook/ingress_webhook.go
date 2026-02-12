@@ -25,6 +25,7 @@ import (
 
 	networkingv1 "k8s.io/api/networking/v1"
 	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/client-go/tools/record"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/log"
 	"sigs.k8s.io/controller-runtime/pkg/webhook/admission"
@@ -52,6 +53,7 @@ type IngressMutator struct {
 	IngressClassFilter          string
 	IngressClassSnippetsFilters []utils.IngressClassSnippetsFilter
 	HTTPRouteManager            *utils.HTTPRouteManager
+	Recorder                    record.EventRecorder
 }
 
 // Handle performs the mutation
@@ -63,6 +65,7 @@ func (m *IngressMutator) Handle(ctx context.Context, req admission.Request) admi
 	err := m.decoder.Decode(req, ingress)
 	if err != nil {
 		logger.Error(err, "failed to decode ingress")
+		m.recordWarning(ingress, "DecodeFailed", "failed to decode ingress")
 		return admission.Errored(http.StatusBadRequest, err)
 	}
 
@@ -92,12 +95,14 @@ func (m *IngressMutator) Handle(ctx context.Context, req admission.Request) admi
 	gateway, httpRoute, err := m.Translator.Translate(ingress)
 	if err != nil {
 		logger.Error(err, "failed to translate ingress")
+		m.recordWarning(ingress, "TranslateFailed", "failed to translate ingress")
 		return admission.Errored(http.StatusInternalServerError, err)
 	}
 
 	// Resolve any named ports
 	if err := m.HTTPRouteManager.ResolveNamedPorts(ctx, ingress, httpRoute); err != nil {
 		logger.Error(err, "failed to resolve named ports")
+		m.recordWarning(ingress, "ResolveNamedPortsFailed", "failed to resolve named ports")
 		// Continue anyway with fallback ports
 	}
 
@@ -109,6 +114,7 @@ func (m *IngressMutator) Handle(ctx context.Context, req admission.Request) admi
 		// If already exists, update it
 		if err := m.Client.Update(ctx, gateway); err != nil {
 			logger.Error(err, "failed to create/update Gateway")
+			m.recordWarning(ingress, "GatewayApplyFailed", "failed to create/update Gateway")
 			// Don't fail the admission, just log
 		} else {
 			logger.Info("Updated Gateway", "name", gateway.Name, "namespace", gateway.Namespace)
@@ -128,6 +134,7 @@ func (m *IngressMutator) Handle(ctx context.Context, req admission.Request) admi
 	m.applyIngressAnnotationSnippetsFilter(ctx, ingress, httpRoutes)
 	if err := m.HTTPRouteManager.ApplyHTTPRoutesAtomic(ctx, ingress, httpRoutes, metricRecorder); err != nil {
 		logger.Error(err, "failed to apply HTTPRoutes")
+		m.recordWarning(ingress, "HTTPRouteApplyFailed", "failed to apply HTTPRoutes")
 		// Don't fail the admission, just log
 	}
 	m.finalizeIngressClassSnippetsFilters(ctx, ingress)
@@ -142,6 +149,7 @@ func (m *IngressMutator) Handle(ctx context.Context, req admission.Request) admi
 		}
 		if err := utils.ApplyReferenceGrant(ctx, m.Client, m.Scheme, m.Translator, ingress.Namespace, recordMetric); err != nil {
 			logger.Error(err, "failed to apply ReferenceGrant", "namespace", ingress.Namespace)
+			m.recordWarning(ingress, "ReferenceGrantApplyFailed", "failed to apply ReferenceGrant")
 			// Don't fail the admission, just log
 		} else {
 			logger.Info("Applied ReferenceGrant", "namespace", ingress.Namespace)
@@ -181,6 +189,13 @@ func (m *IngressMutator) Handle(ctx context.Context, req admission.Request) admi
 func (m *IngressMutator) InjectDecoder(d *admission.Decoder) error {
 	m.decoder = *d
 	return nil
+}
+
+func (m *IngressMutator) recordWarning(ingress *networkingv1.Ingress, reason, message string) {
+	if m.Recorder == nil || ingress == nil {
+		return
+	}
+	m.Recorder.Event(ingress, "Warning", reason, message)
 }
 
 func (m *IngressMutator) applyIngressClassSnippetsFilters(

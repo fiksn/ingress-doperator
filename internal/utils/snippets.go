@@ -490,7 +490,27 @@ func EnsureSnippetsFilterCopyForHTTPRoute(
 	source.SetGroupVersionKind(gvk)
 	if err := c.Get(ctx, types.NamespacedName{Namespace: sourceNamespace, Name: filterName}, source); err != nil {
 		if apierrors.IsNotFound(err) {
-			return false, fmt.Errorf("SnippetsFilter %s/%s not found", sourceNamespace, filterName)
+			if destNamespace == "" {
+				return false, nil
+			}
+			existing := &unstructured.Unstructured{}
+			existing.SetGroupVersionKind(gvk)
+			if err := c.Get(ctx, types.NamespacedName{Namespace: destNamespace, Name: filterName}, existing); err != nil {
+				if apierrors.IsNotFound(err) {
+					return false, nil
+				}
+				return false, err
+			}
+			if !IsManagedByUs(existing) {
+				return false, nil
+			}
+			logger.Info("Deleting SnippetsFilter copy (source missing)",
+				"namespace", destNamespace,
+				"name", filterName)
+			if err := c.Delete(ctx, existing); err != nil && !apierrors.IsNotFound(err) {
+				return false, fmt.Errorf("failed to delete SnippetsFilter %s/%s: %w", destNamespace, filterName, err)
+			}
+			return false, nil
 		}
 		return false, err
 	}
@@ -865,4 +885,20 @@ func copyStringMap(input map[string]string) map[string]string {
 		out[key] = value
 	}
 	return out
+}
+
+// SnippetsFilterGVK returns the GroupVersionKind used for SnippetsFilter watches.
+func SnippetsFilterGVK() schema.GroupVersionKind {
+	return ExtensionFilterGVK(SnippetsFilterKind, SnippetsFilterCRDName)
+}
+
+func ExtensionFilterGVK(kind, crdName string) schema.GroupVersionKind {
+	version := "v1"
+	if cached, ok := crdVersionCache.Load(crdName); ok {
+		entry := cached.(crdVersionCacheEntry)
+		if entry.version != "" {
+			version = entry.version
+		}
+	}
+	return schema.GroupVersionKind{Group: NginxGatewayGroup, Version: version, Kind: kind}
 }

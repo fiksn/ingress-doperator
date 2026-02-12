@@ -20,18 +20,24 @@ import (
 	"context"
 	"fmt"
 	"path/filepath"
+	"sort"
 	"sync"
 	"time"
 
 	networkingv1 "k8s.io/api/networking/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/client-go/tools/record"
 	ctrl "sigs.k8s.io/controller-runtime"
+	ctrlbuilder "sigs.k8s.io/controller-runtime/pkg/builder"
 	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/handler"
 	"sigs.k8s.io/controller-runtime/pkg/log"
 	"sigs.k8s.io/controller-runtime/pkg/predicate"
+	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 	gatewayv1 "sigs.k8s.io/gateway-api/apis/v1"
 
 	"github.com/fiksn/ingress-doperator/internal/metrics"
@@ -75,6 +81,7 @@ const requeueAfterError = 30 * time.Second
 type IngressReconciler struct {
 	client.Client
 	Scheme                           *runtime.Scheme
+	Recorder                         record.EventRecorder
 	GatewayNamespace                 string
 	GatewayName                      string
 	GatewayClassName                 string
@@ -102,7 +109,10 @@ type IngressReconciler struct {
 	ReconcileCacheBaseName           string
 	ReconcileCacheShards             int
 	ReconcileCachePersist            bool
+	ReconcileCacheMaxEntries         int
 	reconcileCacheMu                 sync.Mutex
+	errorLogMu                       sync.Mutex
+	errorLogLast                     map[string]time.Time
 }
 
 // getTranslator creates a translator instance with the reconciler's configuration
@@ -158,6 +168,15 @@ func (r *IngressReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 		logger.V(1).Info("Ingress class does not match filter, skipping reconciliation",
 			"ingressClass", ingressClass,
 			"filter", r.IngressClassFilter)
+		metrics.IngressReconcileSkipsTotal.WithLabelValues("class-filter", ingress.Namespace, ingress.Name).Inc()
+		return ctrl.Result{}, nil
+	}
+
+	if ingress.Annotations != nil && ingress.Annotations[IngressDisabledAnnotation] == fmt.Sprintf("%t", true) {
+		logger.V(1).Info("Ingress is disabled, skipping reconciliation",
+			"namespace", ingress.Namespace,
+			"name", ingress.Name)
+		metrics.IngressReconcileSkipsTotal.WithLabelValues("disabled", ingress.Namespace, ingress.Name).Inc()
 		return ctrl.Result{}, nil
 	}
 
@@ -166,6 +185,7 @@ func (r *IngressReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 			"namespace", ingress.Namespace,
 			"name", ingress.Name,
 			"resourceVersion", ingress.ResourceVersion)
+		metrics.IngressReconcileSkipsTotal.WithLabelValues("cache", ingress.Namespace, ingress.Name).Inc()
 		return ctrl.Result{}, nil
 	}
 
@@ -220,13 +240,19 @@ func (r *IngressReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 
 	if r.OneGatewayPerIngress {
 		// Mode: One Gateway per Ingress
-		result := r.reconcileOneGatewayPerIngress(ctx, ingressList.Items)
+		result, ok := r.reconcileOneGatewayPerIngress(ctx, ingressList.Items)
+		if ok {
+			r.recordNormal(&ingress, "ReconcileSuccess", "Ingress reconcile completed")
+		}
 		r.maybeRecordReconcile(&ingress, result, nil)
 		return result, nil
 	}
 
 	// Mode: Shared Gateways (group by IngressClass)
-	result := r.reconcileSharedGateways(ctx, ingressList.Items)
+	result, ok := r.reconcileSharedGateways(ctx, ingressList.Items)
+	if ok {
+		r.recordNormal(&ingress, "ReconcileSuccess", "Ingress reconcile completed")
+	}
 	r.maybeRecordReconcile(&ingress, result, nil)
 	return result, nil
 }
@@ -234,7 +260,7 @@ func (r *IngressReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 func (r *IngressReconciler) reconcileOneGatewayPerIngress(
 	ctx context.Context,
 	ingresses []networkingv1.Ingress,
-) ctrl.Result {
+) (ctrl.Result, bool) {
 	logger := log.FromContext(ctx)
 	trans := r.getTranslator()
 	hadError := false
@@ -249,6 +275,7 @@ func (r *IngressReconciler) reconcileOneGatewayPerIngress(
 		gateway, httpRoute, err := singleTrans.Translate(&ingress)
 		if err != nil {
 			logger.Error(err, "failed to translate Ingress", "namespace", ingress.Namespace, "name", ingress.Name)
+			r.logErrorRateLimited(err, "translate-ingress", "failed to translate ingress")
 			hadError = true
 			continue
 		}
@@ -268,6 +295,7 @@ func (r *IngressReconciler) reconcileOneGatewayPerIngress(
 		canManageGateway, err := utils.CanUpdateResource(ctx, r.Client, existingGateway, gatewayNN)
 		if err != nil {
 			logger.Error(err, "error checking Gateway resource")
+			r.logErrorRateLimited(err, "check-gateway", "error checking Gateway resource")
 			hadError = true
 			continue
 		}
@@ -276,6 +304,7 @@ func (r *IngressReconciler) reconcileOneGatewayPerIngress(
 			logger.V(1).Info("Creating Gateway", "name", gateway.Name, "namespace", gateway.Namespace)
 			if err := r.applyGateway(ctx, gateway, existingGateway); err != nil {
 				logger.Error(err, "failed to apply Gateway")
+				r.logErrorRateLimited(err, "apply-gateway", "failed to apply Gateway")
 				hadError = true
 				continue
 			}
@@ -297,22 +326,23 @@ func (r *IngressReconciler) reconcileOneGatewayPerIngress(
 		}
 		if err := r.HTTPRouteManager.ApplyHTTPRoutesAtomic(ctx, &ingress, httpRoutes, metricRecorder); err != nil {
 			logger.Error(err, "failed to apply HTTPRoutes")
+			r.logErrorRateLimited(err, "apply-httproutes", "failed to apply HTTPRoutes")
 			hadError = true
 			continue
 		}
 	}
 
 	if hadError {
-		return ctrl.Result{RequeueAfter: requeueAfterError}
+		return ctrl.Result{RequeueAfter: requeueAfterError}, false
 	}
 
-	return ctrl.Result{}
+	return ctrl.Result{}, true
 }
 
 func (r *IngressReconciler) reconcileSharedGateways(
 	ctx context.Context,
 	ingresses []networkingv1.Ingress,
-) ctrl.Result {
+) (ctrl.Result, bool) {
 	logger := log.FromContext(ctx)
 	hadError := false
 
@@ -336,6 +366,7 @@ func (r *IngressReconciler) reconcileSharedGateways(
 		canManageGateway, err := utils.CanUpdateResource(ctx, r.Client, existingGateway, gatewayNN)
 		if err != nil {
 			logger.Error(err, "error checking Gateway resource")
+			r.logErrorRateLimited(err, "check-gateway", "error checking Gateway resource")
 			hadError = true
 			continue
 		}
@@ -344,6 +375,7 @@ func (r *IngressReconciler) reconcileSharedGateways(
 			logger.V(1).Info("Reconciling Gateway", "name", gateway.Name, "namespace", gateway.Namespace)
 			if err := r.applyGateway(ctx, gateway, existingGateway); err != nil {
 				logger.Error(err, "failed to apply Gateway")
+				r.logErrorRateLimited(err, "apply-gateway", "failed to apply Gateway")
 				hadError = true
 				continue
 			}
@@ -379,6 +411,7 @@ func (r *IngressReconciler) reconcileSharedGateways(
 			}
 			if err := r.HTTPRouteManager.ApplyHTTPRoutesAtomic(ctx, &ingress, httpRoutes, metricRecorder); err != nil {
 				logger.Error(err, "failed to apply HTTPRoutes")
+				r.logErrorRateLimited(err, "apply-httproutes", "failed to apply HTTPRoutes")
 				hadError = true
 				continue
 			}
@@ -394,6 +427,7 @@ func (r *IngressReconciler) reconcileSharedGateways(
 			}
 			if err := utils.EnsureReferenceGrants(ctx, r.Client, r.Scheme, trans, classIngresses, recordMetric); err != nil {
 				logger.Error(err, "failed to ensure ReferenceGrants")
+				r.logErrorRateLimited(err, "referencegrant", "failed to ensure ReferenceGrants")
 				// Don't fail the reconciliation, just log the error
 				hadError = true
 			}
@@ -401,10 +435,10 @@ func (r *IngressReconciler) reconcileSharedGateways(
 	}
 
 	if hadError {
-		return ctrl.Result{RequeueAfter: requeueAfterError}
+		return ctrl.Result{RequeueAfter: requeueAfterError}, false
 	}
 
-	return ctrl.Result{}
+	return ctrl.Result{}, true
 }
 
 func (r *IngressReconciler) applyHTTPRouteExtensionRefs(
@@ -488,6 +522,8 @@ func (r *IngressReconciler) applyHTTPRouteExtensionRefs(
 				)
 				if err != nil {
 					logger.Error(err, "failed to apply class-based SnippetsFilter copy", "name", mapping.Name, "namespace", ingress.Namespace)
+					r.recordWarning(ingress, "SnippetsFilterCopyFailed",
+						fmt.Sprintf("failed to copy SnippetsFilter %s from %s", mapping.Name, r.GatewayNamespace))
 					continue
 				}
 				if ok {
@@ -528,6 +564,8 @@ func (r *IngressReconciler) applyHTTPRouteExtensionRefs(
 			)
 			if err != nil {
 				logger.Error(err, "failed to apply annotation SnippetsFilter", "name", filterName, "namespace", httpRoute.Namespace)
+				r.recordWarning(ingress, "AnnotationSnippetsFilterFailed",
+					fmt.Sprintf("failed to apply annotation SnippetsFilter %s", filterName))
 				continue
 			}
 			if ready {
@@ -690,6 +728,25 @@ func (r *IngressReconciler) evictReconcileCache(ingress *networkingv1.Ingress) {
 		cacheCopyEntries,
 	); err != nil {
 		log.FromContext(context.Background()).Error(err, "failed to persist reconcile cache eviction")
+	}
+}
+
+func (r *IngressReconciler) evictOldestCacheEntries() {
+	type entry struct {
+		key string
+		ts  int64
+	}
+	entries := make([]entry, 0, len(r.ReconcileCache))
+	for key, value := range r.ReconcileCache {
+		entries = append(entries, entry{key: key, ts: value.UpdatedAtUnix})
+	}
+	sort.Slice(entries, func(i, j int) bool {
+		return entries[i].ts < entries[j].ts
+	})
+	for len(r.ReconcileCache) > r.ReconcileCacheMaxEntries && len(entries) > 0 {
+		oldest := entries[0]
+		delete(r.ReconcileCache, oldest.key)
+		entries = entries[1:]
 	}
 }
 
@@ -926,15 +983,186 @@ func (r *IngressReconciler) applyGateway(
 }
 
 func (r *IngressReconciler) SetupWithManager(mgr ctrl.Manager) error {
-	builder := ctrl.NewControllerManagedBy(mgr).
+	b := ctrl.NewControllerManagedBy(mgr).
 		For(&networkingv1.Ingress{})
 
 	// If watching specific namespace, add namespace filter
 	if r.WatchNamespace != "" {
-		builder = builder.WithEventFilter(NamespaceFilter(r.WatchNamespace))
+		b = b.WithEventFilter(NamespaceFilter(r.WatchNamespace))
 	}
 
-	return builder.Complete(r)
+	snippetsGVK := utils.SnippetsFilterGVK()
+	snippets := &unstructured.Unstructured{}
+	snippets.SetGroupVersionKind(snippetsGVK)
+	b = b.Watches(
+		snippets,
+		handler.EnqueueRequestsFromMapFunc(func(ctx context.Context, obj client.Object) []reconcile.Request {
+			return r.enqueueIngressesForSnippetsFilter(ctx, obj)
+		}),
+		ctrlbuilder.WithPredicates(predicate.NewPredicateFuncs(func(obj client.Object) bool {
+			return obj.GetNamespace() == r.GatewayNamespace
+		})),
+	)
+
+	authGVK := utils.ExtensionFilterGVK(utils.AuthenticationFilterKind, utils.AuthenticationFilterCRDName)
+	auth := &unstructured.Unstructured{}
+	auth.SetGroupVersionKind(authGVK)
+	b = b.Watches(
+		auth,
+		handler.EnqueueRequestsFromMapFunc(func(ctx context.Context, obj client.Object) []reconcile.Request {
+			return r.enqueueIngressesForExtension(ctx, obj, HTTPRouteAuthenticationAnnotation)
+		}),
+		ctrlbuilder.WithPredicates(predicate.NewPredicateFuncs(func(obj client.Object) bool {
+			return obj.GetNamespace() == r.GatewayNamespace
+		})),
+	)
+
+	headerGVK := utils.ExtensionFilterGVK(utils.RequestHeaderModifierFilterKind, utils.RequestHeaderModifierCRDName)
+	header := &unstructured.Unstructured{}
+	header.SetGroupVersionKind(headerGVK)
+	b = b.Watches(
+		header,
+		handler.EnqueueRequestsFromMapFunc(func(ctx context.Context, obj client.Object) []reconcile.Request {
+			return r.enqueueIngressesForExtension(ctx, obj, HTTPRouteRequestHeaderAnnotation)
+		}),
+		ctrlbuilder.WithPredicates(predicate.NewPredicateFuncs(func(obj client.Object) bool {
+			return obj.GetNamespace() == r.GatewayNamespace
+		})),
+	)
+
+	return b.Complete(r)
+}
+
+func (r *IngressReconciler) enqueueAllIngresses(ctx context.Context) []reconcile.Request {
+	list := &networkingv1.IngressList{}
+	opts := []client.ListOption{}
+	if r.WatchNamespace != "" {
+		opts = append(opts, client.InNamespace(r.WatchNamespace))
+	}
+	if err := r.List(ctx, list, opts...); err != nil {
+		log.FromContext(ctx).Error(err, "failed to list Ingresses for extension filter change")
+		return nil
+	}
+	requests := make([]reconcile.Request, 0, len(list.Items))
+	for _, ingress := range list.Items {
+		requests = append(requests, reconcile.Request{
+			NamespacedName: types.NamespacedName{
+				Namespace: ingress.Namespace,
+				Name:      ingress.Name,
+			},
+		})
+	}
+	return requests
+}
+
+func (r *IngressReconciler) enqueueIngressesForSnippetsFilter(ctx context.Context, obj client.Object) []reconcile.Request {
+	if obj == nil {
+		return r.enqueueAllIngresses(ctx)
+	}
+	filterName := obj.GetName()
+	if filterName == "" {
+		return nil
+	}
+	return r.enqueueIngressesForSnippetsName(ctx, filterName)
+}
+
+func (r *IngressReconciler) enqueueIngressesForExtension(
+	ctx context.Context,
+	obj client.Object,
+	annotationKey string,
+) []reconcile.Request {
+	if obj == nil {
+		return r.enqueueAllIngresses(ctx)
+	}
+	filterName := obj.GetName()
+	if filterName == "" {
+		return nil
+	}
+	return r.enqueueIngressesForAnnotation(ctx, filterName, annotationKey)
+}
+
+func (r *IngressReconciler) enqueueIngressesForSnippetsName(ctx context.Context, filterName string) []reconcile.Request {
+	requests := r.enqueueIngressesForAnnotation(ctx, filterName, HTTPRouteSnippetsFilterAnnotation)
+	list := &networkingv1.IngressList{}
+	opts := []client.ListOption{}
+	if r.WatchNamespace != "" {
+		opts = append(opts, client.InNamespace(r.WatchNamespace))
+	}
+	if err := r.List(ctx, list, opts...); err != nil {
+		log.FromContext(ctx).Error(err, "failed to list Ingresses for SnippetsFilter change")
+		return requests
+	}
+	for _, ingress := range list.Items {
+		ingressClass := r.getIngressClass(&ingress)
+		for _, mapping := range r.IngressClassSnippetsFilters {
+			if mapping.Pattern == "" || mapping.Name != filterName {
+				continue
+			}
+			matched, err := filepath.Match(mapping.Pattern, ingressClass)
+			if err != nil {
+				continue
+			}
+			if !matched {
+				continue
+			}
+			requests = append(requests, reconcile.Request{
+				NamespacedName: types.NamespacedName{
+					Namespace: ingress.Namespace,
+					Name:      ingress.Name,
+				},
+			})
+			break
+		}
+	}
+	return dedupeReconcileRequests(requests)
+}
+
+func (r *IngressReconciler) enqueueIngressesForAnnotation(
+	ctx context.Context,
+	filterName string,
+	annotationKey string,
+) []reconcile.Request {
+	list := &networkingv1.IngressList{}
+	opts := []client.ListOption{}
+	if r.WatchNamespace != "" {
+		opts = append(opts, client.InNamespace(r.WatchNamespace))
+	}
+	if err := r.List(ctx, list, opts...); err != nil {
+		log.FromContext(ctx).Error(err, "failed to list Ingresses for extension filter change")
+		return nil
+	}
+	requests := make([]reconcile.Request, 0, len(list.Items))
+	for _, ingress := range list.Items {
+		names := utils.ParseCommaSeparatedAnnotation(ingress.Annotations, annotationKey)
+		for _, name := range names {
+			if name == filterName {
+				requests = append(requests, reconcile.Request{
+					NamespacedName: types.NamespacedName{
+						Namespace: ingress.Namespace,
+						Name:      ingress.Name,
+					},
+				})
+				break
+			}
+		}
+	}
+	return requests
+}
+
+func dedupeReconcileRequests(requests []reconcile.Request) []reconcile.Request {
+	if len(requests) <= 1 {
+		return requests
+	}
+	seen := make(map[types.NamespacedName]struct{}, len(requests))
+	out := make([]reconcile.Request, 0, len(requests))
+	for _, req := range requests {
+		if _, ok := seen[req.NamespacedName]; ok {
+			continue
+		}
+		seen[req.NamespacedName] = struct{}{}
+		out = append(out, req)
+	}
+	return out
 }
 
 func (r *IngressReconciler) shouldSkipReconcile(ingress *networkingv1.Ingress) bool {
@@ -987,6 +1215,9 @@ func (r *IngressReconciler) maybeRecordReconcile(
 		ResourceVersion: ingress.ResourceVersion,
 		UpdatedAtUnix:   time.Now().Unix(),
 	}
+	if r.ReconcileCacheMaxEntries > 0 && len(r.ReconcileCache) > r.ReconcileCacheMaxEntries {
+		r.evictOldestCacheEntries()
+	}
 	cacheCopyEntries := make(map[string]utils.ReconcileCacheEntry, len(r.ReconcileCache))
 	for k, v := range r.ReconcileCache {
 		cacheCopyEntries[k] = v
@@ -1015,6 +1246,40 @@ func NamespaceFilter(namespace string) predicate.Predicate {
 	return predicate.NewPredicateFuncs(func(obj client.Object) bool {
 		return obj.GetNamespace() == namespace
 	})
+}
+
+func (r *IngressReconciler) recordWarning(ingress *networkingv1.Ingress, reason, message string) {
+	if r.Recorder == nil || ingress == nil {
+		return
+	}
+	r.Recorder.Event(ingress, "Warning", reason, message)
+}
+
+func (r *IngressReconciler) recordNormal(ingress *networkingv1.Ingress, reason, message string) {
+	if r.Recorder == nil || ingress == nil {
+		return
+	}
+	r.Recorder.Event(ingress, "Normal", reason, message)
+}
+
+func (r *IngressReconciler) logErrorRateLimited(err error, key, message string) {
+	if err == nil {
+		return
+	}
+	now := time.Now()
+	r.errorLogMu.Lock()
+	if r.errorLogLast == nil {
+		r.errorLogLast = make(map[string]time.Time)
+	}
+	last, ok := r.errorLogLast[key]
+	if ok && now.Sub(last) < 30*time.Second {
+		r.errorLogMu.Unlock()
+		return
+	}
+	r.errorLogLast[key] = now
+	r.errorLogMu.Unlock()
+
+	log.FromContext(context.Background()).Error(err, message)
 }
 
 func setGatewayOwnerReference(gateway *gatewayv1.Gateway, ingress *networkingv1.Ingress) {

@@ -48,6 +48,15 @@ var (
 		},
 		[]string{"operation", "namespace", "name"},
 	)
+
+	// IngressReconcileSkipsTotal tracks the number of reconciles skipped due to cache/disabled/etc.
+	IngressReconcileSkipsTotal = prometheus.NewCounterVec(
+		prometheus.CounterOpts{
+			Name: "ingress_operator_reconcile_skips_total",
+			Help: "Total number of ingress reconciles skipped",
+		},
+		[]string{"reason", "namespace", "name"},
+	)
 )
 
 func init() {
@@ -56,5 +65,6 @@ func init() {
 		GatewayResourcesTotal,
 		HTTPRouteResourcesTotal,
 		ReferenceGrantResourcesTotal,
+		IngressReconcileSkipsTotal,
 	)
 }
