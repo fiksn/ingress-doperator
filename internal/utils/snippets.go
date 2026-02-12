@@ -185,6 +185,7 @@ func ParseCommaSeparatedAnnotation(annotations map[string]string, key string) []
 }
 
 // BuildNginxIngressSnippets builds SnippetsFilter entries from NGINX Ingress annotations.
+// nolint:gocyclo
 func BuildNginxIngressSnippets(annotations map[string]string) ([]map[string]interface{}, []string, bool) {
 	if annotations == nil {
 		return nil, nil, false
@@ -201,17 +202,34 @@ func BuildNginxIngressSnippets(annotations map[string]string) ([]map[string]inte
 	}
 	sort.Strings(keys)
 
-	lines := make([]string, 0, len(keys))
-	sslRedirectOff := false
-	forceSSLRedirect := false
-	preserveTrailingSlash := false
-	var proxyBodySizeValue string
-	var clientMaxBodySizeValue string
-	var proxyRedirectFrom string
-	var proxyRedirectTo string
-	var proxyBuffersNumber string
-	var proxyBufferSize string
-	warnings := make([]string, 0, 2)
+	state := ingestNginxIngressAnnotations(annotations, keys)
+	lines, warnings := buildNginxDirectiveLines(state)
+	snippets := buildNginxSnippetBlocks(lines, state)
+
+	if len(snippets) == 0 {
+		return nil, warnings, false
+	}
+
+	return snippets, warnings, true
+}
+
+type nginxIngressSnippetState struct {
+	lines                 []string
+	sslRedirectOff        bool
+	forceSSLRedirect      bool
+	preserveTrailingSlash bool
+	proxyBodySizeValue    string
+	clientMaxBodySize     string
+	proxyRedirectFrom     string
+	proxyRedirectTo       string
+	proxyBuffersNumber    string
+	proxyBufferSize       string
+}
+
+func ingestNginxIngressAnnotations(annotations map[string]string, keys []string) nginxIngressSnippetState {
+	state := nginxIngressSnippetState{
+		lines: make([]string, 0, len(keys)),
+	}
 
 	for _, fullKey := range keys {
 		raw := annotations[fullKey]
@@ -224,113 +242,125 @@ func BuildNginxIngressSnippets(annotations map[string]string) ([]map[string]inte
 			continue
 		}
 
-		switch suffix {
-		case configurationSnippetKey, serverSnippetKey, authSnippetKey:
+		if handled := applyIngressAnnotationValue(&state, suffix, value); handled {
 			continue
-		case proxyBodySizeKey:
-			proxyBodySizeValue = value
-			continue
-		case clientMaxBodySizeKey:
-			clientMaxBodySizeValue = value
-			continue
-		case proxyRedirectFromKey:
-			proxyRedirectFrom = value
-			continue
-		case proxyRedirectToKey:
-			proxyRedirectTo = value
-			continue
-		case proxyBuffersNumberKey:
-			proxyBuffersNumber = value
-			continue
-		case sslRedirectKey:
-			if strings.EqualFold(value, "false") {
-				sslRedirectOff = true
-			}
-			continue
-		case forceSSLRedirectKey:
-			if strings.EqualFold(value, "true") {
-				forceSSLRedirect = true
-			}
-			continue
-		case preserveTrailingSlashKey:
-			if strings.EqualFold(value, "true") {
-				preserveTrailingSlash = true
-			}
-			continue
-		default:
-			if !isWhitelistedNginxIngressDirective(suffix) {
-				continue
-			}
-			if suffix == "proxy-buffer-size" {
-				proxyBufferSize = value
-			}
-			directive := strings.ReplaceAll(suffix, "-", "_")
-			lines = append(lines, fmt.Sprintf("%s %s;", directive, value))
 		}
+
+		if !isWhitelistedNginxIngressDirective(suffix) {
+			continue
+		}
+		if suffix == "proxy-buffer-size" {
+			state.proxyBufferSize = value
+		}
+		directive := strings.ReplaceAll(suffix, "-", "_")
+		state.lines = append(state.lines, fmt.Sprintf("%s %s;", directive, value))
 	}
 
-	if clientMaxBodySizeValue != "" {
-		lines = append(lines, fmt.Sprintf("client_max_body_size %s;", clientMaxBodySizeValue))
-	} else if proxyBodySizeValue != "" {
-		lines = append(lines, fmt.Sprintf("client_max_body_size %s;", proxyBodySizeValue))
+	return state
+}
+
+func applyIngressAnnotationValue(state *nginxIngressSnippetState, suffix, value string) bool {
+	switch suffix {
+	case configurationSnippetKey, serverSnippetKey, authSnippetKey:
+		return true
+	case proxyBodySizeKey:
+		state.proxyBodySizeValue = value
+		return true
+	case clientMaxBodySizeKey:
+		state.clientMaxBodySize = value
+		return true
+	case proxyRedirectFromKey:
+		state.proxyRedirectFrom = value
+		return true
+	case proxyRedirectToKey:
+		state.proxyRedirectTo = value
+		return true
+	case proxyBuffersNumberKey:
+		state.proxyBuffersNumber = value
+		return true
+	case sslRedirectKey:
+		if strings.EqualFold(value, "false") {
+			state.sslRedirectOff = true
+		}
+		return true
+	case forceSSLRedirectKey:
+		if strings.EqualFold(value, "true") {
+			state.forceSSLRedirect = true
+		}
+		return true
+	case preserveTrailingSlashKey:
+		if strings.EqualFold(value, "true") {
+			state.preserveTrailingSlash = true
+		}
+		return true
+	default:
+		return false
+	}
+}
+
+func buildNginxDirectiveLines(state nginxIngressSnippetState) ([]string, []string) {
+	lines := append([]string{}, state.lines...)
+	warnings := make([]string, 0, 2)
+
+	if state.clientMaxBodySize != "" {
+		lines = append(lines, fmt.Sprintf("client_max_body_size %s;", state.clientMaxBodySize))
+	} else if state.proxyBodySizeValue != "" {
+		lines = append(lines, fmt.Sprintf("client_max_body_size %s;", state.proxyBodySizeValue))
 	}
 
-	if proxyRedirectFrom != "" {
-		lowerFrom := strings.ToLower(proxyRedirectFrom)
+	if state.proxyRedirectFrom != "" {
+		lowerFrom := strings.ToLower(state.proxyRedirectFrom)
 		if lowerFrom == "off" || lowerFrom == "default" {
-			lines = append(lines, fmt.Sprintf("proxy_redirect %s;", proxyRedirectFrom))
-		} else if proxyRedirectTo != "" {
-			lines = append(lines, fmt.Sprintf("proxy_redirect %s %s;", proxyRedirectFrom, proxyRedirectTo))
+			lines = append(lines, fmt.Sprintf("proxy_redirect %s;", state.proxyRedirectFrom))
+		} else if state.proxyRedirectTo != "" {
+			lines = append(lines, fmt.Sprintf("proxy_redirect %s %s;", state.proxyRedirectFrom, state.proxyRedirectTo))
 		} else {
 			warnings = append(warnings, "proxy-redirect-from requires proxy-redirect-to (or set proxy-redirect-from to off/default)")
 		}
-	} else if proxyRedirectTo != "" {
+	} else if state.proxyRedirectTo != "" {
 		warnings = append(warnings, "proxy-redirect-to requires proxy-redirect-from")
 	}
 
-	if proxyBuffersNumber != "" {
-		if proxyBufferSize == "" {
+	if state.proxyBuffersNumber != "" {
+		if state.proxyBufferSize == "" {
 			warnings = append(warnings, "proxy-buffers-number requires proxy-buffer-size to compute proxy_buffers")
 		} else {
-			lines = append(lines, fmt.Sprintf("proxy_buffers %s %s;", proxyBuffersNumber, proxyBufferSize))
+			lines = append(lines, fmt.Sprintf("proxy_buffers %s %s;", state.proxyBuffersNumber, state.proxyBufferSize))
 		}
 	}
 
+	return lines, warnings
+}
+
+func buildNginxSnippetBlocks(lines []string, state nginxIngressSnippetState) []map[string]interface{} {
 	snippets := make([]map[string]interface{}, 0, 2)
-	if sslRedirectOff {
+	if state.sslRedirectOff {
 		snippets = append(snippets, map[string]interface{}{
 			"context": "http",
 			"value":   "ssl_redirect off;",
 		})
 	}
 
-	if len(lines) > 0 {
-		snippets = append(snippets, map[string]interface{}{
-			"context": "http.server",
-			"value":   strings.Join(lines, "\n"),
-		})
-	}
-
-	if forceSSLRedirect {
+	serverLines := append([]string{}, lines...)
+	if state.forceSSLRedirect {
 		redirectTarget := "https://$server_name$request_uri"
-		if preserveTrailingSlash {
+		if state.preserveTrailingSlash {
 			redirectTarget = "https://$server_name$request_uri"
 		}
-		parts := []string{
+		serverLines = append(serverLines,
 			"more_set_headers \"Strict-Transport-Security: max-age=31536000\";",
 			fmt.Sprintf("if ($scheme != \"https\") { return 308 %s; }", redirectTarget),
-		}
+		)
+	}
+
+	if len(serverLines) > 0 {
 		snippets = append(snippets, map[string]interface{}{
 			"context": "http.server",
-			"value":   strings.Join(parts, "\n"),
+			"value":   strings.Join(serverLines, "\n"),
 		})
 	}
 
-	if len(snippets) == 0 {
-		return nil, warnings, false
-	}
-
-	return snippets, warnings, true
+	return snippets
 }
 
 // NginxIngressSnippetWarningAnnotations returns full annotation keys that should emit warnings when ignored.
@@ -539,7 +569,7 @@ func EnsureSnippetsFilterCopyForHTTPRoute(
 }
 
 // ValidateSnippetsFilterExists ensures a SnippetsFilter exists in the given namespace.
-func ValidateSnippetsFilterExists(ctx context.Context, c client.Client, namespace, name string) error {
+func ValidateSnippetsFilterExists(ctx context.Context, c client.Reader, namespace, name string) error {
 	crdName, ok := snippetsCRDNameForKind(SnippetsFilterKind)
 	if !ok {
 		return nil
@@ -789,7 +819,7 @@ func extensionCRDNameForKind(kind string) (string, bool) {
 	}
 }
 
-func getCRDVersion(ctx context.Context, c client.Client, crdName string) (string, bool, error) {
+func getCRDVersion(ctx context.Context, c client.Reader, crdName string) (string, bool, error) {
 	if cached, ok := crdVersionCache.Load(crdName); ok {
 		entry := cached.(crdVersionCacheEntry)
 		return entry.version, true, nil

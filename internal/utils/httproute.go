@@ -224,6 +224,18 @@ func (m *HTTPRouteManager) applyHTTPRoute(
 	existingHTTPRoute.Spec = httpRoute.Spec
 	logger.Info("Updating HTTPRoute", "namespace", existingHTTPRoute.Namespace, "name", existingHTTPRoute.Name)
 	if err := m.Client.Update(ctx, existingHTTPRoute); err != nil {
+		if apierrors.IsNotFound(err) {
+			logger.Info("HTTPRoute disappeared during update, recreating",
+				"namespace", existingHTTPRoute.Namespace,
+				"name", existingHTTPRoute.Name)
+			if err := m.Client.Create(ctx, httpRoute); err != nil {
+				return fmt.Errorf("failed to recreate HTTPRoute: %w", err)
+			}
+			if metricRecorder != nil {
+				metricRecorder("create", httpRoute.Namespace, httpRoute.Name)
+			}
+			return nil
+		}
 		return fmt.Errorf("failed to update HTTPRoute: %w", err)
 	}
 	if metricRecorder != nil {

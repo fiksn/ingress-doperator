@@ -28,6 +28,7 @@ import (
 	// to ensure that exec-entrypoint and run can make use of them.
 	_ "k8s.io/client-go/plugin/pkg/client/auth"
 
+	"go.uber.org/zap/zapcore"
 	corev1 "k8s.io/api/core/v1"
 	apiextensionsv1 "k8s.io/apiextensions-apiserver/pkg/apis/apiextensions/v1"
 	"k8s.io/apimachinery/pkg/runtime"
@@ -82,6 +83,7 @@ func main() {
 	var probeAddr string
 	var secureMetrics bool
 	var enableHTTP2 bool
+	var verbosity int
 	var tlsOpts []func(*tls.Config)
 	var gatewayNamespace string
 	var gatewayName string
@@ -101,6 +103,7 @@ func main() {
 	var privateIngressClassPattern string
 	var ingressClassFilter string
 	var ingressClassSnippetsFilters string
+	var reconcileCachePersist bool
 	flag.StringVar(&gatewayNamespace, "gateway-namespace", "nginx-fabric",
 		"The namespace where the Gateway resource will be created")
 	flag.StringVar(&gatewayName, "gateway-name", "ingress-gateway",
@@ -139,6 +142,8 @@ func main() {
 	flag.StringVar(&ingressClassSnippetsFilters, "ingress-class-snippets-filter", "",
 		"Comma-separated list of pattern:snippetsFilterName entries. "+
 			"If ingress class matches the glob, the SnippetsFilter is copied from the Gateway namespace and attached.")
+	flag.BoolVar(&reconcileCachePersist, "reconcile-cache-persist", true,
+		"If false, do not persist the reconcile cache to ConfigMaps.")
 	flag.StringVar(&gatewayAnnotationFilters, "gateway-annotation-filters",
 		controller.DefaultGatewayAnnotationFilters,
 		"Comma-separated list of annotation prefixes to exclude from Gateway resources")
@@ -171,11 +176,17 @@ func main() {
 	flag.StringVar(&metricsCertKey, "metrics-cert-key", "tls.key", "The name of the metrics server key file.")
 	flag.BoolVar(&enableHTTP2, "enable-http2", false,
 		"If set, HTTP/2 will be enabled for the metrics and webhook servers")
+	flag.IntVar(&verbosity, "v", 0, "Log verbosity (0 = info, higher = more verbose)")
 	opts := zap.Options{
 		Development: true,
 	}
 	opts.BindFlags(flag.CommandLine)
 	flag.Parse()
+
+	if verbosity > 0 {
+		opts.Development = false
+		opts.Level = zapcore.Level(-verbosity)
+	}
 
 	ctrl.SetLogger(zap.New(zap.UseFlagOptions(&opts)))
 
@@ -302,9 +313,32 @@ func main() {
 	}
 	setupLog.Info("Verified Gateway namespace exists", "namespace", gatewayNamespace)
 
+	reconcileCache := make(map[string]utils.ReconcileCacheEntry)
+	if reconcileCachePersist {
+		var err error
+		reconcileCache, err = utils.LoadReconcileCacheSharded(
+			ctx,
+			mgr.GetAPIReader(),
+			gatewayNamespace,
+			utils.ReconcileCacheConfigMapBaseName,
+			utils.ReconcileCacheShardCount,
+		)
+		if err != nil {
+			setupLog.Error(err, "Failed to load reconcile cache, continuing with empty cache")
+			reconcileCache = make(map[string]utils.ReconcileCacheEntry)
+		}
+	}
+
 	for _, mapping := range parsedSnippetsFilters {
-		if err := utils.ValidateSnippetsFilterExists(ctx, mgr.GetClient(), gatewayNamespace, mapping.Name); err != nil {
-			setupLog.Error(err, "SnippetsFilter not found in gateway namespace", "name", mapping.Name, "namespace", gatewayNamespace)
+		if err := utils.ValidateSnippetsFilterExists(
+			ctx,
+			mgr.GetAPIReader(),
+			gatewayNamespace,
+			mapping.Name,
+		); err != nil {
+			setupLog.Error(err, "SnippetsFilter not found in gateway namespace",
+				"name", mapping.Name,
+				"namespace", gatewayNamespace)
 			os.Exit(1)
 		}
 	}
@@ -373,6 +407,11 @@ func main() {
 		PrivateIngressClassPattern:       privateIngressClassPattern,
 		IngressClassFilter:               ingressClassFilter,
 		IngressClassSnippetsFilters:      parsedSnippetsFilters,
+		ReconcileCache:                   reconcileCache,
+		ReconcileCacheNamespace:          gatewayNamespace,
+		ReconcileCacheBaseName:           utils.ReconcileCacheConfigMapBaseName,
+		ReconcileCacheShards:             utils.ReconcileCacheShardCount,
+		ReconcileCachePersist:            reconcileCachePersist,
 		UseIngress2Gateway:               useIngress2Gateway,
 		Ingress2GatewayProvider:          ingress2GatewayProvider,
 		Ingress2GatewayIngressClass:      ingress2GatewayIngressClass,

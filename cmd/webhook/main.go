@@ -25,6 +25,7 @@ import (
 	// Import all Kubernetes client auth plugins (e.g. Azure, GCP, OIDC, etc.)
 	_ "k8s.io/client-go/plugin/pkg/client/auth"
 
+	"go.uber.org/zap/zapcore"
 	"k8s.io/apimachinery/pkg/runtime"
 	utilruntime "k8s.io/apimachinery/pkg/util/runtime"
 	clientgoscheme "k8s.io/client-go/kubernetes/scheme"
@@ -68,6 +69,7 @@ func main() {
 	var ingressClassSnippetsFilters string
 	var useIngress2Gateway bool
 	var ingressClassFilter string
+	var verbosity int
 
 	flag.StringVar(&metricsAddr, "metrics-bind-address", ":8080",
 		"The address the metric endpoint binds to.")
@@ -110,12 +112,18 @@ func main() {
 	flag.StringVar(&ingressClassFilter, "ingress-class-filter", "*",
 		"Glob pattern to filter which ingress classes to process (e.g., '*private*', 'nginx', '*'). "+
 			"Default '*' processes all classes.")
+	flag.IntVar(&verbosity, "v", 0, "Log verbosity (0 = info, higher = more verbose)")
 
 	opts := zap.Options{
 		Development: true,
 	}
 	opts.BindFlags(flag.CommandLine)
 	flag.Parse()
+
+	if verbosity > 0 {
+		opts.Development = false
+		opts.Level = zapcore.Level(-verbosity)
+	}
 
 	ctrl.SetLogger(zap.New(zap.UseFlagOptions(&opts)))
 
@@ -142,8 +150,15 @@ func main() {
 	}
 
 	for _, mapping := range parsedSnippetsFilters {
-		if err := utils.ValidateSnippetsFilterExists(context.Background(), mgr.GetClient(), gatewayNamespace, mapping.Name); err != nil {
-			setupLog.Error(err, "SnippetsFilter not found in gateway namespace", "name", mapping.Name, "namespace", gatewayNamespace)
+		if err := utils.ValidateSnippetsFilterExists(
+			context.Background(),
+			mgr.GetAPIReader(),
+			gatewayNamespace,
+			mapping.Name,
+		); err != nil {
+			setupLog.Error(err, "SnippetsFilter not found in gateway namespace",
+				"name", mapping.Name,
+				"namespace", gatewayNamespace)
 			os.Exit(1)
 		}
 	}

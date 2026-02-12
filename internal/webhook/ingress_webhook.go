@@ -196,6 +196,9 @@ func (m *IngressMutator) applyIngressClassSnippetsFilters(
 	ingressClass := m.getIngressClass(ingress)
 	matchedFilters := make([]utils.IngressClassSnippetsFilter, 0, len(m.IngressClassSnippetsFilters))
 	for _, mapping := range m.IngressClassSnippetsFilters {
+		if mapping.Pattern == "" {
+			continue
+		}
 		matched, err := filepath.Match(mapping.Pattern, ingressClass)
 		if err != nil {
 			logger.Error(err, "invalid ingress class pattern for snippets filter", "pattern", mapping.Pattern)
@@ -240,6 +243,9 @@ func (m *IngressMutator) finalizeIngressClassSnippetsFilters(ctx context.Context
 	logger := log.FromContext(ctx)
 	ingressClass := m.getIngressClass(ingress)
 	for _, mapping := range m.IngressClassSnippetsFilters {
+		if mapping.Pattern == "" {
+			continue
+		}
 		matched, err := filepath.Match(mapping.Pattern, ingressClass)
 		if err != nil {
 			logger.Error(err, "invalid ingress class pattern for snippets filter", "pattern", mapping.Pattern)
@@ -361,15 +367,18 @@ func (m *IngressMutator) getIngressClass(ingress *networkingv1.Ingress) string {
 // matchesIngressClassFilter checks if the Ingress class matches the configured filter pattern
 func (m *IngressMutator) matchesIngressClassFilter(ingress *networkingv1.Ingress) bool {
 	// Default filter "*" matches everything
-	if m.IngressClassFilter == "" || m.IngressClassFilter == "*" {
+	if m.IngressClassFilter == "" {
+		return false
+	}
+	if m.IngressClassFilter == "*" {
 		return true
 	}
 
 	ingressClass := m.getIngressClass(ingress)
 
-	// Empty ingress class matches empty filter or "*"
+	// Empty ingress class only matches "*"
 	if ingressClass == "" {
-		return m.IngressClassFilter == "" || m.IngressClassFilter == "*"
+		return false
 	}
 
 	// Use filepath.Match for glob pattern matching
