@@ -1,25 +1,39 @@
 # ingress-doperator
-Ingress deprecation operator is a way to transition from [ingress-nginx](https://github.com/kubernetes/ingress-nginx) to [nginx-gateway-fabric](https://github.com/nginx/nginx-gateway-fabric)
-and get started with the [Gateway API](https://gateway-api.sigs.k8s.io/guides/getting-started/)
+Ingress deprecation operator is a way to transition from
+[ingress-nginx](https://github.com/kubernetes/ingress-nginx) to
+[nginx-gateway-fabric](https://github.com/nginx/nginx-gateway-fabric) and get
+started with the
+[Gateway API](https://gateway-api.sigs.k8s.io/guides/getting-started/)
 
-It can transparently create `Gateway`, `Httproute` (and possibly `ReferenceGrant` to allow access to TLS secrets in other namespaces or `SnippetsFilter` to translate known `nginx.ingress.kubernetes.io` annotations)
-from `Ingress` resources.
-Depending on `--ingress-postprocessing` it can either ("disable") disable the original ingress, remove it completely ("remove") or just leave it (for future reference).
+It can transparently create `Gateway`, `Httproute` (and possibly
+`ReferenceGrant` to allow access to TLS secrets in other namespaces or
+`SnippetsFilter` to translate known `nginx.ingress.kubernetes.io`
+annotations) from `Ingress` resources.
+Depending on `--ingress-postprocessing` it can either ("disable") disable the
+original ingress, remove it completely ("remove") or just leave it (for future
+reference).
 
 !!! Nginx ingress controller is [deprecated](https://kubernetes.io/blog/2025/11/11/ingress-nginx-retirement/) and
 will not get security updates after March 2026 !!!
 
 ## Related tools
 
-* [Ingress2Gateway](https://github.com/kubernetes-sigs/ingress2gateway) is a similar tool if you have control over your YAML files and want to update them.
-Unfortunately that is not always the case and an `Ingress` might be provisioned without your control. Ingress-doperator includes the mentioned tool as a library
-so you can benefit from all translation quirks implemented there.
+* [Ingress2Gateway](https://github.com/kubernetes-sigs/ingress2gateway) is a
+  similar tool if you have control over your YAML files and want to update them.
+  Unfortunately that is not always the case and an `Ingress` might be
+  provisioned without your control. Ingress-doperator includes the mentioned
+  tool as a library so you can benefit from all translation quirks implemented
+  there.
 
 However this tool is primarily meant for `ingress-nginx` audience and comes with a few opinionated (but sane) defaults.
 
-For instance operator enables a "shared mode" (unless you start it with `--one-gateway-per-ingress`) which means you do not need a new `Gateway` for each `Ingress` but
-can aggregate multiple vhosts in one thereby save cluster resources. This way you just get one (or if you change `nginxproxies` crd also more)
-Nginx instance(s) which is consistent with previous behaviour. Of course you get less isolation which depending on your case might also be bad for security.
+For instance operator enables a "shared mode" (unless you start it with
+`--one-gateway-per-ingress`) which means you do not need a new `Gateway` for
+each `Ingress` but can aggregate multiple vhosts in one thereby save cluster
+resources. This way you just get one (or if you change the `NginxProxy` resource
+as described in [Multiple replicas](#multiple-replicas), also more) Nginx
+instance(s) which is consistent with previous behaviour. Of course you get less
+isolation which depending on your case might also be bad for security.
 
 ## Build
 
@@ -42,7 +56,8 @@ make build-webhook  # Build bin/webhook
 ## Features
 
 ### Cluster-Wide Ingress Watching
-The operator monitors all Ingress resources across all namespaces and aggregates them into a unified Gateway configuration.
+The operator monitors all Ingress resources across all namespaces and
+aggregates them into a unified Gateway configuration.
 
 ### Resource Management with Annotations
 All synthesized resources are annotated with:
@@ -51,7 +66,9 @@ annotations:
   ingress-doperator.fiction.si/managed-by: ingress-doperator
 ```
 
-**Important:** The operator will NOT overwrite existing Gateway or HTTPRoute resources unless they have this annotation. This prevents conflicts with manually created resources.
+**Important:** The operator will NOT overwrite existing Gateway or HTTPRoute
+resources unless they have this annotation. This prevents conflicts with
+manually created resources.
 
 ### Resource Placement
 - **Gateway**: Created in the configured namespace (default: `nginx-fabric`)
@@ -71,8 +88,10 @@ The ingress-doperator includes an **admission webhook** that intercepts Ingress 
 2. Creates the Gateway and HTTPRoute in the cluster
 3. **Rejects the Ingress** by default (prevents it from being stored)
 
-This mode is useful when you want to completely block Ingress resources from being created while automatically creating the equivalent Gateway API resources.
-However it is not best practice since creating other resources is a side-effect - if possible stay with operator approach.
+This mode is useful when you want to completely block Ingress resources from
+being created while automatically creating the equivalent Gateway API resources.
+However it is not best practice since creating other resources is a side-effect
+- if possible stay with operator approach.
 
 ### Why Use Webhook Mode?
 
@@ -226,20 +245,28 @@ webhooks:
 ### Webhook Configuration Flags
 
 ```bash
---gateway-namespace string              Namespace where Gateway resources will be created (default: "default")
---gateway-name string                   Name of the Gateway resource (default: "ingress-gateway")
---webhook-port int                      The port the webhook server binds to (default: 9443)
---cert-dir string                       Directory containing TLS certificates (default: "/tmp/k8s-webhook-server/serving-certs")
---metrics-bind-address string           Metrics endpoint address (default: ":8080")
---health-probe-bind-address string      Health probe endpoint address (default: ":8081")
---hostname-rewrite-from string          Domain suffix to match for rewriting
---hostname-rewrite-to string            Replacement domain suffix
---gateway-annotations string            Comma-separated key=value pairs for Gateway annotations
---gateway-annotation-filters string     Comma-separated list of annotation prefixes to exclude from Gateway
---httproute-annotation-filters string   Comma-separated list of annotation prefixes to exclude from HTTPRoute
---use-ingress2gateway                   Use ingress2gateway library for translation (default: false)
---ingress2gateway-provider string       Provider for ingress2gateway (default: "ingress-nginx")
---ingress2gateway-ingress-class string  Ingress class for ingress2gateway filtering (default: "nginx")
+--gateway-namespace string                  Namespace where Gateway resources will be created (default: "default")
+--gateway-name string                       Name of the Gateway resource (default: "ingress-gateway")
+--gateway-class-name string                 GatewayClass for created Gateway resources (default: "nginx")
+--webhook-port int                          The port the webhook server binds to (default: 9443)
+--cert-dir string                           Directory containing TLS certificates
+                                             (default: "/tmp/k8s-webhook-server/serving-certs")
+--metrics-bind-address string               Metrics endpoint address (default: ":8080")
+--health-probe-bind-address string          Health probe endpoint address (default: ":8081")
+--hostname-rewrite-from string              Comma-separated list of domain suffixes to match
+--hostname-rewrite-to string                Comma-separated list of replacement domain suffixes
+--gateway-annotations string                Comma-separated key=value pairs for Gateway annotations
+--gateway-annotation-filters string         Comma-separated list of annotation prefixes to exclude from Gateway
+--httproute-annotation-filters string       Comma-separated list of annotation prefixes to exclude from HTTPRoute
+--ingress-class-filter string               Glob pattern to filter which ingress classes to process (default: "*")
+--ingress-class-snippets-filter string      Comma-separated list of pattern:snippetsFilterName entries
+--ingress-name-snippets-filter string       Comma-separated list of pattern:snippetsFilterName entries
+--ingress-annotation-snippets-add string    Semicolon-separated list of key=value:filter1,filter2 entries
+--ingress-annotation-snippets-remove string Semicolon-separated list of key=value:filter1,filter2 entries
+--use-ingress2gateway                       Use ingress2gateway library for translation (default: false)
+--ingress2gateway-provider string           Provider for ingress2gateway (default: "ingress-nginx")
+--ingress2gateway-ingress-class string      Ingress class for ingress2gateway filtering (default: "nginx")
+-v int                                      Log verbosity (0 = info, higher = more verbose)
 ```
 
 ### Translation Modes
@@ -405,7 +432,8 @@ EOF
 - Check webhook service is running: `kubectl get pods -n ingress-doperator-system`
 - Verify service endpoints: `kubectl get endpoints -n ingress-doperator-system`
 - Check ValidatingWebhookConfiguration exists: `kubectl get validatingwebhookconfiguration`
-- Verify CA bundle injected: `kubectl get validatingwebhookconfigurations ingress-to-gateway-webhook -o yaml | grep caBundle`
+- Verify CA bundle injected:
+  `kubectl get validatingwebhookconfigurations ingress-to-gateway-webhook -o yaml | grep caBundle`
 
 **Certificate errors:**
 - Check cert-manager is installed: `kubectl get pods -n cert-manager`
@@ -422,24 +450,48 @@ EOF
 The operator accepts the following command-line flags:
 
 ```bash
---gateway-namespace string                    Namespace where the Gateway resource will be created (default: "nginx-fabric")
---gateway-name string                         Name of the Gateway resource when not using ingressClassName (default: "ingress-gateway")
---watch-namespace string                      If specified, only watch Ingresses in this namespace (default: watch all namespaces)
---one-gateway-per-ingress                     Create a separate Gateway for each Ingress with the same name (default: false)
---enable-deletion                             Delete HTTPRoute and Gateway when Ingress is deleted (default: false)
+--gateway-namespace string                    Namespace where the Gateway resource will be created
+                                              (default: "nginx-fabric")
+--gateway-name string                         Name of the Gateway resource when not using ingressClassName
+                                              (default: "ingress-gateway")
+--gateway-class-name string                   GatewayClass for created Gateway resources (default: "nginx")
+--watch-namespace string                      If specified, only watch Ingresses in this namespace
+                                              (default: watch all namespaces)
+--ingress-class-filter string                 Glob pattern to filter which ingress classes to process (default: "*")
+--one-gateway-per-ingress                     Create a separate Gateway for each Ingress with the same name
+                                              (default: false)
+--enable-deletion                             Delete HTTPRoute and Gateway when Ingress is deleted
+                                              (default: false)
 --hostname-rewrite-from string                Domain suffix to match for rewriting (e.g., 'domain.cc')
---hostname-rewrite-to string                  Replacement domain suffix (e.g., 'foo.domain.cc'). Transforms 'a.b.domain.cc' to 'a.b.foo.domain.cc'
---disable-source-ingress                      Disable the source Ingress by removing ingressClassName (default: false)
---gateway-annotation-filters string           Comma-separated list of annotation prefixes to exclude from Gateway (default: "ingress.kubernetes.io,cert-manager.io,nginx.ingress.kubernetes.io")
---httproute-annotation-filters string         Comma-separated list of annotation prefixes to exclude from HTTPRoute (default: "ingress.kubernetes.io,cert-manager.io,nginx.ingress.kubernetes.io")
---use-ingress2gateway                         Use ingress2gateway library for translation (disables hostname/certificate mangling) (default: false)
---ingress2gateway-provider string             Provider to use with ingress2gateway (e.g., ingress-nginx, istio, kong) (default: "ingress-nginx")
---ingress2gateway-ingress-class string        Ingress class name for provider-specific filtering in ingress2gateway (default: "nginx")
+--hostname-rewrite-to string                  Replacement domain suffix (e.g., 'foo.domain.cc').
+                                              Transforms 'a.b.domain.cc' to 'a.b.foo.domain.cc'
+--ingress-postprocessing string               Post processing mode: none, disable, or remove (default: "none")
+--gateway-annotation-filters string           Comma-separated list of annotation prefixes to exclude from Gateway
+                                              (default: "ingress.kubernetes.io,cert-manager.io,
+                                              nginx.ingress.kubernetes.io")
+--httproute-annotation-filters string         Comma-separated list of annotation prefixes to exclude from HTTPRoute
+                                              (default: "ingress.kubernetes.io,cert-manager.io,
+                                              nginx.ingress.kubernetes.io")
+--ingress-class-snippets-filter string        Comma-separated list of pattern:snippetsFilterName entries
+--ingress-name-snippets-filter string         Comma-separated list of pattern:snippetsFilterName entries
+--ingress-annotation-snippets-add string      Semicolon-separated list of key=value:filter1,filter2 entries
+--ingress-annotation-snippets-remove string   Semicolon-separated list of key=value:filter1,filter2 entries
+--use-ingress2gateway                         Use ingress2gateway library for translation
+                                              (disables hostname/certificate mangling) (default: false)
+--ingress2gateway-provider string             Provider to use with ingress2gateway (e.g., ingress-nginx, istio, kong)
+                                              (default: "ingress-nginx")
+--ingress2gateway-ingress-class string        Ingress class name for provider-specific filtering in ingress2gateway
+                                              (default: "nginx")
 --gateway-annotations string                  Comma-separated key=value pairs for Gateway metadata annotations
 --gateway-infrastructure-annotations string   Comma-separated key=value pairs for Gateway infrastructure annotations
---private-annotations string                  Comma-separated key=value pairs defining what 'private' means for infrastructure annotations
+--private-annotations string                  Comma-separated key=value pairs defining what 'private' means for
+                                              infrastructure annotations
 --private                                     If true, apply private annotations to all Gateways (default: false)
---private-ingress-class-pattern string        Glob pattern for ingress class names that should get private infrastructure annotations (default: "*private*")
+--private-ingress-class-pattern string        Glob pattern for ingress class names that should get private
+                                              infrastructure annotations (default: "*private*")
+--reconcile-cache-persist                     Persist reconcile cache to ConfigMaps (default: true)
+--reconcile-cache-max-entries int             Max entries in reconcile cache (0 = unlimited)
+-v int                                        Log verbosity (0 = info, higher = more verbose)
 ```
 
 ### Translation Modes in Operator
@@ -490,7 +542,8 @@ Each Ingress gets its own dedicated Gateway:
 
 ### Namespace Filtering
 
-By default, the operator watches Ingresses in **all namespaces**. You can restrict it to a specific namespace for testing:
+By default, the operator watches Ingresses in **all namespaces**. You can
+restrict it to a specific namespace for testing:
 
 ```bash
 # Watch only the test-namespace
@@ -506,7 +559,9 @@ This is useful for:
 
 ### DNS Conflict Avoidance
 
-When migrating from nginx-ingress to nginx-fabric (Gateway API), you'll face a DNS conflict issue: both the Ingress and Gateway resources will try to claim the same hostnames, and external-dns will be confused.
+When migrating from nginx-ingress to nginx-fabric (Gateway API), you'll face a
+DNS conflict issue: both the Ingress and Gateway resources will try to claim
+the same hostnames, and external-dns will be confused.
 
 **Solution: Hostname Rewriting**
 
@@ -549,10 +604,10 @@ This allows you to:
 
 ### Disabling Source Ingress
 
-Use `--disable-source-ingress` to automatically disable the original Ingress:
+Use `--ingress-postprocessing=disable` to automatically disable the original Ingress:
 
 ```bash
-./bin/operator --disable-source-ingress
+./bin/operator --ingress-postprocessing=disable
 ```
 
 This will:
@@ -575,7 +630,7 @@ This prevents nginx-ingress from processing the Ingress while keeping it in the 
 # Step 2: Test the Gateway setup at migration.domain.cc hostnames
 
 # Step 3: When ready, disable source Ingress and use original hostnames
-./bin/operator --disable-source-ingress
+./bin/operator --ingress-postprocessing=disable
 
 # Step 4: Update DNS to point to Gateway
 
@@ -584,7 +639,9 @@ This prevents nginx-ingress from processing the Ingress while keeping it in the 
 
 ## Deletion behaviour
 
-By default (`--enable-deletion=false`), the operator **does NOT delete** Gateway and HTTPRoute resources when an Ingress is deleted. This is the safe default to prevent accidental deletion of resources that might be in use.
+By default (`--enable-deletion=false`), the operator **does NOT delete** Gateway
+and HTTPRoute resources when an Ingress is deleted. This is the safe default to
+prevent accidental deletion of resources that might be in use.
 
 When `--enable-deletion=true`:
 - **HTTPRoute Deletion**: Always deleted when the corresponding Ingress is deleted
@@ -793,4 +850,3 @@ distributed under the License is distributed on an "AS IS" BASIS,
 WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 See the License for the specific language governing permissions and
 limitations under the License.
-

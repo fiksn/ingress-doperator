@@ -24,6 +24,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/go-logr/logr"
 	networkingv1 "k8s.io/api/networking/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -455,184 +456,206 @@ func (r *IngressReconciler) applyHTTPRouteExtensionRefs(
 		return
 	}
 
-	extensionRefs := []struct {
-		annotation string
-		kind       string
-		logName    string
-	}{
-		{HTTPRouteSnippetsFilterAnnotation, utils.SnippetsFilterKind, "SnippetsFilter"},
-		{HTTPRouteAuthenticationAnnotation, utils.AuthenticationFilterKind, "AuthenticationFilter"},
-		{HTTPRouteRequestHeaderAnnotation, utils.RequestHeaderModifierFilterKind, "RequestHeaderModifierFilter"},
+	r.applyAnnotationExtensionRefs(
+		ctx,
+		ingress,
+		httpRoute,
+		HTTPRouteAuthenticationAnnotation,
+		utils.AuthenticationFilterKind,
+		"AuthenticationFilter",
+	)
+	r.applyAnnotationExtensionRefs(
+		ctx,
+		ingress,
+		httpRoute,
+		HTTPRouteRequestHeaderAnnotation,
+		utils.RequestHeaderModifierFilterKind,
+		"RequestHeaderModifierFilter",
+	)
+	r.applySnippetsFilters(ctx, ingress, httpRoute, logger)
+}
+
+func (r *IngressReconciler) applyAnnotationExtensionRefs(
+	ctx context.Context,
+	ingress *networkingv1.Ingress,
+	httpRoute *gatewayv1.HTTPRoute,
+	annotation string,
+	kind string,
+	logName string,
+) {
+	logger := log.FromContext(ctx)
+	names := utils.ParseCommaSeparatedAnnotation(ingress.Annotations, annotation)
+	if len(names) == 0 {
+		return
 	}
 
-	for _, entry := range extensionRefs {
-		names := utils.ParseCommaSeparatedAnnotation(ingress.Annotations, entry.annotation)
-		if len(names) == 0 {
-			if entry.kind != utils.SnippetsFilterKind {
+	available := make([]string, 0, len(names))
+	for _, name := range names {
+		ok, err := utils.EnsureExtensionResource(
+			ctx,
+			r.Client,
+			kind,
+			name,
+			r.GatewayNamespace,
+			ingress.Namespace,
+			ingress.Namespace,
+			ingress.Name,
+			nil,
+		)
+		if err != nil {
+			logger.Error(err, "failed to apply extension resource copy",
+				"kind", logName,
+				"name", name,
+				"namespace", ingress.Namespace)
+			continue
+		}
+		if ok {
+			available = append(available, name)
+		}
+	}
+
+	if len(available) > 0 {
+		utils.AddExtensionRefFilters(httpRoute, utils.NginxGatewayGroup, kind, available)
+	}
+}
+
+func (r *IngressReconciler) applySnippetsFilters(
+	ctx context.Context,
+	ingress *networkingv1.Ingress,
+	httpRoute *gatewayv1.HTTPRoute,
+	logger logr.Logger,
+) {
+	snippetsOrder := make([]string, 0)
+	snippetsSet := make(map[string]struct{})
+	addSnippet := func(name string) {
+		if name == "" {
+			return
+		}
+		if _, ok := snippetsSet[name]; ok {
+			return
+		}
+		snippetsSet[name] = struct{}{}
+		snippetsOrder = append(snippetsOrder, name)
+	}
+
+	ingressClass := r.getIngressClass(ingress)
+	for _, mapping := range r.IngressClassSnippetsFilters {
+		if mapping.Pattern == "" {
+			continue
+		}
+		matched, err := filepath.Match(mapping.Pattern, ingressClass)
+		if err != nil {
+			logger.Error(err, "invalid ingress class pattern for snippets filter", "pattern", mapping.Pattern)
+			continue
+		}
+		if matched {
+			addSnippet(mapping.Name)
+		}
+	}
+	for _, mapping := range r.IngressNameSnippetsFilters {
+		if mapping.Pattern == "" {
+			continue
+		}
+		matched, err := filepath.Match(mapping.Pattern, ingress.Name)
+		if err != nil {
+			logger.Error(err, "invalid ingress name pattern for snippets filter", "pattern", mapping.Pattern)
+			continue
+		}
+		if matched {
+			addSnippet(mapping.Name)
+		}
+	}
+	for _, name := range utils.ParseCommaSeparatedAnnotation(ingress.Annotations, HTTPRouteSnippetsFilterAnnotation) {
+		addSnippet(name)
+	}
+	for _, name := range utils.MatchIngressAnnotationSnippetsRules(
+		ingress.Annotations,
+		r.IngressAnnotationSnippetsAdd,
+	) {
+		addSnippet(name)
+	}
+
+	removeSet := make(map[string]struct{})
+	for _, name := range utils.MatchIngressAnnotationSnippetsRules(
+		ingress.Annotations,
+		r.IngressAnnotationSnippetsRemove,
+	) {
+		removeSet[name] = struct{}{}
+	}
+	if len(removeSet) > 0 && len(snippetsOrder) > 0 {
+		filtered := make([]string, 0, len(snippetsOrder))
+		for _, name := range snippetsOrder {
+			if _, ok := removeSet[name]; ok {
+				delete(snippetsSet, name)
 				continue
 			}
+			filtered = append(filtered, name)
 		}
+		snippetsOrder = filtered
+	}
 
-		available := make([]string, 0, len(names))
-		for _, name := range names {
-			ok, err := utils.EnsureExtensionResource(
-				ctx,
-				r.Client,
-				entry.kind,
-				name,
-				r.GatewayNamespace,
-				ingress.Namespace,
-				ingress.Namespace,
-				ingress.Name,
-				nil,
-			)
-			if err != nil {
-				logger.Error(err, "failed to apply extension resource copy", "kind", entry.logName, "name", name, "namespace", ingress.Namespace)
-				continue
-			}
-			if ok {
-				available = append(available, name)
-			}
+	for _, name := range snippetsOrder {
+		ok, err := utils.EnsureSnippetsFilterCopyForHTTPRoute(
+			ctx,
+			r.Client,
+			r.Scheme,
+			r.GatewayNamespace,
+			httpRoute.Namespace,
+			ingress.Namespace,
+			ingress.Name,
+			name,
+			httpRoute.Name,
+		)
+		if err != nil {
+			logger.Error(err, "failed to apply SnippetsFilter copy", "name", name, "namespace", ingress.Namespace)
+			r.recordWarning(ingress, "SnippetsFilterCopyFailed",
+				fmt.Sprintf("failed to copy SnippetsFilter %s from %s", name, r.GatewayNamespace))
+			continue
 		}
-
-		if len(available) > 0 {
-			utils.AddExtensionRefFilters(httpRoute, utils.NginxGatewayGroup, entry.kind, available)
+		if ok {
+			utils.AddExtensionRefFilterAfterExistingKind(httpRoute, utils.NginxGatewayGroup, utils.SnippetsFilterKind, name)
 		}
+	}
 
-		if entry.kind == utils.SnippetsFilterKind {
-			snippetsOrder := make([]string, 0)
-			snippetsSet := make(map[string]struct{})
-			addSnippet := func(name string) {
-				if name == "" {
-					return
-				}
-				if _, ok := snippetsSet[name]; ok {
-					return
-				}
-				snippetsSet[name] = struct{}{}
-				snippetsOrder = append(snippetsOrder, name)
-			}
-
-			ingressClass := r.getIngressClass(ingress)
-			for _, mapping := range r.IngressClassSnippetsFilters {
-				if mapping.Pattern == "" {
-					continue
-				}
-				matched, err := filepath.Match(mapping.Pattern, ingressClass)
-				if err != nil {
-					logger.Error(err, "invalid ingress class pattern for snippets filter", "pattern", mapping.Pattern)
-					continue
-				}
-				if matched {
-					addSnippet(mapping.Name)
-				}
-			}
-			for _, mapping := range r.IngressNameSnippetsFilters {
-				if mapping.Pattern == "" {
-					continue
-				}
-				matched, err := filepath.Match(mapping.Pattern, ingress.Name)
-				if err != nil {
-					logger.Error(err, "invalid ingress name pattern for snippets filter", "pattern", mapping.Pattern)
-					continue
-				}
-				if matched {
-					addSnippet(mapping.Name)
-				}
-			}
-			for _, name := range utils.ParseCommaSeparatedAnnotation(ingress.Annotations, HTTPRouteSnippetsFilterAnnotation) {
-				addSnippet(name)
-			}
-
-			for _, name := range utils.MatchIngressAnnotationSnippetsRules(
-				ingress.Annotations,
-				r.IngressAnnotationSnippetsAdd,
-			) {
-				addSnippet(name)
-			}
-			removeSet := make(map[string]struct{})
-			for _, name := range utils.MatchIngressAnnotationSnippetsRules(
-				ingress.Annotations,
-				r.IngressAnnotationSnippetsRemove,
-			) {
-				removeSet[name] = struct{}{}
-			}
-			if len(removeSet) > 0 && len(snippetsOrder) > 0 {
-				filtered := make([]string, 0, len(snippetsOrder))
-				for _, name := range snippetsOrder {
-					if _, ok := removeSet[name]; ok {
-						delete(snippetsSet, name)
-						continue
-					}
-					filtered = append(filtered, name)
-				}
-				snippetsOrder = filtered
-			}
-
-			for _, name := range snippetsOrder {
-				ok, err := utils.EnsureSnippetsFilterCopyForHTTPRoute(
-					ctx,
-					r.Client,
-					r.Scheme,
-					r.GatewayNamespace,
-					httpRoute.Namespace,
-					ingress.Namespace,
-					ingress.Name,
-					name,
-					httpRoute.Name,
-				)
-				if err != nil {
-					logger.Error(err, "failed to apply SnippetsFilter copy", "name", name, "namespace", ingress.Namespace)
-					r.recordWarning(ingress, "SnippetsFilterCopyFailed",
-						fmt.Sprintf("failed to copy SnippetsFilter %s from %s", name, r.GatewayNamespace))
-					continue
-				}
-				if ok {
-					utils.AddExtensionRefFilterAfterExistingKind(httpRoute, utils.NginxGatewayGroup, utils.SnippetsFilterKind, name)
-				}
-			}
-
-			if ingress.Annotations != nil {
-				for _, fullKey := range utils.NginxIngressSnippetWarningAnnotations(ingress.Annotations) {
-					logger.Info("Ignoring nginx ingress annotation; use ingress-doperator.fiction.si/httproute-snippets-filter instead",
-						"annotation", fullKey,
-						"namespace", ingress.Namespace,
-						"name", ingress.Name)
-				}
-			}
-			snippets, warnings, ok := utils.BuildNginxIngressSnippets(ingress.Annotations)
-			if !ok {
-				continue
-			}
-			for _, warning := range warnings {
-				logger.Info("nginx ingress annotation warning", "warning", warning, "namespace", ingress.Namespace, "name", ingress.Name)
-			}
-			filterName := utils.AutomaticSnippetsFilterName(ingress.Name)
-			var owner client.Object = ingress
-			if r.IngressPostProcessingMode == IngressPostProcessingModeRemove {
-				owner = nil
-			}
-			ready, err := utils.EnsureSnippetsFilterForIngress(
-				ctx,
-				r.Client,
-				r.Scheme,
-				httpRoute,
-				owner,
-				ingress.Namespace,
-				ingress.Name,
-				filterName,
-				snippets,
-			)
-			if err != nil {
-				logger.Error(err, "failed to apply annotation SnippetsFilter", "name", filterName, "namespace", httpRoute.Namespace)
-				r.recordWarning(ingress, "AnnotationSnippetsFilterFailed",
-					fmt.Sprintf("failed to apply annotation SnippetsFilter %s", filterName))
-				continue
-			}
-			if ready {
-				utils.AddExtensionRefFilterAfterExistingKind(httpRoute, utils.NginxGatewayGroup, utils.SnippetsFilterKind, filterName)
-			}
+	if ingress.Annotations != nil {
+		for _, fullKey := range utils.NginxIngressSnippetWarningAnnotations(ingress.Annotations) {
+			logger.Info("Ignoring nginx ingress annotation; use ingress-doperator.fiction.si/httproute-snippets-filter instead",
+				"annotation", fullKey,
+				"namespace", ingress.Namespace,
+				"name", ingress.Name)
 		}
+	}
+	snippets, warnings, ok := utils.BuildNginxIngressSnippets(ingress.Annotations)
+	if !ok {
+		return
+	}
+	for _, warning := range warnings {
+		logger.Info("nginx ingress annotation warning", "warning", warning, "namespace", ingress.Namespace, "name", ingress.Name)
+	}
+	filterName := utils.AutomaticSnippetsFilterName(ingress.Name)
+	var owner client.Object = ingress
+	if r.IngressPostProcessingMode == IngressPostProcessingModeRemove {
+		owner = nil
+	}
+	ready, err := utils.EnsureSnippetsFilterForIngress(
+		ctx,
+		r.Client,
+		r.Scheme,
+		httpRoute,
+		owner,
+		ingress.Namespace,
+		ingress.Name,
+		filterName,
+		snippets,
+	)
+	if err != nil {
+		logger.Error(err, "failed to apply annotation SnippetsFilter", "name", filterName, "namespace", httpRoute.Namespace)
+		r.recordWarning(ingress, "AnnotationSnippetsFilterFailed",
+			fmt.Sprintf("failed to apply annotation SnippetsFilter %s", filterName))
+		return
+	}
+	if ready {
+		utils.AddExtensionRefFilterAfterExistingKind(httpRoute, utils.NginxGatewayGroup, utils.SnippetsFilterKind, filterName)
 	}
 }
 
