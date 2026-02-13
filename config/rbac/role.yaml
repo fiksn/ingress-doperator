@@ -30,6 +30,8 @@ rules:
   - ingresses/status
   verbs:
   - get
+  - update
+  - patch
 - apiGroups:
   - networking.k8s.io
   resources:

@@ -30,7 +30,10 @@ import (
 
 	"go.uber.org/zap/zapcore"
 	corev1 "k8s.io/api/core/v1"
+	networkingv1 "k8s.io/api/networking/v1"
 	apiextensionsv1 "k8s.io/apiextensions-apiserver/pkg/apis/apiextensions/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	utilruntime "k8s.io/apimachinery/pkg/util/runtime"
 	clientgoscheme "k8s.io/client-go/kubernetes/scheme"
@@ -74,173 +77,14 @@ func init() {
 	// +kubebuilder:scaffold:scheme
 }
 
-// nolint:gocyclo
 func main() {
-	var metricsAddr string
-	var metricsCertPath, metricsCertName, metricsCertKey string
-	var webhookCertPath, webhookCertName, webhookCertKey string
-	var enableLeaderElection bool
-	var probeAddr string
-	var secureMetrics bool
-	var enableHTTP2 bool
-	var verbosity int
-	var tlsOpts []func(*tls.Config)
-	var gatewayNamespace string
-	var gatewayName string
-	var gatewayClassName string
-	var watchNamespace string
-	var oneGatewayPerIngress bool
-	var gatewayAnnotationFilters string
-	var httpRouteAnnotationFilters string
-	var enableDeletion bool
-	var hostnameRewriteFrom string
-	var hostnameRewriteTo string
-	var ingressPostProcessing string
-	var gatewayAnnotations string
-	var gatewayInfraAnnotations string
-	var private bool
-	var privateAnnotations string
-	var privateIngressClassPattern string
-	var ingressClassFilter string
-	var ingressClassSnippetsFilters string
-	var ingressNameSnippetsFilters string
-	var ingressAnnotationSnippetsAdd string
-	var ingressAnnotationSnippetsRemove string
-	var reconcileCachePersist bool
-	var reconcileCacheMaxEntries int
-	var useIngress2Gateway bool
-	var ingress2GatewayProvider string
-	var ingress2GatewayIngressClass string
-
-	flag.StringVar(&gatewayNamespace, "gateway-namespace", "nginx-fabric",
-		"The namespace where the Gateway resource will be created")
-	flag.StringVar(&gatewayName, "gateway-name", "ingress-gateway",
-		"The name of the Gateway resource (only used when one-gateway-per-ingress is false)")
-	flag.StringVar(&gatewayClassName, "gateway-class-name", "nginx",
-		"The GatewayClass to use for created Gateway resources")
-	flag.StringVar(&watchNamespace, "watch-namespace", "",
-		"If specified, only watch Ingresses in this namespace (default: watch all namespaces)")
-	flag.StringVar(&ingressClassFilter, "ingress-class-filter", "*",
-		"Glob pattern to filter which ingress classes to process (e.g., '*private*', 'nginx', '*'). "+
-			"Default '*' processes all classes.")
-	flag.BoolVar(&oneGatewayPerIngress, "one-gateway-per-ingress", false,
-		"If true, create a separate Gateway for each Ingress with the same name")
-	flag.BoolVar(&enableDeletion, "enable-deletion", false,
-		"If true, delete HTTPRoute (and Gateway in one-gateway-per-ingress mode) when Ingress is deleted")
-	flag.StringVar(&hostnameRewriteFrom, "hostname-rewrite-from", "",
-		"Comma-separated list of domain suffixes to match for rewriting (e.g., 'domain.cc,other.com'). "+
-			"Used with --hostname-rewrite-to.")
-	flag.StringVar(&hostnameRewriteTo, "hostname-rewrite-to", "",
-		"Comma-separated list of replacement domain suffixes (e.g., 'foo.domain.cc,bar.other.com'). "+
-			"Transforms 'a.b.domain.cc' to 'a.b.foo.domain.cc'. "+
-			"Must have same number of items as --hostname-rewrite-from.")
-	flag.StringVar(&ingressPostProcessing, "ingress-postprocessing", "none",
-		"How to handle the post processing of ingress: 'none' (no action), "+
-			"'disable' (remove ingress class), 'remove' (delete ingress)")
-	flag.StringVar(&gatewayAnnotations, "gateway-annotations", DefaultGatewayAnnotations,
-		"Comma-separated key=value pairs for Gateway metadata annotations (applied to all Gateways)")
-	flag.StringVar(&gatewayInfraAnnotations, "gateway-infrastructure-annotations",
-		DefaultGatewayInfraAnnotations,
-		"Comma-separated key=value pairs for Gateway infrastructure annotations (applied to all Gateways)")
-	flag.StringVar(&privateAnnotations, "private-annotations", DefaultPrivateInfraAnnotations,
-		"Comma-separated key=value pairs defining what 'private' means for Gateway infrastructure annotations")
-	flag.BoolVar(&private, "private", false, "If true, apply private annotations to all Gateways")
-	flag.StringVar(&privateIngressClassPattern, "private-ingress-class-pattern", "*private*",
-		"Glob pattern for ingress class names (e.g., '*private') that should get private infrastructure annotations")
-	flag.StringVar(&ingressClassSnippetsFilters, "ingress-class-snippets-filter", "",
-		"Comma-separated list of pattern:snippetsFilterName entries. "+
-			"If ingress class matches the glob, the SnippetsFilter is copied from the Gateway namespace and attached.")
-	flag.StringVar(&ingressNameSnippetsFilters, "ingress-name-snippets-filter", "",
-		"Comma-separated list of pattern:snippetsFilterName entries. "+
-			"If ingress name matches the glob, the SnippetsFilter is copied from the Gateway namespace and attached.")
-	flag.StringVar(&ingressAnnotationSnippetsAdd, "ingress-annotation-snippets-add", "",
-		"Semicolon-separated list of key=value:filter1,filter2 entries. "+
-			"If annotation value matches glob, add SnippetsFilter(s).")
-	flag.StringVar(&ingressAnnotationSnippetsRemove, "ingress-annotation-snippets-remove", "",
-		"Semicolon-separated list of key=value:filter1,filter2 entries. "+
-			"If annotation value matches glob, remove SnippetsFilter(s).")
-	flag.BoolVar(&reconcileCachePersist, "reconcile-cache-persist", true,
-		"If false, do not persist the reconcile cache to ConfigMaps.")
-	flag.IntVar(&reconcileCacheMaxEntries, "reconcile-cache-max-entries", 0,
-		"Maximum number of entries to keep in reconcile cache (0 = unlimited).")
-	flag.StringVar(&gatewayAnnotationFilters, "gateway-annotation-filters",
-		controller.DefaultGatewayAnnotationFilters,
-		"Comma-separated list of annotation prefixes to exclude from Gateway resources")
-	flag.StringVar(&httpRouteAnnotationFilters, "httproute-annotation-filters",
-		controller.DefaultHTTPRouteAnnotationFilters,
-		"Comma-separated list of annotation prefixes to exclude from HTTPRoute resources")
-	flag.BoolVar(&useIngress2Gateway, "use-ingress2gateway", false,
-		"If true, use the ingress2gateway library for translation (disables hostname/certificate mangling)")
-	flag.StringVar(&ingress2GatewayProvider, "ingress2gateway-provider", "ingress-nginx",
-		"Provider to use with ingress2gateway (e.g., ingress-nginx, istio, kong)")
-	flag.StringVar(&ingress2GatewayIngressClass, "ingress2gateway-ingress-class", "nginx",
-		"Ingress class name for provider-specific filtering in ingress2gateway")
-	flag.StringVar(&metricsAddr, "metrics-bind-address", "0", "The address the metrics endpoint binds to. "+
-		"Use :8443 for HTTPS or :8080 for HTTP, or leave as 0 to disable the metrics service.")
-	flag.StringVar(&probeAddr, "health-probe-bind-address", ":8081", "The address the probe endpoint binds to.")
-	flag.BoolVar(&enableLeaderElection, "leader-elect", false,
-		"Enable leader election for controller manager. "+
-			"Enabling this will ensure there is only one active controller manager.")
-	flag.BoolVar(&secureMetrics, "metrics-secure", true,
-		"If set, the metrics endpoint is served securely via HTTPS. Use --metrics-secure=false to use HTTP instead.")
-	flag.StringVar(&webhookCertPath, "webhook-cert-path", "", "The directory that contains the webhook certificate.")
-	flag.StringVar(&webhookCertName, "webhook-cert-name", "tls.crt", "The name of the webhook certificate file.")
-	flag.StringVar(&webhookCertKey, "webhook-cert-key", "tls.key", "The name of the webhook key file.")
-	flag.StringVar(&metricsCertPath, "metrics-cert-path", "",
-		"The directory that contains the metrics server certificate.")
-	flag.StringVar(&metricsCertName, "metrics-cert-name", "tls.crt", "The name of the metrics server certificate file.")
-	flag.StringVar(&metricsCertKey, "metrics-cert-key", "tls.key", "The name of the metrics server key file.")
-	flag.BoolVar(&enableHTTP2, "enable-http2", false,
-		"If set, HTTP/2 will be enabled for the metrics and webhook servers")
-	flag.IntVar(&verbosity, "v", 0, "Log verbosity (0 = info, higher = more verbose)")
-	opts := zap.Options{
-		Development: true,
-	}
-	opts.BindFlags(flag.CommandLine)
-	flag.Parse()
-
-	if verbosity > 0 {
-		opts.Development = false
-		opts.Level = zapcore.Level(-verbosity)
+	cfg, opts, err := parseOperatorConfig()
+	if err != nil {
+		setupLog.Error(err, "Invalid configuration")
+		os.Exit(1)
 	}
 
 	ctrl.SetLogger(zap.New(zap.UseFlagOptions(&opts)))
-
-	parsedSnippetsFilters, err := utils.ParseIngressClassSnippetsFilters(ingressClassSnippetsFilters)
-	if err != nil {
-		setupLog.Error(err, "Invalid ingress-class-snippets-filter value")
-		os.Exit(1)
-	}
-	parsedNameSnippetsFilters, err := utils.ParseIngressClassSnippetsFilters(ingressNameSnippetsFilters)
-	if err != nil {
-		setupLog.Error(err, "Invalid ingress-name-snippets-filter value")
-		os.Exit(1)
-	}
-	parsedAnnotationAddRules, err := utils.ParseIngressAnnotationSnippetsRules(ingressAnnotationSnippetsAdd)
-	if err != nil {
-		setupLog.Error(err, "Invalid ingress-annotation-snippets-add value")
-		os.Exit(1)
-	}
-	parsedAnnotationRemoveRules, err := utils.ParseIngressAnnotationSnippetsRules(ingressAnnotationSnippetsRemove)
-	if err != nil {
-		setupLog.Error(err, "Invalid ingress-annotation-snippets-remove value")
-		os.Exit(1)
-	}
-
-	var ingressPostProcessingMode controller.IngressPostProcessingMode
-	switch ingressPostProcessing {
-	case "none":
-		ingressPostProcessingMode = controller.IngressPostProcessingModeNone
-	case "disable":
-		ingressPostProcessingMode = controller.IngressPostProcessingModeDisable
-	case "remove":
-		ingressPostProcessingMode = controller.IngressPostProcessingModeRemove
-	default:
-		setupLog.Error(nil, "Invalid ingress-post-processing value",
-			"value", ingressPostProcessingMode,
-			"allowed", "none, disable, remove")
-		os.Exit(1)
-	}
 
 	// if the enable-http2 flag is false (the default), http/2 should be disabled
 	// due to its vulnerabilities. More specifically, disabling http/2 will
@@ -248,19 +92,409 @@ func main() {
 	// Rapid Reset CVEs. For more information see:
 	// - https://github.com/advisories/GHSA-qppj-fm5r-hxr3
 	// - https://github.com/advisories/GHSA-4374-p667-p6c8
-	disableHTTP2 := func(c *tls.Config) {
-		setupLog.Info("disabling http/2")
-		c.NextProtos = []string{"http/1.1"}
-	}
-
-	if !enableHTTP2 {
-		tlsOpts = append(tlsOpts, disableHTTP2)
-	}
+	tlsOpts := buildTLSOptions(cfg.EnableHTTP2)
 
 	// Initial webhook TLS options
 	webhookTLSOpts := tlsOpts
+	webhookServer := buildWebhookServer(webhookTLSOpts, cfg.WebhookCertPath, cfg.WebhookCertName, cfg.WebhookCertKey)
+
+	// Metrics endpoint is enabled in 'config/default/kustomization.yaml'. The Metrics options configure the server.
+	// More info:
+	// - https://pkg.go.dev/sigs.k8s.io/controller-runtime@v0.22.4/pkg/metrics/server
+	// - https://book.kubebuilder.io/reference/metrics.html
+	metricsServerOptions := buildMetricsServerOptions(
+		cfg.MetricsAddr,
+		cfg.SecureMetrics,
+		tlsOpts,
+		cfg.MetricsCertPath,
+		cfg.MetricsCertName,
+		cfg.MetricsCertKey,
+	)
+
+	mgr, err := ctrl.NewManager(ctrl.GetConfigOrDie(), ctrl.Options{
+		Scheme:                 scheme,
+		Metrics:                metricsServerOptions,
+		WebhookServer:          webhookServer,
+		HealthProbeBindAddress: cfg.ProbeAddr,
+		LeaderElection:         cfg.EnableLeaderElection,
+		LeaderElectionID:       "94203fac.fiction.si",
+		// LeaderElectionReleaseOnCancel defines if the leader should step down voluntarily
+		// when the Manager ends. This requires the binary to immediately end when the
+		// Manager is stopped, otherwise, this setting is unsafe. Setting this significantly
+		// speeds up voluntary leader transitions as the new leader don't have to wait
+		// LeaseDuration time first.
+		//
+		// In the default scaffold provided, the program ends immediately after
+		// the manager stops, so would be fine to enable this option. However,
+		// if you are doing or is intended to do any operation such as perform cleanups
+		// after the manager stops then its usage might be unsafe.
+		// LeaderElectionReleaseOnCancel: true,
+	})
+	if err != nil {
+		setupLog.Error(err, "unable to start manager")
+		os.Exit(1)
+	}
+
+	ctx := context.Background()
+	if cfg.IngressPostProcessingMode == controller.IngressPostProcessingModeDisable {
+		if err := ensureDisabledIngressClass(ctx, mgr.GetAPIReader(), mgr.GetClient()); err != nil {
+			setupLog.Error(err, "failed to ensure disabled IngressClass")
+			os.Exit(1)
+		}
+	}
+
+	// Verify that the Gateway namespace exists
+	if err := ensureGatewayNamespace(ctx, mgr.GetAPIReader(), cfg.GatewayNamespace); err != nil {
+		setupLog.Error(err, "Gateway namespace does not exist", "namespace", cfg.GatewayNamespace)
+		cmd := fmt.Sprintf("kubectl create namespace %s", cfg.GatewayNamespace)
+		setupLog.Info("Please create the namespace first", "command", cmd)
+		os.Exit(1)
+	}
+	setupLog.Info("Verified Gateway namespace exists", "namespace", cfg.GatewayNamespace)
+
+	reconcileCache := make(map[string]utils.ReconcileCacheEntry)
+	if cfg.ReconcileCachePersist {
+		reconcileCache = loadReconcileCache(ctx, mgr.GetAPIReader(), cfg.GatewayNamespace)
+	}
+
+	for _, mapping := range cfg.ParsedClassSnippetsFilters {
+		if err := utils.ValidateSnippetsFilterExists(
+			ctx,
+			mgr.GetAPIReader(),
+			cfg.GatewayNamespace,
+			mapping.Name,
+		); err != nil {
+			setupLog.Error(err, "SnippetsFilter not found in gateway namespace",
+				"name", mapping.Name,
+				"namespace", cfg.GatewayNamespace)
+			os.Exit(1)
+		}
+	}
+
+	if err = (&controller.IngressReconciler{
+		Client:                           mgr.GetClient(),
+		Scheme:                           mgr.GetScheme(),
+		Recorder:                         mgr.GetEventRecorder("ingress-doperator"),
+		GatewayNamespace:                 cfg.GatewayNamespace,
+		GatewayName:                      cfg.GatewayName,
+		GatewayClassName:                 cfg.GatewayClassName,
+		WatchNamespace:                   cfg.WatchNamespace,
+		OneGatewayPerIngress:             cfg.OneGatewayPerIngress,
+		EnableDeletion:                   cfg.EnableDeletion,
+		HostnameRewriteFrom:              cfg.HostnameRewriteFrom,
+		HostnameRewriteTo:                cfg.HostnameRewriteTo,
+		IngressPostProcessingMode:        cfg.IngressPostProcessingMode,
+		GatewayAnnotationFilters:         cfg.GatewayFilters,
+		HTTPRouteAnnotationFilters:       cfg.HTTPRouteFilters,
+		DefaultGatewayAnnotations:        cfg.GatewayAnnotationsMap,
+		GatewayInfrastructureAnnotations: cfg.GatewayInfraAnnotationsMap,
+		PrivateInfrastructureAnnotations: cfg.PrivateInfraAnnotationsMap,
+		ApplyPrivateToAll:                cfg.Private,
+		PrivateIngressClassPattern:       cfg.PrivateIngressClassPattern,
+		IngressClassFilter:               cfg.IngressClassFilter,
+		IngressClassSnippetsFilters:      cfg.ParsedClassSnippetsFilters,
+		IngressNameSnippetsFilters:       cfg.ParsedNameSnippetsFilters,
+		IngressAnnotationSnippetsAdd:     cfg.ParsedAnnotationSnippetsAdd,
+		IngressAnnotationSnippetsRemove:  cfg.ParsedAnnotationSnippetsRemove,
+		ClearIngressStatusOnDisable:      cfg.ClearIngressStatusOnDisable,
+		ReconcileCache:                   reconcileCache,
+		ReconcileCacheNamespace:          cfg.GatewayNamespace,
+		ReconcileCacheBaseName:           utils.ReconcileCacheConfigMapBaseName,
+		ReconcileCacheShards:             utils.ReconcileCacheShardCount,
+		ReconcileCachePersist:            cfg.ReconcileCachePersist,
+		ReconcileCacheMaxEntries:         cfg.ReconcileCacheMaxEntries,
+		UseIngress2Gateway:               cfg.UseIngress2Gateway,
+		Ingress2GatewayProvider:          cfg.Ingress2GatewayProvider,
+		Ingress2GatewayIngressClass:      cfg.Ingress2GatewayIngressClass,
+		HTTPRouteManager: &utils.HTTPRouteManager{
+			Client: mgr.GetClient(),
+		},
+	}).SetupWithManager(mgr); err != nil {
+		setupLog.Error(err, "unable to create controller", "controller", "Ingress")
+		os.Exit(1)
+	}
+
+	if cfg.WatchNamespace != "" {
+		setupLog.Info("Watching Ingresses in specific namespace only", "namespace", cfg.WatchNamespace)
+	} else {
+		setupLog.Info("Watching Ingresses in all namespaces")
+	}
+
+	if cfg.OneGatewayPerIngress {
+		setupLog.Info("Mode: One Gateway per Ingress")
+	} else {
+		setupLog.Info("Mode: Shared Gateway", "gatewayName", cfg.GatewayName)
+	}
+
+	if cfg.EnableDeletion {
+		setupLog.Info("Deletion enabled: HTTPRoute and Gateway resources will be deleted when Ingress is deleted")
+	} else {
+		setupLog.Info("Deletion disabled: HTTPRoute and Gateway resources will remain when Ingress is deleted")
+	}
+
+	ruleCount, err := validateHostnameRewrite(cfg.HostnameRewriteFrom, cfg.HostnameRewriteTo)
+	if err != nil {
+		setupLog.Error(err, "Invalid hostname rewrite configuration")
+		os.Exit(1)
+	}
+	if ruleCount > 0 {
+		setupLog.Info("Hostname rewriting enabled",
+			"from", cfg.HostnameRewriteFrom,
+			"to", cfg.HostnameRewriteTo,
+			"rules", ruleCount)
+	}
+
+	switch cfg.IngressPostProcessingMode {
+	case controller.IngressPostProcessingModeNone:
+		setupLog.Info("Ingress post processing mode: none")
+	case controller.IngressPostProcessingModeDisable:
+		setupLog.Info("Ingress post processing mode: disable")
+	case controller.IngressPostProcessingModeRemove:
+		setupLog.Info("Ingress post processing mode: remove")
+	}
+
+	// +kubebuilder:scaffold:builder
+
+	if err := mgr.AddHealthzCheck("healthz", healthz.Ping); err != nil {
+		setupLog.Error(err, "unable to set up health check")
+		os.Exit(1)
+	}
+	if err := mgr.AddReadyzCheck("readyz", healthz.Ping); err != nil {
+		setupLog.Error(err, "unable to set up ready check")
+		os.Exit(1)
+	}
+
+	setupLog.Info("starting manager")
+
+	// Log when metrics server is ready
+	if cfg.MetricsAddr != "0" {
+		setupLog.Info("Serving metrics server", "addr", cfg.MetricsAddr, "secure", cfg.SecureMetrics)
+	}
+
+	if err := mgr.Start(ctrl.SetupSignalHandler()); err != nil {
+		setupLog.Error(err, "problem running manager")
+		os.Exit(1)
+	}
+}
+
+type operatorConfig struct {
+	MetricsAddr                     string
+	MetricsCertPath                 string
+	MetricsCertName                 string
+	MetricsCertKey                  string
+	WebhookCertPath                 string
+	WebhookCertName                 string
+	WebhookCertKey                  string
+	EnableLeaderElection            bool
+	ProbeAddr                       string
+	SecureMetrics                   bool
+	EnableHTTP2                     bool
+	Verbosity                       int
+	GatewayNamespace                string
+	GatewayName                     string
+	GatewayClassName                string
+	WatchNamespace                  string
+	OneGatewayPerIngress            bool
+	GatewayAnnotationFilters        string
+	HTTPRouteAnnotationFilters      string
+	EnableDeletion                  bool
+	HostnameRewriteFrom             string
+	HostnameRewriteTo               string
+	IngressPostProcessing           string
+	GatewayAnnotations              string
+	GatewayInfraAnnotations         string
+	Private                         bool
+	PrivateAnnotations              string
+	PrivateIngressClassPattern      string
+	IngressClassFilter              string
+	IngressClassSnippetsFilters     string
+	IngressNameSnippetsFilters      string
+	IngressAnnotationSnippetsAdd    string
+	IngressAnnotationSnippetsRemove string
+	ReconcileCachePersist           bool
+	ReconcileCacheMaxEntries        int
+	ClearIngressStatusOnDisable     bool
+	UseIngress2Gateway              bool
+	Ingress2GatewayProvider         string
+	Ingress2GatewayIngressClass     string
+
+	ParsedClassSnippetsFilters     []utils.IngressClassSnippetsFilter
+	ParsedNameSnippetsFilters      []utils.IngressClassSnippetsFilter
+	ParsedAnnotationSnippetsAdd    []utils.IngressAnnotationSnippetsRule
+	ParsedAnnotationSnippetsRemove []utils.IngressAnnotationSnippetsRule
+	IngressPostProcessingMode      controller.IngressPostProcessingMode
+	GatewayFilters                 []string
+	HTTPRouteFilters               []string
+	GatewayAnnotationsMap          map[string]string
+	GatewayInfraAnnotationsMap     map[string]string
+	PrivateInfraAnnotationsMap     map[string]string
+}
+
+func parseOperatorConfig() (operatorConfig, zap.Options, error) {
+	var cfg operatorConfig
+	opts := zap.Options{
+		Development: true,
+	}
+
+	flag.StringVar(&cfg.GatewayNamespace, "gateway-namespace", "nginx-fabric",
+		"The namespace where the Gateway resource will be created")
+	flag.StringVar(&cfg.GatewayName, "gateway-name", "ingress-gateway",
+		"The name of the Gateway resource (only used when one-gateway-per-ingress is false)")
+	flag.StringVar(&cfg.GatewayClassName, "gateway-class-name", "nginx",
+		"The GatewayClass to use for created Gateway resources")
+	flag.StringVar(&cfg.WatchNamespace, "watch-namespace", "",
+		"If specified, only watch Ingresses in this namespace (default: watch all namespaces)")
+	flag.StringVar(&cfg.IngressClassFilter, "ingress-class-filter", "*",
+		"Glob pattern to filter which ingress classes to process (e.g., '*private*', 'nginx', '*'). "+
+			"Default '*' processes all classes.")
+	flag.BoolVar(&cfg.OneGatewayPerIngress, "one-gateway-per-ingress", false,
+		"If true, create a separate Gateway for each Ingress with the same name")
+	flag.BoolVar(&cfg.EnableDeletion, "enable-deletion", false,
+		"If true, delete HTTPRoute (and Gateway in one-gateway-per-ingress mode) when Ingress is deleted")
+	flag.StringVar(&cfg.HostnameRewriteFrom, "hostname-rewrite-from", "",
+		"Comma-separated list of domain suffixes to match for rewriting (e.g., 'domain.cc,other.com'). "+
+			"Used with --hostname-rewrite-to.")
+	flag.StringVar(&cfg.HostnameRewriteTo, "hostname-rewrite-to", "",
+		"Comma-separated list of replacement domain suffixes (e.g., 'foo.domain.cc,bar.other.com'). "+
+			"Transforms 'a.b.domain.cc' to 'a.b.foo.domain.cc'. "+
+			"Must have same number of items as --hostname-rewrite-from.")
+	flag.StringVar(&cfg.IngressPostProcessing, "ingress-postprocessing", "none",
+		"How to handle the post processing of ingress: 'none' (no action), "+
+			"'disable' (remove ingress class), 'remove' (delete ingress)")
+	flag.StringVar(&cfg.GatewayAnnotations, "gateway-annotations", DefaultGatewayAnnotations,
+		"Comma-separated key=value pairs for Gateway metadata annotations (applied to all Gateways)")
+	flag.StringVar(&cfg.GatewayInfraAnnotations, "gateway-infrastructure-annotations",
+		DefaultGatewayInfraAnnotations,
+		"Comma-separated key=value pairs for Gateway infrastructure annotations (applied to all Gateways)")
+	flag.StringVar(&cfg.PrivateAnnotations, "private-annotations", DefaultPrivateInfraAnnotations,
+		"Comma-separated key=value pairs defining what 'private' means for Gateway infrastructure annotations")
+	flag.BoolVar(&cfg.Private, "private", false, "If true, apply private annotations to all Gateways")
+	flag.StringVar(&cfg.PrivateIngressClassPattern, "private-ingress-class-pattern", "*private*",
+		"Glob pattern for ingress class names (e.g., '*private') that should get private infrastructure annotations")
+	flag.StringVar(&cfg.IngressClassSnippetsFilters, "ingress-class-snippets-filter", "",
+		"Comma-separated list of pattern:snippetsFilterName entries. "+
+			"If ingress class matches the glob, the SnippetsFilter is copied from the Gateway namespace and attached.")
+	flag.StringVar(&cfg.IngressNameSnippetsFilters, "ingress-name-snippets-filter", "",
+		"Comma-separated list of pattern:snippetsFilterName entries. "+
+			"If ingress name matches the glob, the SnippetsFilter is copied from the Gateway namespace and attached.")
+	flag.StringVar(&cfg.IngressAnnotationSnippetsAdd, "ingress-annotation-snippets-add", "",
+		"Semicolon-separated list of key=value:filter1,filter2 entries. "+
+			"If annotation value matches glob, add SnippetsFilter(s).")
+	flag.StringVar(&cfg.IngressAnnotationSnippetsRemove, "ingress-annotation-snippets-remove", "",
+		"Semicolon-separated list of key=value:filter1,filter2 entries. "+
+			"If annotation value matches glob, remove SnippetsFilter(s).")
+	flag.BoolVar(&cfg.ReconcileCachePersist, "reconcile-cache-persist", true,
+		"If false, do not persist the reconcile cache to ConfigMaps.")
+	flag.IntVar(&cfg.ReconcileCacheMaxEntries, "reconcile-cache-max-entries", 0,
+		"Maximum number of entries to keep in reconcile cache (0 = unlimited).")
+	flag.BoolVar(&cfg.ClearIngressStatusOnDisable, "clear-ingress-status-on-disable", true,
+		"If true, clear status.loadBalancer when disabling an Ingress (requires update on ingresses/status).")
+	flag.StringVar(&cfg.GatewayAnnotationFilters, "gateway-annotation-filters",
+		controller.DefaultGatewayAnnotationFilters,
+		"Comma-separated list of annotation prefixes to exclude from Gateway resources")
+	flag.StringVar(&cfg.HTTPRouteAnnotationFilters, "httproute-annotation-filters",
+		controller.DefaultHTTPRouteAnnotationFilters,
+		"Comma-separated list of annotation prefixes to exclude from HTTPRoute resources")
+	flag.BoolVar(&cfg.UseIngress2Gateway, "use-ingress2gateway", false,
+		"If true, use the ingress2gateway library for translation (disables hostname/certificate mangling)")
+	flag.StringVar(&cfg.Ingress2GatewayProvider, "ingress2gateway-provider", "ingress-nginx",
+		"Provider to use with ingress2gateway (e.g., ingress-nginx, istio, kong)")
+	flag.StringVar(&cfg.Ingress2GatewayIngressClass, "ingress2gateway-ingress-class", "nginx",
+		"Ingress class name for provider-specific filtering in ingress2gateway")
+	flag.StringVar(&cfg.MetricsAddr, "metrics-bind-address", "0", "The address the metrics endpoint binds to. "+
+		"Use :8443 for HTTPS or :8080 for HTTP, or leave as 0 to disable the metrics service.")
+	flag.StringVar(&cfg.ProbeAddr, "health-probe-bind-address", ":8081", "The address the probe endpoint binds to.")
+	flag.BoolVar(&cfg.EnableLeaderElection, "leader-elect", false,
+		"Enable leader election for controller manager. "+
+			"Enabling this will ensure there is only one active controller manager.")
+	flag.BoolVar(&cfg.SecureMetrics, "metrics-secure", true,
+		"If set, the metrics endpoint is served securely via HTTPS. Use --metrics-secure=false to use HTTP instead.")
+	flag.StringVar(&cfg.WebhookCertPath, "webhook-cert-path", "", "The directory that contains the webhook certificate.")
+	flag.StringVar(&cfg.WebhookCertName, "webhook-cert-name", "tls.crt", "The name of the webhook certificate file.")
+	flag.StringVar(&cfg.WebhookCertKey, "webhook-cert-key", "tls.key", "The name of the webhook key file.")
+	flag.StringVar(&cfg.MetricsCertPath, "metrics-cert-path", "",
+		"The directory that contains the metrics server certificate.")
+	flag.StringVar(&cfg.MetricsCertName, "metrics-cert-name", "tls.crt",
+		"The name of the metrics server certificate file.")
+	flag.StringVar(&cfg.MetricsCertKey, "metrics-cert-key", "tls.key", "The name of the metrics server key file.")
+	flag.BoolVar(&cfg.EnableHTTP2, "enable-http2", false,
+		"If set, HTTP/2 will be enabled for the metrics and webhook servers")
+	flag.IntVar(&cfg.Verbosity, "v", 0, "Log verbosity (0 = info, higher = more verbose)")
+	opts.BindFlags(flag.CommandLine)
+	flag.Parse()
+
+	if cfg.Verbosity > 0 {
+		opts.Development = false
+		opts.Level = zapcore.Level(-cfg.Verbosity)
+	}
+
+	var err error
+	cfg.ParsedClassSnippetsFilters, err = utils.ParseIngressClassSnippetsFilters(cfg.IngressClassSnippetsFilters)
+	if err != nil {
+		return cfg, opts, fmt.Errorf("invalid ingress-class-snippets-filter value: %w", err)
+	}
+	cfg.ParsedNameSnippetsFilters, err = utils.ParseIngressClassSnippetsFilters(cfg.IngressNameSnippetsFilters)
+	if err != nil {
+		return cfg, opts, fmt.Errorf("invalid ingress-name-snippets-filter value: %w", err)
+	}
+	cfg.ParsedAnnotationSnippetsAdd, err = utils.ParseIngressAnnotationSnippetsRules(cfg.IngressAnnotationSnippetsAdd)
+	if err != nil {
+		return cfg, opts, fmt.Errorf("invalid ingress-annotation-snippets-add value: %w", err)
+	}
+	cfg.ParsedAnnotationSnippetsRemove, err =
+		utils.ParseIngressAnnotationSnippetsRules(cfg.IngressAnnotationSnippetsRemove)
+	if err != nil {
+		return cfg, opts, fmt.Errorf("invalid ingress-annotation-snippets-remove value: %w", err)
+	}
+
+	cfg.IngressPostProcessingMode, err = parseIngressPostProcessingMode(cfg.IngressPostProcessing)
+	if err != nil {
+		return cfg, opts, err
+	}
+
+	cfg.GatewayFilters = splitCSV(cfg.GatewayAnnotationFilters)
+	cfg.HTTPRouteFilters = splitCSV(cfg.HTTPRouteAnnotationFilters)
+	cfg.GatewayAnnotationsMap = parseKeyValueCSV(cfg.GatewayAnnotations)
+	cfg.GatewayInfraAnnotationsMap = parseKeyValueCSV(cfg.GatewayInfraAnnotations)
+	cfg.PrivateInfraAnnotationsMap = parseKeyValueCSV(cfg.PrivateAnnotations)
+
+	return cfg, opts, nil
+}
+
+func parseIngressPostProcessingMode(value string) (controller.IngressPostProcessingMode, error) {
+	switch value {
+	case "none":
+		return controller.IngressPostProcessingModeNone, nil
+	case "disable":
+		return controller.IngressPostProcessingModeDisable, nil
+	case "remove":
+		return controller.IngressPostProcessingModeRemove, nil
+	default:
+		return controller.IngressPostProcessingModeNone,
+			fmt.Errorf("invalid ingress-post-processing value %q (allowed: none, disable, remove)", value)
+	}
+}
+
+func buildTLSOptions(enableHTTP2 bool) []func(*tls.Config) {
+	if enableHTTP2 {
+		return nil
+	}
+	return []func(*tls.Config){
+		func(c *tls.Config) {
+			setupLog.Info("disabling http/2")
+			c.NextProtos = []string{"http/1.1"}
+		},
+	}
+}
+
+func buildWebhookServer(
+	tlsOpts []func(*tls.Config),
+	webhookCertPath string,
+	webhookCertName string,
+	webhookCertKey string,
+) webhook.Server {
 	webhookServerOptions := webhook.Options{
-		TLSOpts: webhookTLSOpts,
+		TLSOpts: tlsOpts,
 	}
 
 	if len(webhookCertPath) > 0 {
@@ -272,12 +506,17 @@ func main() {
 		webhookServerOptions.KeyName = webhookCertKey
 	}
 
-	webhookServer := webhook.NewServer(webhookServerOptions)
+	return webhook.NewServer(webhookServerOptions)
+}
 
-	// Metrics endpoint is enabled in 'config/default/kustomization.yaml'. The Metrics options configure the server.
-	// More info:
-	// - https://pkg.go.dev/sigs.k8s.io/controller-runtime@v0.22.4/pkg/metrics/server
-	// - https://book.kubebuilder.io/reference/metrics.html
+func buildMetricsServerOptions(
+	metricsAddr string,
+	secureMetrics bool,
+	tlsOpts []func(*tls.Config),
+	metricsCertPath string,
+	metricsCertName string,
+	metricsCertKey string,
+) metricsserver.Options {
 	metricsServerOptions := metricsserver.Options{
 		BindAddress:   metricsAddr,
 		SecureServing: secureMetrics,
@@ -309,223 +548,89 @@ func main() {
 		metricsServerOptions.KeyName = metricsCertKey
 	}
 
-	mgr, err := ctrl.NewManager(ctrl.GetConfigOrDie(), ctrl.Options{
-		Scheme:                 scheme,
-		Metrics:                metricsServerOptions,
-		WebhookServer:          webhookServer,
-		HealthProbeBindAddress: probeAddr,
-		LeaderElection:         enableLeaderElection,
-		LeaderElectionID:       "94203fac.fiction.si",
-		// LeaderElectionReleaseOnCancel defines if the leader should step down voluntarily
-		// when the Manager ends. This requires the binary to immediately end when the
-		// Manager is stopped, otherwise, this setting is unsafe. Setting this significantly
-		// speeds up voluntary leader transitions as the new leader don't have to wait
-		// LeaseDuration time first.
-		//
-		// In the default scaffold provided, the program ends immediately after
-		// the manager stops, so would be fine to enable this option. However,
-		// if you are doing or is intended to do any operation such as perform cleanups
-		// after the manager stops then its usage might be unsafe.
-		// LeaderElectionReleaseOnCancel: true,
-	})
-	if err != nil {
-		setupLog.Error(err, "unable to start manager")
-		os.Exit(1)
-	}
+	return metricsServerOptions
+}
 
-	// Verify that the Gateway namespace exists
-	ctx := context.Background()
+func ensureGatewayNamespace(ctx context.Context, reader client.Reader, namespace string) error {
 	var ns corev1.Namespace
-	if err := mgr.GetAPIReader().Get(ctx, client.ObjectKey{Name: gatewayNamespace}, &ns); err != nil {
-		setupLog.Error(err, "Gateway namespace does not exist", "namespace", gatewayNamespace)
-		cmd := fmt.Sprintf("kubectl create namespace %s", gatewayNamespace)
-		setupLog.Info("Please create the namespace first", "command", cmd)
-		os.Exit(1)
-	}
-	setupLog.Info("Verified Gateway namespace exists", "namespace", gatewayNamespace)
+	return reader.Get(ctx, client.ObjectKey{Name: namespace}, &ns)
+}
 
-	reconcileCache := make(map[string]utils.ReconcileCacheEntry)
-	if reconcileCachePersist {
-		var err error
-		reconcileCache, err = utils.LoadReconcileCacheSharded(
-			ctx,
-			mgr.GetAPIReader(),
-			gatewayNamespace,
-			utils.ReconcileCacheConfigMapBaseName,
-			utils.ReconcileCacheShardCount,
-		)
-		if err != nil {
-			setupLog.Error(err, "Failed to load reconcile cache, continuing with empty cache")
-			reconcileCache = make(map[string]utils.ReconcileCacheEntry)
-		}
+func ensureDisabledIngressClass(ctx context.Context, reader client.Reader, c client.Client) error {
+	ingressClass := &networkingv1.IngressClass{}
+	err := reader.Get(ctx, client.ObjectKey{Name: controller.DisabledIngressClassName}, ingressClass)
+	if err == nil {
+		return nil
+	}
+	if !apierrors.IsNotFound(err) {
+		return err
 	}
 
-	for _, mapping := range parsedSnippetsFilters {
-		if err := utils.ValidateSnippetsFilterExists(
-			ctx,
-			mgr.GetAPIReader(),
-			gatewayNamespace,
-			mapping.Name,
-		); err != nil {
-			setupLog.Error(err, "SnippetsFilter not found in gateway namespace",
-				"name", mapping.Name,
-				"namespace", gatewayNamespace)
-			os.Exit(1)
-		}
-	}
-
-	// Parse annotation filters
-	var gatewayFilters []string
-	if gatewayAnnotationFilters != "" {
-		gatewayFilters = strings.Split(gatewayAnnotationFilters, ",")
-	}
-	var httpRouteFilters []string
-	if httpRouteAnnotationFilters != "" {
-		httpRouteFilters = strings.Split(httpRouteAnnotationFilters, ",")
-	}
-
-	// Parse gateway metadata annotations
-	gwAnnotations := make(map[string]string)
-	if gatewayAnnotations != "" {
-		for _, pair := range strings.Split(gatewayAnnotations, ",") {
-			parts := strings.SplitN(pair, "=", 2)
-			if len(parts) == 2 {
-				gwAnnotations[strings.TrimSpace(parts[0])] = strings.TrimSpace(parts[1])
-			}
-		}
-	}
-
-	// Parse base infrastructure annotations
-	infraAnnotations := make(map[string]string)
-	if gatewayInfraAnnotations != "" {
-		for _, pair := range strings.Split(gatewayInfraAnnotations, ",") {
-			parts := strings.SplitN(pair, "=", 2)
-			if len(parts) == 2 {
-				infraAnnotations[strings.TrimSpace(parts[0])] = strings.TrimSpace(parts[1])
-			}
-		}
-	}
-
-	// Parse private annotations
-	privateInfraAnnotations := make(map[string]string)
-	if privateAnnotations != "" {
-		for _, pair := range strings.Split(privateAnnotations, ",") {
-			parts := strings.SplitN(pair, "=", 2)
-			if len(parts) == 2 {
-				privateInfraAnnotations[strings.TrimSpace(parts[0])] = strings.TrimSpace(parts[1])
-			}
-		}
-	}
-
-	if err = (&controller.IngressReconciler{
-		Client:                           mgr.GetClient(),
-		Scheme:                           mgr.GetScheme(),
-		Recorder:                         mgr.GetEventRecorderFor("ingress-doperator"),
-		GatewayNamespace:                 gatewayNamespace,
-		GatewayName:                      gatewayName,
-		GatewayClassName:                 gatewayClassName,
-		WatchNamespace:                   watchNamespace,
-		OneGatewayPerIngress:             oneGatewayPerIngress,
-		EnableDeletion:                   enableDeletion,
-		HostnameRewriteFrom:              hostnameRewriteFrom,
-		HostnameRewriteTo:                hostnameRewriteTo,
-		IngressPostProcessingMode:        ingressPostProcessingMode,
-		GatewayAnnotationFilters:         gatewayFilters,
-		HTTPRouteAnnotationFilters:       httpRouteFilters,
-		DefaultGatewayAnnotations:        gwAnnotations,
-		GatewayInfrastructureAnnotations: infraAnnotations,
-		PrivateInfrastructureAnnotations: privateInfraAnnotations,
-		ApplyPrivateToAll:                private,
-		PrivateIngressClassPattern:       privateIngressClassPattern,
-		IngressClassFilter:               ingressClassFilter,
-		IngressClassSnippetsFilters:      parsedSnippetsFilters,
-		IngressNameSnippetsFilters:       parsedNameSnippetsFilters,
-		IngressAnnotationSnippetsAdd:     parsedAnnotationAddRules,
-		IngressAnnotationSnippetsRemove:  parsedAnnotationRemoveRules,
-		ReconcileCache:                   reconcileCache,
-		ReconcileCacheNamespace:          gatewayNamespace,
-		ReconcileCacheBaseName:           utils.ReconcileCacheConfigMapBaseName,
-		ReconcileCacheShards:             utils.ReconcileCacheShardCount,
-		ReconcileCachePersist:            reconcileCachePersist,
-		ReconcileCacheMaxEntries:         reconcileCacheMaxEntries,
-		UseIngress2Gateway:               useIngress2Gateway,
-		Ingress2GatewayProvider:          ingress2GatewayProvider,
-		Ingress2GatewayIngressClass:      ingress2GatewayIngressClass,
-		HTTPRouteManager: &utils.HTTPRouteManager{
-			Client: mgr.GetClient(),
+	ingressClass = &networkingv1.IngressClass{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: controller.DisabledIngressClassName,
 		},
-	}).SetupWithManager(mgr); err != nil {
-		setupLog.Error(err, "unable to create controller", "controller", "Ingress")
-		os.Exit(1)
+		Spec: networkingv1.IngressClassSpec{
+			Controller: controller.DisabledIngressClassController,
+		},
 	}
-
-	if watchNamespace != "" {
-		setupLog.Info("Watching Ingresses in specific namespace only", "namespace", watchNamespace)
-	} else {
-		setupLog.Info("Watching Ingresses in all namespaces")
+	if err := c.Create(ctx, ingressClass); err != nil && !apierrors.IsAlreadyExists(err) {
+		return fmt.Errorf("failed to create disabled IngressClass: %w", err)
 	}
+	return nil
+}
 
-	if oneGatewayPerIngress {
-		setupLog.Info("Mode: One Gateway per Ingress")
-	} else {
-		setupLog.Info("Mode: Shared Gateway", "gatewayName", gatewayName)
+func loadReconcileCache(
+	ctx context.Context,
+	reader client.Reader,
+	gatewayNamespace string,
+) map[string]utils.ReconcileCacheEntry {
+	reconcileCache, err := utils.LoadReconcileCacheSharded(
+		ctx,
+		reader,
+		gatewayNamespace,
+		utils.ReconcileCacheConfigMapBaseName,
+		utils.ReconcileCacheShardCount,
+	)
+	if err != nil {
+		setupLog.Error(err, "Failed to load reconcile cache, continuing with empty cache")
+		return make(map[string]utils.ReconcileCacheEntry)
 	}
+	return reconcileCache
+}
 
-	if enableDeletion {
-		setupLog.Info("Deletion enabled: HTTPRoute and Gateway resources will be deleted when Ingress is deleted")
-	} else {
-		setupLog.Info("Deletion disabled: HTTPRoute and Gateway resources will remain when Ingress is deleted")
+func splitCSV(raw string) []string {
+	if raw == "" {
+		return nil
 	}
+	return strings.Split(raw, ",")
+}
 
-	if hostnameRewriteFrom != "" && hostnameRewriteTo != "" {
-		// Validate that both lists have the same number of items
-		fromParts := strings.Split(hostnameRewriteFrom, ",")
-		toParts := strings.Split(hostnameRewriteTo, ",")
-		if len(fromParts) != len(toParts) {
-			setupLog.Error(nil,
-				"--hostname-rewrite-from and --hostname-rewrite-to must have same number of items",
-				"from-count", len(fromParts), "to-count", len(toParts))
-			os.Exit(1)
+func parseKeyValueCSV(raw string) map[string]string {
+	out := make(map[string]string)
+	if raw == "" {
+		return out
+	}
+	for _, pair := range strings.Split(raw, ",") {
+		parts := strings.SplitN(pair, "=", 2)
+		if len(parts) == 2 {
+			out[strings.TrimSpace(parts[0])] = strings.TrimSpace(parts[1])
 		}
-		setupLog.Info("Hostname rewriting enabled",
-			"from", hostnameRewriteFrom,
-			"to", hostnameRewriteTo,
-			"rules", len(fromParts))
-	} else if hostnameRewriteFrom != "" || hostnameRewriteTo != "" {
-		setupLog.Error(nil,
-			"Both --hostname-rewrite-from and --hostname-rewrite-to must be specified together")
-		os.Exit(1)
 	}
+	return out
+}
 
-	switch ingressPostProcessingMode {
-	case controller.IngressPostProcessingModeNone:
-		setupLog.Info("Ingress post processing mode: none")
-	case controller.IngressPostProcessingModeDisable:
-		setupLog.Info("Ingress post processing mode: disable")
-	case controller.IngressPostProcessingModeRemove:
-		setupLog.Info("Ingress post processing mode: remove")
+func validateHostnameRewrite(from, to string) (int, error) {
+	if from == "" && to == "" {
+		return 0, nil
 	}
-
-	// +kubebuilder:scaffold:builder
-
-	if err := mgr.AddHealthzCheck("healthz", healthz.Ping); err != nil {
-		setupLog.Error(err, "unable to set up health check")
-		os.Exit(1)
+	if from == "" || to == "" {
+		return 0, fmt.Errorf("both --hostname-rewrite-from and --hostname-rewrite-to must be specified together")
 	}
-	if err := mgr.AddReadyzCheck("readyz", healthz.Ping); err != nil {
-		setupLog.Error(err, "unable to set up ready check")
-		os.Exit(1)
+	fromParts := strings.Split(from, ",")
+	toParts := strings.Split(to, ",")
+	if len(fromParts) != len(toParts) {
+		return 0, fmt.Errorf("--hostname-rewrite-from and --hostname-rewrite-to must have same number of items")
 	}
-
-	setupLog.Info("starting manager")
-
-	// Log when metrics server is ready
-	if metricsAddr != "0" {
-		setupLog.Info("Serving metrics server", "addr", metricsAddr, "secure", secureMetrics)
-	}
-
-	if err := mgr.Start(ctrl.SetupSignalHandler()); err != nil {
-		setupLog.Error(err, "problem running manager")
-		os.Exit(1)
-	}
+	return len(fromParts), nil
 }

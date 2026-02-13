@@ -25,7 +25,7 @@ import (
 
 	networkingv1 "k8s.io/api/networking/v1"
 	"k8s.io/apimachinery/pkg/runtime"
-	"k8s.io/client-go/tools/record"
+	"k8s.io/client-go/tools/events"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/log"
 	"sigs.k8s.io/controller-runtime/pkg/webhook/admission"
@@ -42,6 +42,7 @@ const (
 	WebhookAnnotation       = "ingress-doperator.fiction.si/webhook"
 )
 
+//nolint:lll
 // +kubebuilder:webhook:path=/mutate-v1-ingress,mutating=true,failurePolicy=ignore,groups="networking.k8s.io",resources=ingresses,verbs=create;update,versions=v1,name=mingress.fiction.si,admissionReviewVersions=v1,sideEffects=None
 
 // IngressMutator handles Ingress mutations
@@ -56,7 +57,7 @@ type IngressMutator struct {
 	IngressAnnotationSnippetsAdd    []utils.IngressAnnotationSnippetsRule
 	IngressAnnotationSnippetsRemove []utils.IngressAnnotationSnippetsRule
 	HTTPRouteManager                *utils.HTTPRouteManager
-	Recorder                        record.EventRecorder
+	Recorder                        events.EventRecorder
 }
 
 // Handle performs the mutation
@@ -154,7 +155,14 @@ func (m *IngressMutator) Handle(ctx context.Context, req admission.Request) admi
 		recordMetric := func(operation, namespace, name string) {
 			metrics.ReferenceGrantResourcesTotal.WithLabelValues(operation, namespace, name).Inc()
 		}
-		if err := utils.ApplyReferenceGrant(ctx, m.Client, m.Scheme, m.Translator, ingress.Namespace, recordMetric); err != nil {
+		if err := utils.ApplyReferenceGrant(
+			ctx,
+			m.Client,
+			m.Scheme,
+			m.Translator,
+			ingress.Namespace,
+			recordMetric,
+		); err != nil {
 			logger.Error(err, "failed to apply ReferenceGrant", "namespace", ingress.Namespace)
 			m.recordWarning(ingress, "ReferenceGrantApplyFailed", "failed to apply ReferenceGrant")
 			// Don't fail the admission, just log
@@ -202,7 +210,7 @@ func (m *IngressMutator) recordWarning(ingress *networkingv1.Ingress, reason, me
 	if m.Recorder == nil || ingress == nil {
 		return
 	}
-	m.Recorder.Event(ingress, "Warning", reason, message)
+	m.Recorder.Eventf(ingress, nil, "Warning", reason, "Webhook", message)
 }
 
 func (m *IngressMutator) applyIngressClassSnippetsFilters(
@@ -339,7 +347,9 @@ func (m *IngressMutator) finalizeIngressClassSnippetsFilters(ctx context.Context
 			mapping.Name,
 			ingress.Name,
 		); err != nil {
-			logger.Error(err, "failed to finalize class-based SnippetsFilter owner reference", "name", mapping.Name, "namespace", ingress.Namespace)
+			logger.Error(err, "failed to finalize class-based SnippetsFilter owner reference",
+				"name", mapping.Name,
+				"namespace", ingress.Namespace)
 		}
 	}
 }
@@ -372,7 +382,9 @@ func (m *IngressMutator) finalizeIngressNameSnippetsFilters(ctx context.Context,
 			mapping.Name,
 			ingress.Name,
 		); err != nil {
-			logger.Error(err, "failed to finalize name-based SnippetsFilter owner reference", "name", mapping.Name, "namespace", ingress.Namespace)
+			logger.Error(err, "failed to finalize name-based SnippetsFilter owner reference",
+				"name", mapping.Name,
+				"namespace", ingress.Namespace)
 		}
 	}
 }
@@ -421,12 +433,17 @@ func (m *IngressMutator) applyIngressAnnotationSnippetsOverrides(
 			name,
 			"",
 		); err != nil {
-			log.FromContext(ctx).Error(err, "failed to copy annotation-based SnippetsFilter override", "name", name, "namespace", ingress.Namespace)
+			log.FromContext(ctx).Error(err, "failed to copy annotation-based SnippetsFilter override",
+				"name", name,
+				"namespace", ingress.Namespace)
 		}
 	}
 }
 
-func (m *IngressMutator) finalizeIngressAnnotationSnippetsOverrides(ctx context.Context, ingress *networkingv1.Ingress) {
+func (m *IngressMutator) finalizeIngressAnnotationSnippetsOverrides(
+	ctx context.Context,
+	ingress *networkingv1.Ingress,
+) {
 	if ingress == nil {
 		return
 	}
@@ -454,7 +471,9 @@ func (m *IngressMutator) finalizeIngressAnnotationSnippetsOverrides(ctx context.
 			name,
 			ingress.Name,
 		); err != nil {
-			log.FromContext(ctx).Error(err, "failed to finalize annotation-based SnippetsFilter override", "name", name, "namespace", ingress.Namespace)
+			log.FromContext(ctx).Error(err, "failed to finalize annotation-based SnippetsFilter override",
+				"name", name,
+				"namespace", ingress.Namespace)
 		}
 	}
 }
@@ -483,7 +502,10 @@ func (m *IngressMutator) applyIngressAnnotationSnippetsFilter(
 		return
 	}
 	for _, warning := range warnings {
-		logger.Info("nginx ingress annotation warning", "warning", warning, "namespace", ingress.Namespace, "name", ingress.Name)
+		logger.Info("nginx ingress annotation warning",
+			"warning", warning,
+			"namespace", ingress.Namespace,
+			"name", ingress.Name)
 	}
 
 	filterName := utils.AutomaticSnippetsFilterName(ingress.Name)
@@ -532,7 +554,9 @@ func (m *IngressMutator) finalizeIngressAnnotationSnippetsFilter(ctx context.Con
 		filterName,
 		snippets,
 	); err != nil {
-		logger.Error(err, "failed to finalize annotation SnippetsFilter owner reference", "name", filterName, "namespace", ingress.Namespace)
+		logger.Error(err, "failed to finalize annotation SnippetsFilter owner reference",
+			"name", filterName,
+			"namespace", ingress.Namespace)
 	}
 }
 
@@ -574,7 +598,8 @@ func (m *IngressMutator) matchesIngressClassFilter(ingress *networkingv1.Ingress
 	matched, err := filepath.Match(m.IngressClassFilter, ingressClass)
 	if err != nil {
 		// If pattern is invalid, log error and don't match
-		log.FromContext(context.Background()).Error(err, "Invalid ingress class filter pattern", "pattern", m.IngressClassFilter)
+		log.FromContext(context.Background()).Error(err, "Invalid ingress class filter pattern",
+			"pattern", m.IngressClassFilter)
 		return false
 	}
 

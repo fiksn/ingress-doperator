@@ -30,3 +30,7 @@ go.work
 *.kubeconfig
 operator
 webhook
+reenabler
+!cmd/operator
+!cmd/webhook
+!cmd/reenabler

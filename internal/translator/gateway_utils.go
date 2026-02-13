@@ -36,6 +36,9 @@ func MergeGatewaySpec(existing, desired *gatewayv1.Gateway) {
 		if k == MismatchedCertAnnotation {
 			existing.Annotations[k] = MergeCertificateMismatchAnnotation(
 				existing.Annotations[k], v)
+		} else if k == SourceAnnotation {
+			existing.Annotations[k] = MergeAnnotationValues(
+				existing.Annotations[k], v)
 		} else if strings.HasPrefix(k, "ingress-doperator.fiction.si/") {
 			// Other ingress-doperator annotations are not merged, just overwrite
 			existing.Annotations[k] = v

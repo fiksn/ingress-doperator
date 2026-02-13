@@ -32,7 +32,8 @@ import (
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/types"
-	"k8s.io/client-go/tools/record"
+	"k8s.io/client-go/tools/events"
+	"k8s.io/utils/ptr"
 	ctrl "sigs.k8s.io/controller-runtime"
 	ctrlbuilder "sigs.k8s.io/controller-runtime/pkg/builder"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -58,6 +59,8 @@ const (
 	HTTPRouteSnippetsFilterAnnotation  = "ingress-doperator.fiction.si/httproute-snippets-filter"
 	HTTPRouteAuthenticationAnnotation  = "ingress-doperator.fiction.si/httproute-authentication-filter"
 	HTTPRouteRequestHeaderAnnotation   = "ingress-doperator.fiction.si/httproute-request-header-modifier-filter"
+	DisabledIngressClassName           = "ingress-doperator-disabled"
+	DisabledIngressClassController     = "dummy.io/no-controller"
 	DefaultGatewayAnnotationFilters    = "ingress.kubernetes.io,cert-manager.io," +
 		"nginx.ingress.kubernetes.io,kubectl.kubernetes.io,kubernetes.io/ingress.class," +
 		"traefik.ingress.kubernetes.io,ingress-doperator.fiction.si"
@@ -83,7 +86,7 @@ const requeueAfterError = 30 * time.Second
 type IngressReconciler struct {
 	client.Client
 	Scheme                           *runtime.Scheme
-	Recorder                         record.EventRecorder
+	Recorder                         events.EventRecorder
 	GatewayNamespace                 string
 	GatewayName                      string
 	GatewayClassName                 string
@@ -109,6 +112,7 @@ type IngressReconciler struct {
 	IngressNameSnippetsFilters       []utils.IngressClassSnippetsFilter
 	IngressAnnotationSnippetsAdd     []utils.IngressAnnotationSnippetsRule
 	IngressAnnotationSnippetsRemove  []utils.IngressAnnotationSnippetsRule
+	ClearIngressStatusOnDisable      bool
 	ReconcileCache                   map[string]utils.ReconcileCacheEntry
 	ReconcileCacheNamespace          string
 	ReconcileCacheBaseName           string
@@ -182,6 +186,14 @@ func (r *IngressReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 			"namespace", ingress.Namespace,
 			"name", ingress.Name)
 		metrics.IngressReconcileSkipsTotal.WithLabelValues("disabled", ingress.Namespace, ingress.Name).Inc()
+		return ctrl.Result{}, nil
+	}
+
+	if r.getIngressClass(&ingress) == DisabledIngressClassName {
+		logger.Info("Ingress uses disabled class, skipping reconciliation",
+			"namespace", ingress.Namespace,
+			"name", ingress.Name)
+		metrics.IngressReconcileSkipsTotal.WithLabelValues("disabled-class", ingress.Namespace, ingress.Name).Inc()
 		return ctrl.Result{}, nil
 	}
 
@@ -630,7 +642,10 @@ func (r *IngressReconciler) applySnippetsFilters(
 		return
 	}
 	for _, warning := range warnings {
-		logger.Info("nginx ingress annotation warning", "warning", warning, "namespace", ingress.Namespace, "name", ingress.Name)
+		logger.Info("nginx ingress annotation warning",
+			"warning", warning,
+			"namespace", ingress.Namespace,
+			"name", ingress.Name)
 	}
 	filterName := utils.AutomaticSnippetsFilterName(ingress.Name)
 	var owner client.Object = ingress
@@ -849,7 +864,16 @@ func (r *IngressReconciler) disableIngress(ctx context.Context, ingress *network
 
 	// Check if already disabled
 	if ingress.Annotations != nil && ingress.Annotations[IngressDisabledAnnotation] == fmt.Sprintf("%t", true) {
+		if r.ClearIngressStatusOnDisable {
+			if err := r.clearIngressStatus(ctx, ingress); err != nil {
+				return err
+			}
+		}
 		return nil // Already disabled
+	}
+
+	if err := r.ensureDisabledIngressClass(ctx); err != nil {
+		return err
 	}
 
 	modified := false
@@ -864,32 +888,35 @@ func (r *IngressReconciler) disableIngress(ctx context.Context, ingress *network
 			ingress.Annotations[OriginalIngressClassNameAnnotation] = *ingress.Spec.IngressClassName
 			logger.Info("Saved original ingressClassName", "value", *ingress.Spec.IngressClassName)
 		}
-		// Remove the ingressClassName
-		ingress.Spec.IngressClassName = nil
-		modified = true
-		logger.Info("Removed spec.ingressClassName to disable Ingress")
+	}
+
+	if ingress.Annotations == nil {
+		ingress.Annotations = make(map[string]string)
 	}
 
 	// Save original ingress.class annotation if it exists
-	if ingress.Annotations != nil {
-		if class, exists := ingress.Annotations[IngressClassAnnotation]; exists && class != "" {
-			// Save the original value
-			if _, saved := ingress.Annotations[OriginalIngressClassAnnotation]; !saved {
-				ingress.Annotations[OriginalIngressClassAnnotation] = class
-				logger.Info("Saved original ingress.class annotation", "value", class)
-			}
-			// Remove the annotation
-			delete(ingress.Annotations, IngressClassAnnotation)
-			modified = true
-			logger.Info("Removed kubernetes.io/ingress.class annotation to disable Ingress")
+	if class, exists := ingress.Annotations[IngressClassAnnotation]; exists && class != "" {
+		if _, saved := ingress.Annotations[OriginalIngressClassAnnotation]; !saved {
+			ingress.Annotations[OriginalIngressClassAnnotation] = class
+			logger.Info("Saved original ingress.class annotation", "value", class)
 		}
+	}
+
+	if ingress.Spec.IngressClassName == nil || *ingress.Spec.IngressClassName != DisabledIngressClassName {
+		ingress.Spec.IngressClassName = ptr.To(DisabledIngressClassName)
+		modified = true
+		logger.Info("Set spec.ingressClassName to disable Ingress", "value", DisabledIngressClassName)
+	}
+
+	if ingress.Annotations[IngressClassAnnotation] != DisabledIngressClassName {
+		ingress.Annotations[IngressClassAnnotation] = DisabledIngressClassName
+		modified = true
+		logger.Info("Set kubernetes.io/ingress.class annotation to disable Ingress",
+			"value", DisabledIngressClassName)
 	}
 
 	// Mark as disabled
 	if modified {
-		if ingress.Annotations == nil {
-			ingress.Annotations = make(map[string]string)
-		}
 		ingress.Annotations[IngressDisabledAnnotation] = fmt.Sprintf("%t", true)
 
 		if err := r.Update(ctx, ingress); err != nil {
@@ -898,6 +925,63 @@ func (r *IngressReconciler) disableIngress(ctx context.Context, ingress *network
 		logger.Info("Successfully disabled source Ingress", "namespace", ingress.Namespace, "name", ingress.Name)
 	}
 
+	if r.ClearIngressStatusOnDisable {
+		if err := r.clearIngressStatus(ctx, ingress); err != nil {
+			return err
+		}
+	}
+
+	return nil
+}
+
+func (r *IngressReconciler) ensureDisabledIngressClass(ctx context.Context) error {
+	ingressClass := &networkingv1.IngressClass{}
+	err := r.Get(ctx, types.NamespacedName{Name: DisabledIngressClassName}, ingressClass)
+	if err == nil {
+		return nil
+	}
+	if !apierrors.IsNotFound(err) {
+		return err
+	}
+
+	ingressClass = &networkingv1.IngressClass{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: DisabledIngressClassName,
+		},
+		Spec: networkingv1.IngressClassSpec{
+			Controller: DisabledIngressClassController,
+		},
+	}
+	if err := r.Create(ctx, ingressClass); err != nil && !apierrors.IsAlreadyExists(err) {
+		return fmt.Errorf("failed to create disabled IngressClass: %w", err)
+	}
+	return nil
+}
+
+func (r *IngressReconciler) clearIngressStatus(ctx context.Context, ingress *networkingv1.Ingress) error {
+	if ingress == nil {
+		return nil
+	}
+	if len(ingress.Status.LoadBalancer.Ingress) == 0 {
+		return nil
+	}
+	for i := 0; i < 2; i++ {
+		updated := ingress.DeepCopy()
+		updated.Status.LoadBalancer = networkingv1.IngressLoadBalancerStatus{}
+		if err := r.Status().Update(ctx, updated); err != nil {
+			if apierrors.IsConflict(err) {
+				if err := r.Get(ctx, types.NamespacedName{
+					Namespace: ingress.Namespace,
+					Name:      ingress.Name,
+				}, ingress); err != nil {
+					return err
+				}
+				continue
+			}
+			return fmt.Errorf("failed to clear Ingress status.loadBalancer: %w", err)
+		}
+		return nil
+	}
 	return nil
 }
 
@@ -949,6 +1033,12 @@ func (r *IngressReconciler) groupIngressesByClass(ingresses []networkingv1.Ingre
 	result := make(map[string][]networkingv1.Ingress)
 	for _, ingress := range ingresses {
 		class := trans.GetIngressClass(&ingress)
+		if class == DisabledIngressClassName {
+			log.Log.Info("Skipping disabled ingress class when grouping shared gateways",
+				"namespace", ingress.Namespace,
+				"name", ingress.Name)
+			continue
+		}
 		result[class] = append(result[class], ingress)
 	}
 	return result
@@ -1078,7 +1168,11 @@ func (r *IngressReconciler) SetupWithManager(mgr ctrl.Manager) error {
 	apiReader := mgr.GetAPIReader()
 	ctx := context.Background()
 	if version, ok, err := utils.GetCRDVersion(ctx, apiReader, utils.SnippetsFilterCRDName); err == nil && ok {
-		snippetsGVK := schema.GroupVersionKind{Group: utils.NginxGatewayGroup, Version: version, Kind: utils.SnippetsFilterKind}
+		snippetsGVK := schema.GroupVersionKind{
+			Group:   utils.NginxGatewayGroup,
+			Version: version,
+			Kind:    utils.SnippetsFilterKind,
+		}
 		snippets := &unstructured.Unstructured{}
 		snippets.SetGroupVersionKind(snippetsGVK)
 		b = b.Watches(
@@ -1095,7 +1189,11 @@ func (r *IngressReconciler) SetupWithManager(mgr ctrl.Manager) error {
 	}
 
 	if version, ok, err := utils.GetCRDVersion(ctx, apiReader, utils.AuthenticationFilterCRDName); err == nil && ok {
-		authGVK := schema.GroupVersionKind{Group: utils.NginxGatewayGroup, Version: version, Kind: utils.AuthenticationFilterKind}
+		authGVK := schema.GroupVersionKind{
+			Group:   utils.NginxGatewayGroup,
+			Version: version,
+			Kind:    utils.AuthenticationFilterKind,
+		}
 		auth := &unstructured.Unstructured{}
 		auth.SetGroupVersionKind(authGVK)
 		b = b.Watches(
@@ -1112,7 +1210,11 @@ func (r *IngressReconciler) SetupWithManager(mgr ctrl.Manager) error {
 	}
 
 	if version, ok, err := utils.GetCRDVersion(ctx, apiReader, utils.RequestHeaderModifierCRDName); err == nil && ok {
-		headerGVK := schema.GroupVersionKind{Group: utils.NginxGatewayGroup, Version: version, Kind: utils.RequestHeaderModifierFilterKind}
+		headerGVK := schema.GroupVersionKind{
+			Group:   utils.NginxGatewayGroup,
+			Version: version,
+			Kind:    utils.RequestHeaderModifierFilterKind,
+		}
 		header := &unstructured.Unstructured{}
 		header.SetGroupVersionKind(headerGVK)
 		b = b.Watches(
@@ -1153,7 +1255,10 @@ func (r *IngressReconciler) enqueueAllIngresses(ctx context.Context) []reconcile
 	return requests
 }
 
-func (r *IngressReconciler) enqueueIngressesForSnippetsFilter(ctx context.Context, obj client.Object) []reconcile.Request {
+func (r *IngressReconciler) enqueueIngressesForSnippetsFilter(
+	ctx context.Context,
+	obj client.Object,
+) []reconcile.Request {
 	if obj == nil {
 		return r.enqueueAllIngresses(ctx)
 	}
@@ -1179,7 +1284,10 @@ func (r *IngressReconciler) enqueueIngressesForExtension(
 	return r.enqueueIngressesForAnnotation(ctx, filterName, annotationKey)
 }
 
-func (r *IngressReconciler) enqueueIngressesForSnippetsName(ctx context.Context, filterName string) []reconcile.Request {
+func (r *IngressReconciler) enqueueIngressesForSnippetsName(
+	ctx context.Context,
+	filterName string,
+) []reconcile.Request {
 	requests := r.enqueueIngressesForAnnotation(ctx, filterName, HTTPRouteSnippetsFilterAnnotation)
 	list := &networkingv1.IngressList{}
 	opts := []client.ListOption{}
@@ -1384,14 +1492,14 @@ func (r *IngressReconciler) recordWarning(ingress *networkingv1.Ingress, reason,
 	if r.Recorder == nil || ingress == nil {
 		return
 	}
-	r.Recorder.Event(ingress, "Warning", reason, message)
+	r.Recorder.Eventf(ingress, nil, "Warning", reason, "Reconcile", message)
 }
 
 func (r *IngressReconciler) recordNormal(ingress *networkingv1.Ingress, reason, message string) {
 	if r.Recorder == nil || ingress == nil {
 		return
 	}
-	r.Recorder.Event(ingress, "Normal", reason, message)
+	r.Recorder.Eventf(ingress, nil, "Normal", reason, "Reconcile", message)
 }
 
 func (r *IngressReconciler) logErrorRateLimited(err error, key, message string) {

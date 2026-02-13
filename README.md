@@ -491,6 +491,7 @@ The operator accepts the following command-line flags:
                                               infrastructure annotations (default: "*private*")
 --reconcile-cache-persist                     Persist reconcile cache to ConfigMaps (default: true)
 --reconcile-cache-max-entries int             Max entries in reconcile cache (0 = unlimited)
+--clear-ingress-status-on-disable             Clear status.loadBalancer when disabling an Ingress (default: true)
 -v int                                        Log verbosity (0 = info, higher = more verbose)
 ```
 
@@ -707,6 +708,32 @@ spec:
     service:
       externalTrafficPolicy: Local
       type: LoadBalancer
+```
+
+## Re-enabling disabled Ingresses
+
+The `reenabler` CLI restores Ingresses that were disabled via
+`--ingress-postprocessing=disable` by restoring the original ingress class and
+removing ingress-doperator disable annotations. It also deletes managed
+HTTPRoutes generated from those Ingresses.
+
+Build and run:
+
+```bash
+go build -o bin/reenabler ./cmd/reenabler
+./bin/reenabler
+```
+
+Limit to a namespace:
+
+```bash
+./bin/reenabler --namespace=staging-qa
+```
+
+Remove managed HTTPRoutes and automatic SnippetsFilters:
+
+```bash
+./bin/reenabler --remove-derived-resources
 ```
 
 ## Behaviour

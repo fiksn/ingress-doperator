@@ -52,6 +52,7 @@ const (
 
 const (
 	nginxIngressAnnotationPrefix = "nginx.ingress.kubernetes.io/"
+	ingressAnnotationPrefix      = "ingress.kubernetes.io/"
 	maxK8sNameLength             = 253
 )
 
@@ -67,6 +68,10 @@ const (
 	proxyRedirectFromKey     = "proxy-redirect-from"
 	proxyRedirectToKey       = "proxy-redirect-to"
 	proxyBuffersNumberKey    = "proxy-buffers-number"
+	browserXssFilterKey      = "browser-xss-filter"
+	contentTypeNosniffKey    = "content-type-nosniff"
+	referrerPolicyKey        = "referrer-policy"
+	sslProxyHeadersKey       = "ssl-proxy-headers"
 )
 
 var nginxIngressDirectiveWhitelist = map[string]struct{}{
@@ -121,6 +126,58 @@ func collectSnippetWarnings(annotations map[string]string) []string {
 	}
 	sort.Strings(warnings)
 	return warnings
+}
+
+type ingressAnnotationKey struct {
+	fullKey string
+	prefix  string
+	suffix  string
+}
+
+type sslProxyHeader struct {
+	headerVar string
+	value     string
+}
+
+func parseSSLProxyHeaders(raw string) ([]sslProxyHeader, []string) {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return nil, nil
+	}
+	parts := strings.Split(raw, "||")
+	seen := make(map[string]struct{})
+	headers := make([]sslProxyHeader, 0, len(parts))
+	warnings := make([]string, 0, 1)
+
+	for _, part := range parts {
+		part = strings.TrimSpace(part)
+		if part == "" {
+			continue
+		}
+		pieces := strings.SplitN(part, ":", 2)
+		if len(pieces) != 2 {
+			warnings = append(warnings, "ssl-proxy-headers entry must be HEADER:value")
+			continue
+		}
+		header := strings.ToLower(strings.TrimSpace(pieces[0]))
+		value := strings.TrimSpace(pieces[1])
+		if header == "" || value == "" {
+			warnings = append(warnings, "ssl-proxy-headers entry must be HEADER:value")
+			continue
+		}
+		headerVar := strings.ReplaceAll(header, "-", "_")
+		key := headerVar + "\x00" + value
+		if _, ok := seen[key]; ok {
+			continue
+		}
+		seen[key] = struct{}{}
+		headers = append(headers, sslProxyHeader{
+			headerVar: headerVar,
+			value:     value,
+		})
+	}
+
+	return headers, warnings
 }
 
 type crdVersionCacheEntry struct {
@@ -276,16 +333,36 @@ func BuildNginxIngressSnippets(annotations map[string]string) ([]map[string]inte
 		return nil, nil, false
 	}
 
-	keys := make([]string, 0, len(annotations))
+	keys := make([]ingressAnnotationKey, 0, len(annotations))
 	for key := range annotations {
 		if strings.HasPrefix(key, nginxIngressAnnotationPrefix) {
-			keys = append(keys, key)
+			suffix := strings.TrimPrefix(key, nginxIngressAnnotationPrefix)
+			if suffix != "" {
+				keys = append(keys, ingressAnnotationKey{
+					fullKey: key,
+					prefix:  nginxIngressAnnotationPrefix,
+					suffix:  suffix,
+				})
+			}
+			continue
+		}
+		if strings.HasPrefix(key, ingressAnnotationPrefix) {
+			suffix := strings.TrimPrefix(key, ingressAnnotationPrefix)
+			if suffix != "" {
+				keys = append(keys, ingressAnnotationKey{
+					fullKey: key,
+					prefix:  ingressAnnotationPrefix,
+					suffix:  suffix,
+				})
+			}
 		}
 	}
 	if len(keys) == 0 {
 		return nil, nil, false
 	}
-	sort.Strings(keys)
+	sort.Slice(keys, func(i, j int) bool {
+		return keys[i].fullKey < keys[j].fullKey
+	})
 
 	state := ingestNginxIngressAnnotations(annotations, keys)
 	lines, warnings := buildNginxDirectiveLines(state)
@@ -309,36 +386,42 @@ type nginxIngressSnippetState struct {
 	proxyRedirectTo       string
 	proxyBuffersNumber    string
 	proxyBufferSize       string
+	browserXssFilter      bool
+	contentTypeNosniff    bool
+	referrerPolicy        string
+	sslProxyHeaders       []sslProxyHeader
+	warnings              []string
 }
 
-func ingestNginxIngressAnnotations(annotations map[string]string, keys []string) nginxIngressSnippetState {
+func ingestNginxIngressAnnotations(annotations map[string]string, keys []ingressAnnotationKey) nginxIngressSnippetState {
 	state := nginxIngressSnippetState{
 		lines: make([]string, 0, len(keys)),
 	}
 
-	for _, fullKey := range keys {
-		raw := annotations[fullKey]
+	for _, entry := range keys {
+		raw := annotations[entry.fullKey]
 		value := strings.TrimSpace(raw)
 		if value == "" {
 			continue
 		}
-		suffix := strings.TrimPrefix(fullKey, nginxIngressAnnotationPrefix)
-		if suffix == "" {
-			continue
-		}
+		if entry.prefix == nginxIngressAnnotationPrefix {
+			if handled := applyIngressAnnotationValue(&state, entry.suffix, value); handled {
+				continue
+			}
 
-		if handled := applyIngressAnnotationValue(&state, suffix, value); handled {
+			if !isWhitelistedNginxIngressDirective(entry.suffix) {
+				continue
+			}
+			if entry.suffix == "proxy-buffer-size" {
+				state.proxyBufferSize = value
+			}
+			directive := strings.ReplaceAll(entry.suffix, "-", "_")
+			state.lines = append(state.lines, fmt.Sprintf("%s %s;", directive, value))
 			continue
 		}
-
-		if !isWhitelistedNginxIngressDirective(suffix) {
-			continue
+		if entry.prefix == ingressAnnotationPrefix {
+			applyLegacyIngressAnnotationValue(&state, entry.suffix, value)
 		}
-		if suffix == "proxy-buffer-size" {
-			state.proxyBufferSize = value
-		}
-		directive := strings.ReplaceAll(suffix, "-", "_")
-		state.lines = append(state.lines, fmt.Sprintf("%s %s;", directive, value))
 	}
 
 	return state
@@ -383,9 +466,43 @@ func applyIngressAnnotationValue(state *nginxIngressSnippetState, suffix, value 
 	}
 }
 
+func applyLegacyIngressAnnotationValue(state *nginxIngressSnippetState, suffix, value string) bool {
+	switch suffix {
+	case browserXssFilterKey:
+		if strings.EqualFold(value, "true") {
+			state.browserXssFilter = true
+		}
+		return true
+	case contentTypeNosniffKey:
+		if strings.EqualFold(value, "true") {
+			state.contentTypeNosniff = true
+		}
+		return true
+	case referrerPolicyKey:
+		state.referrerPolicy = value
+		return true
+	case sslProxyHeadersKey:
+		headers, warnings := parseSSLProxyHeaders(value)
+		if len(headers) > 0 {
+			state.sslProxyHeaders = headers
+		}
+		if len(warnings) > 0 {
+			state.warnings = append(state.warnings, warnings...)
+		}
+		return true
+	case forceSSLRedirectKey:
+		if strings.EqualFold(value, "true") {
+			state.forceSSLRedirect = true
+		}
+		return true
+	default:
+		return false
+	}
+}
+
 func buildNginxDirectiveLines(state nginxIngressSnippetState) ([]string, []string) {
 	lines := append([]string{}, state.lines...)
-	warnings := make([]string, 0, 2)
+	warnings := append([]string{}, state.warnings...)
 
 	if state.clientMaxBodySize != "" {
 		lines = append(lines, fmt.Sprintf("client_max_body_size %s;", state.clientMaxBodySize))
@@ -427,14 +544,37 @@ func buildNginxSnippetBlocks(lines []string, state nginxIngressSnippetState) []m
 	}
 
 	serverLines := append([]string{}, lines...)
+	if state.browserXssFilter {
+		serverLines = append(serverLines, "more_set_headers \"X-XSS-Protection: 1; mode=block\";")
+	}
+	if state.contentTypeNosniff {
+		serverLines = append(serverLines, "more_set_headers \"X-Content-Type-Options: nosniff\";")
+	}
+	if strings.TrimSpace(state.referrerPolicy) != "" {
+		serverLines = append(serverLines,
+			fmt.Sprintf("more_set_headers \"Referrer-Policy: %s\";", escapeHeaderValue(state.referrerPolicy)))
+	}
 	if state.forceSSLRedirect {
 		redirectTarget := "https://$server_name$request_uri"
 		if state.preserveTrailingSlash {
 			redirectTarget = "https://$server_name$request_uri"
 		}
 		serverLines = append(serverLines,
+			"set $ingress_doperator_needs_redirect 0;",
+			"if ($scheme != \"https\") { set $ingress_doperator_needs_redirect 1; }",
+		)
+		for _, header := range state.sslProxyHeaders {
+			serverLines = append(serverLines,
+				fmt.Sprintf(
+					"if ($http_%s = %q) { set $ingress_doperator_needs_redirect 0; }",
+					header.headerVar,
+					header.value,
+				),
+			)
+		}
+		serverLines = append(serverLines,
 			"more_set_headers \"Strict-Transport-Security: max-age=31536000\";",
-			fmt.Sprintf("if ($scheme != \"https\") { return 308 %s; }", redirectTarget),
+			fmt.Sprintf("if ($ingress_doperator_needs_redirect = 1) { return 308 %s; }", redirectTarget),
 		)
 	}
 
@@ -446,6 +586,10 @@ func buildNginxSnippetBlocks(lines []string, state nginxIngressSnippetState) []m
 	}
 
 	return snippets
+}
+
+func escapeHeaderValue(value string) string {
+	return strings.ReplaceAll(value, "\"", "\\\"")
 }
 
 // NginxIngressSnippetWarningAnnotations returns full annotation keys that should emit warnings when ignored.
