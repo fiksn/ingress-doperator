@@ -242,15 +242,6 @@ func (r *IngressReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 
 	// Handle source Ingress based on configured mode
 	switch r.IngressPostProcessingMode {
-	case IngressPostProcessingModeDisable:
-		if err := r.disableIngress(ctx, &ingress); err != nil {
-			logger.Error(err, "failed to disable source Ingress")
-			return ctrl.Result{RequeueAfter: requeueAfterError}, nil
-		}
-		if err := r.Get(ctx, req.NamespacedName, &ingress); err != nil {
-			logger.Error(err, "failed to refresh Ingress after disable")
-			return ctrl.Result{RequeueAfter: requeueAfterError}, nil
-		}
 	case IngressPostProcessingModeRemove:
 		if err := r.removeIngress(ctx, &ingress); err != nil {
 			logger.Error(err, "failed to remove source Ingress")
@@ -274,10 +265,17 @@ func (r *IngressReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 		return ctrl.Result{RequeueAfter: requeueAfterError}, nil
 	}
 
+	disableAfterReconcile := r.IngressPostProcessingMode == IngressPostProcessingModeDisable
 	if r.OneGatewayPerIngress {
 		// Mode: One Gateway per Ingress
 		result, ok := r.reconcileOneGatewayPerIngress(ctx, ingressList.Items)
 		if ok {
+			if disableAfterReconcile {
+				if err := r.disableIngress(ctx, &ingress); err != nil {
+					logger.Error(err, "failed to disable source Ingress")
+					return ctrl.Result{RequeueAfter: requeueAfterError}, nil
+				}
+			}
 			r.recordNormal(&ingress, "ReconcileSuccess", "Ingress reconcile completed")
 		}
 		r.maybeRecordReconcile(&ingress, result, nil)
@@ -287,6 +285,12 @@ func (r *IngressReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 	// Mode: Shared Gateways (group by IngressClass)
 	result, ok := r.reconcileSharedGateways(ctx, ingressList.Items)
 	if ok {
+		if disableAfterReconcile {
+			if err := r.disableIngress(ctx, &ingress); err != nil {
+				logger.Error(err, "failed to disable source Ingress")
+				return ctrl.Result{RequeueAfter: requeueAfterError}, nil
+			}
+		}
 		r.recordNormal(&ingress, "ReconcileSuccess", "Ingress reconcile completed")
 	}
 	r.maybeRecordReconcile(&ingress, result, nil)
@@ -703,45 +707,64 @@ func (r *IngressReconciler) handleDeletion(ctx context.Context, ingress *network
 	logger := log.FromContext(ctx)
 	logger.V(1).Info("Handling Ingress deletion", "namespace", ingress.Namespace, "name", ingress.Name)
 
+	if r.shouldSkipDeletionCleanup(ctx, ingress, logger) {
+		return ctrl.Result{}, nil
+	}
+
+	if !r.EnableDeletion {
+		logger.V(1).Info("Deletion disabled - HTTPRoute and Gateway will not be deleted")
+		return r.finalizeDeletion(ctx, ingress, nil)
+	}
+
+	if err := r.deleteManagedHTTPRoutes(ctx, ingress, logger); err != nil {
+		return ctrl.Result{}, err
+	}
+
+	if r.OneGatewayPerIngress {
+		if err := r.cleanupOneGatewayPerIngress(ctx, ingress, logger); err != nil {
+			return ctrl.Result{}, err
+		}
+	} else {
+		if err := r.cleanupSharedGateway(ctx, ingress, logger); err != nil {
+			return ctrl.Result{}, err
+		}
+	}
+
+	return r.finalizeDeletion(ctx, ingress, nil)
+}
+
+func (r *IngressReconciler) shouldSkipDeletionCleanup(
+	ctx context.Context,
+	ingress *networkingv1.Ingress,
+	logger logr.Logger,
+) bool {
 	if ingress.Annotations != nil && ingress.Annotations[IngressRemovedAnnotation] == fmt.Sprintf("%t", true) {
 		logger.Info("Ingress deleted by ingress-doperator, skipping derived resource cleanup",
 			"namespace", ingress.Namespace,
 			"name", ingress.Name)
-		err := r.removeFinalizer(ctx, ingress)
-		if err != nil {
-			return ctrl.Result{}, err
-		}
-		r.evictReconcileCache(ingress)
-		return ctrl.Result{}, nil
+		_, _ = r.finalizeDeletion(ctx, ingress, nil)
+		return true
 	}
 
 	if r.wasSelfDeleted(ingress) {
 		logger.Info("Ingress deleted by ingress-doperator (cached), skipping derived resource cleanup",
 			"namespace", ingress.Namespace,
 			"name", ingress.Name)
-		err := r.removeFinalizer(ctx, ingress)
-		if err != nil {
-			return ctrl.Result{}, err
-		}
-		r.evictReconcileCache(ingress)
-		return ctrl.Result{}, nil
+		_, _ = r.finalizeDeletion(ctx, ingress, nil)
+		return true
 	}
 
-	if !r.EnableDeletion {
-		// Deletion is disabled, just remove finalizer
-		err := r.removeFinalizer(ctx, ingress)
-		if err != nil {
-			return ctrl.Result{}, err
-		}
+	return false
+}
 
-		logger.V(1).Info("Deletion disabled - HTTPRoute and Gateway will not be deleted")
-		r.evictReconcileCache(ingress)
-		return ctrl.Result{}, nil
-	}
-
+func (r *IngressReconciler) deleteManagedHTTPRoutes(
+	ctx context.Context,
+	ingress *networkingv1.Ingress,
+	logger logr.Logger,
+) error {
 	routes, err := r.HTTPRouteManager.GetHTTPRoutesWithPrefix(ctx, ingress.Namespace, ingress.Name)
 	if err != nil {
-		return ctrl.Result{}, err
+		return err
 	}
 
 	for _, route := range routes {
@@ -750,7 +773,7 @@ func (r *IngressReconciler) handleDeletion(ctx context.Context, ingress *network
 			logger.V(1).Info("Deleting managed HTTPRoute", "namespace", httpRoute.Namespace, "name", httpRoute.Name)
 			if err := r.Delete(ctx, httpRoute); err != nil && !apierrors.IsNotFound(err) {
 				logger.Error(err, "failed to delete HTTPRoute")
-				return ctrl.Result{}, err
+				return err
 			}
 			metrics.HTTPRouteResourcesTotal.WithLabelValues("delete", httpRoute.Namespace, httpRoute.Name).Inc()
 		} else {
@@ -758,90 +781,99 @@ func (r *IngressReconciler) handleDeletion(ctx context.Context, ingress *network
 				"namespace", httpRoute.Namespace, "name", httpRoute.Name)
 		}
 	}
-	// Handle Gateway cleanup
-	if r.OneGatewayPerIngress {
-		// In one-gateway-per-ingress mode, delete the entire Gateway
-		gatewayName := ingress.Name
-		gateway := &gatewayv1.Gateway{}
-		err := r.Get(ctx, types.NamespacedName{
-			Namespace: r.GatewayNamespace,
-			Name:      gatewayName,
-		}, gateway)
+	return nil
+}
 
-		if err == nil {
-			// Gateway exists, check if we manage it for this specific ingress
-			if utils.IsManagedByUsForIngress(gateway, ingress.Namespace, ingress.Name) {
-				logger.V(1).Info("Deleting managed Gateway", "namespace", gateway.Namespace, "name", gateway.Name)
-				if err := r.Delete(ctx, gateway); err != nil && !apierrors.IsNotFound(err) {
-					logger.Error(err, "failed to delete Gateway")
-					return ctrl.Result{}, err
-				}
-			} else {
-				logger.V(1).Info("Gateway exists but is not managed by us for this Ingress, skipping deletion",
-					"namespace", gateway.Namespace, "name", gateway.Name)
+func (r *IngressReconciler) cleanupOneGatewayPerIngress(
+	ctx context.Context,
+	ingress *networkingv1.Ingress,
+	logger logr.Logger,
+) error {
+	gatewayName := ingress.Name
+	gateway := &gatewayv1.Gateway{}
+	err := r.Get(ctx, types.NamespacedName{
+		Namespace: r.GatewayNamespace,
+		Name:      gatewayName,
+	}, gateway)
+
+	if err == nil {
+		if utils.IsManagedByUsForIngress(gateway, ingress.Namespace, ingress.Name) {
+			logger.V(1).Info("Deleting managed Gateway", "namespace", gateway.Namespace, "name", gateway.Name)
+			if err := r.Delete(ctx, gateway); err != nil && !apierrors.IsNotFound(err) {
+				logger.Error(err, "failed to delete Gateway")
+				return err
 			}
-		} else if !apierrors.IsNotFound(err) {
-			logger.Error(err, "error checking Gateway")
-			return ctrl.Result{}, err
+		} else {
+			logger.V(1).Info("Gateway exists but is not managed by us for this Ingress, skipping deletion",
+				"namespace", gateway.Namespace, "name", gateway.Name)
 		}
-	} else {
-		// In shared gateway mode, remove listeners associated with this Ingress
-		trans := r.getTranslator()
-		ingressClass := trans.GetIngressClass(ingress)
-		gatewayName := r.getGatewayNameForClass(ingressClass)
+	} else if !apierrors.IsNotFound(err) {
+		logger.Error(err, "error checking Gateway")
+		return err
+	}
+	return nil
+}
 
-		gateway := &gatewayv1.Gateway{}
-		err := r.Get(ctx, types.NamespacedName{
-			Namespace: r.GatewayNamespace,
-			Name:      gatewayName,
-		}, gateway)
+func (r *IngressReconciler) cleanupSharedGateway(
+	ctx context.Context,
+	ingress *networkingv1.Ingress,
+	logger logr.Logger,
+) error {
+	trans := r.getTranslator()
+	ingressClass := trans.GetIngressClass(ingress)
+	gatewayName := r.getGatewayNameForClass(ingressClass)
 
-		if err == nil && utils.IsManagedByUsWithIngress(gateway, ingress.Namespace, ingress.Name) {
-			// Remove listeners for hostnames from this Ingress
-			trans := r.getTranslator()
-			translator.RemoveIngressListeners(gateway, ingress, trans)
+	gateway := &gatewayv1.Gateway{}
+	err := r.Get(ctx, types.NamespacedName{
+		Namespace: r.GatewayNamespace,
+		Name:      gatewayName,
+	}, gateway)
 
-			if len(gateway.Spec.Listeners) == 0 {
-				// No more listeners, delete the Gateway
-				logger.V(1).Info("Deleting Gateway with no remaining listeners",
-					"namespace", gateway.Namespace, "name", gateway.Name)
-				if err := r.Delete(ctx, gateway); err != nil && !apierrors.IsNotFound(err) {
-					logger.Error(err, "failed to delete Gateway")
-					return ctrl.Result{}, err
-				}
-			} else {
-				// Update Gateway with remaining listeners
-				logger.V(1).Info("Removing listeners from shared Gateway",
-					"namespace", gateway.Namespace, "name", gateway.Name,
-					"remainingListeners", len(gateway.Spec.Listeners))
-				if err := r.Update(ctx, gateway); err != nil {
-					logger.Error(err, "failed to update Gateway")
-					return ctrl.Result{}, err
-				}
+	if err == nil && utils.IsManagedByUsWithIngress(gateway, ingress.Namespace, ingress.Name) {
+		translator.RemoveIngressListeners(gateway, ingress, trans)
+
+		if len(gateway.Spec.Listeners) == 0 {
+			logger.V(1).Info("Deleting Gateway with no remaining listeners",
+				"namespace", gateway.Namespace, "name", gateway.Name)
+			if err := r.Delete(ctx, gateway); err != nil && !apierrors.IsNotFound(err) {
+				logger.Error(err, "failed to delete Gateway")
+				return err
 			}
-		} else if err != nil && !apierrors.IsNotFound(err) {
-			logger.Error(err, "error checking Gateway")
-			return ctrl.Result{}, err
-		}
-
-		// Check if ReferenceGrant should be cleaned up
-		// Only if this Ingress had TLS and Gateway is in different namespace
-		if !r.UseIngress2Gateway && len(ingress.Spec.TLS) > 0 && ingress.Namespace != r.GatewayNamespace {
-			if err := utils.CleanupReferenceGrantIfNeeded(ctx, r.Client, ingress.Namespace, ingress.Name); err != nil {
-				logger.Error(err, "failed to cleanup ReferenceGrant", "namespace", ingress.Namespace, "ingress", ingress.Name)
-				// Don't fail the reconciliation, just log the error
+		} else {
+			logger.V(1).Info("Removing listeners from shared Gateway",
+				"namespace", gateway.Namespace, "name", gateway.Name,
+				"remainingListeners", len(gateway.Spec.Listeners))
+			if err := r.Update(ctx, gateway); err != nil {
+				logger.Error(err, "failed to update Gateway")
+				return err
 			}
 		}
+	} else if err != nil && !apierrors.IsNotFound(err) {
+		logger.Error(err, "error checking Gateway")
+		return err
 	}
 
-	err = r.removeFinalizer(ctx, ingress)
+	if !r.UseIngress2Gateway && len(ingress.Spec.TLS) > 0 && ingress.Namespace != r.GatewayNamespace {
+		if err := utils.CleanupReferenceGrantIfNeeded(ctx, r.Client, ingress.Namespace, ingress.Name); err != nil {
+			logger.Error(err, "failed to cleanup ReferenceGrant", "namespace", ingress.Namespace, "ingress", ingress.Name)
+		}
+	}
+	return nil
+}
+
+func (r *IngressReconciler) finalizeDeletion(
+	ctx context.Context,
+	ingress *networkingv1.Ingress,
+	err error,
+) (ctrl.Result, error) {
 	if err != nil {
-		logger.Error(err, "failed to remove finalizer")
 		return ctrl.Result{}, err
 	}
-
+	if removeErr := r.removeFinalizer(ctx, ingress); removeErr != nil {
+		log.FromContext(ctx).Error(removeErr, "failed to remove finalizer")
+		return ctrl.Result{}, removeErr
+	}
 	r.evictReconcileCache(ingress)
-
 	return ctrl.Result{}, nil
 }
 
