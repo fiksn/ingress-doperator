@@ -224,7 +224,7 @@ func runReenabler(
 				"name", ingress.Name)
 			continue
 		}
-		if !disabled && !(restoreExternalDNS && needsExternalDNSRestore(ingress)) {
+		if !disabled && (!restoreExternalDNS || !needsExternalDNSRestore(ingress)) {
 			continue
 		}
 

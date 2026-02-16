@@ -176,60 +176,7 @@ func (r *IngressReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 		return ctrl.Result{RequeueAfter: requeueAfterError}, nil
 	}
 
-	// Check if this Ingress should be ignored
-	if ingress.Annotations != nil && ingress.Annotations[IgnoreIngressAnnotation] == fmt.Sprintf("%t", true) {
-		logger.Info("Ingress has ignore annotation, skipping reconciliation")
-		return ctrl.Result{}, nil
-	}
-
-	// Check if this Ingress matches the ingress class filter
-	if !r.matchesIngressClassFilter(&ingress) {
-		ingressClass := r.getIngressClass(&ingress)
-		logger.V(1).Info("Ingress class does not match filter, skipping reconciliation",
-			"ingressClass", ingressClass,
-			"filter", r.IngressClassFilter)
-		metrics.IngressReconcileSkipsTotal.WithLabelValues("class-filter", ingress.Namespace, ingress.Name).Inc()
-		return ctrl.Result{}, nil
-	}
-
-	if ingress.Annotations != nil && ingress.Annotations[IngressDisabledAnnotation] == IngressDisabledReasonNormal {
-		logger.V(1).Info("Ingress is disabled, skipping reconciliation",
-			"namespace", ingress.Namespace,
-			"name", ingress.Name)
-		metrics.IngressReconcileSkipsTotal.WithLabelValues("disabled", ingress.Namespace, ingress.Name).Inc()
-		return ctrl.Result{}, nil
-	}
-
-	if ingress.Annotations != nil && ingress.Annotations[IngressRemovedAnnotation] == fmt.Sprintf("%t", true) {
-		logger.Info("Ingress marked for removal by ingress-doperator, skipping reconciliation",
-			"namespace", ingress.Namespace,
-			"name", ingress.Name)
-		metrics.IngressReconcileSkipsTotal.WithLabelValues("removed", ingress.Namespace, ingress.Name).Inc()
-		return ctrl.Result{}, nil
-	}
-
-	if r.getIngressClass(&ingress) == DisabledIngressClassName {
-		logger.Info("Ingress uses disabled class, skipping reconciliation",
-			"namespace", ingress.Namespace,
-			"name", ingress.Name)
-		metrics.IngressReconcileSkipsTotal.WithLabelValues("disabled-class", ingress.Namespace, ingress.Name).Inc()
-		return ctrl.Result{}, nil
-	}
-
-	if r.wasSelfDeleted(&ingress) {
-		logger.Info("Ingress was deleted by ingress-doperator, skipping reconciliation",
-			"namespace", ingress.Namespace,
-			"name", ingress.Name)
-		metrics.IngressReconcileSkipsTotal.WithLabelValues("self-deleted", ingress.Namespace, ingress.Name).Inc()
-		return ctrl.Result{}, nil
-	}
-
-	if r.shouldSkipReconcile(&ingress) {
-		logger.V(3).Info("Ingress resourceVersion unchanged, skipping reconciliation",
-			"namespace", ingress.Namespace,
-			"name", ingress.Name,
-			"resourceVersion", ingress.ResourceVersion)
-		metrics.IngressReconcileSkipsTotal.WithLabelValues("cache", ingress.Namespace, ingress.Name).Inc()
+	if r.shouldSkipIngress(&ingress, logger) {
 		return ctrl.Result{}, nil
 	}
 
@@ -320,6 +267,71 @@ func (r *IngressReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 	return result, nil
 }
 
+func (r *IngressReconciler) shouldSkipIngress(
+	ingress *networkingv1.Ingress,
+	logger logr.Logger,
+) bool {
+	if ingress == nil {
+		return true
+	}
+
+	if ingress.Annotations != nil && ingress.Annotations[IgnoreIngressAnnotation] == fmt.Sprintf("%t", true) {
+		logger.Info("Ingress has ignore annotation, skipping reconciliation")
+		return true
+	}
+
+	if !r.matchesIngressClassFilter(ingress) {
+		ingressClass := r.getIngressClass(ingress)
+		logger.V(1).Info("Ingress class does not match filter, skipping reconciliation",
+			"ingressClass", ingressClass,
+			"filter", r.IngressClassFilter)
+		metrics.IngressReconcileSkipsTotal.WithLabelValues("class-filter", ingress.Namespace, ingress.Name).Inc()
+		return true
+	}
+
+	if ingress.Annotations != nil && ingress.Annotations[IngressDisabledAnnotation] == IngressDisabledReasonNormal {
+		logger.V(1).Info("Ingress is disabled, skipping reconciliation",
+			"namespace", ingress.Namespace,
+			"name", ingress.Name)
+		metrics.IngressReconcileSkipsTotal.WithLabelValues("disabled", ingress.Namespace, ingress.Name).Inc()
+		return true
+	}
+
+	if ingress.Annotations != nil && ingress.Annotations[IngressRemovedAnnotation] == fmt.Sprintf("%t", true) {
+		logger.Info("Ingress marked for removal by ingress-doperator, skipping reconciliation",
+			"namespace", ingress.Namespace,
+			"name", ingress.Name)
+		metrics.IngressReconcileSkipsTotal.WithLabelValues("removed", ingress.Namespace, ingress.Name).Inc()
+		return true
+	}
+
+	if r.getIngressClass(ingress) == DisabledIngressClassName {
+		logger.Info("Ingress uses disabled class, skipping reconciliation",
+			"namespace", ingress.Namespace,
+			"name", ingress.Name)
+		metrics.IngressReconcileSkipsTotal.WithLabelValues("disabled-class", ingress.Namespace, ingress.Name).Inc()
+		return true
+	}
+
+	if r.wasSelfDeleted(ingress) {
+		logger.Info("Ingress was deleted by ingress-doperator, skipping reconciliation",
+			"namespace", ingress.Namespace,
+			"name", ingress.Name)
+		metrics.IngressReconcileSkipsTotal.WithLabelValues("self-deleted", ingress.Namespace, ingress.Name).Inc()
+		return true
+	}
+
+	if r.shouldSkipReconcile(ingress) {
+		logger.V(3).Info("Ingress resourceVersion unchanged, skipping reconciliation",
+			"namespace", ingress.Namespace,
+			"name", ingress.Name,
+			"resourceVersion", ingress.ResourceVersion)
+		metrics.IngressReconcileSkipsTotal.WithLabelValues("cache", ingress.Namespace, ingress.Name).Inc()
+		return true
+	}
+
+	return false
+}
 func (r *IngressReconciler) reconcileOneGatewayPerIngress(
 	ctx context.Context,
 	ingresses []networkingv1.Ingress,
