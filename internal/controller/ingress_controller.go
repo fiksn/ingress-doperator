@@ -49,19 +49,25 @@ import (
 )
 
 const (
-	IngressClassAnnotation             = "kubernetes.io/ingress.class"
-	IngressDisabledAnnotation          = "ingress-doperator.fiction.si/disabled"
-	IngressRemovedAnnotation           = "ingress-doperator.fiction.si/removed"
-	IgnoreIngressAnnotation            = "ingress-doperator.fiction.si/ignore-ingress"
-	OriginalIngressClassAnnotation     = "ingress-doperator.fiction.si/original-ingress-class"
-	OriginalIngressClassNameAnnotation = "ingress-doperator.fiction.si/original-ingress-classname"
-	FinalizerName                      = "ingress-doperator.fiction.si/finalizer"
-	HTTPRouteSnippetsFilterAnnotation  = "ingress-doperator.fiction.si/httproute-snippets-filter"
-	HTTPRouteAuthenticationAnnotation  = "ingress-doperator.fiction.si/httproute-authentication-filter"
-	HTTPRouteRequestHeaderAnnotation   = "ingress-doperator.fiction.si/httproute-request-header-modifier-filter"
-	DisabledIngressClassName           = "ingress-doperator-disabled"
-	DisabledIngressClassController     = "dummy.io/no-controller"
-	DefaultGatewayAnnotationFilters    = "ingress.kubernetes.io,cert-manager.io," +
+	IngressClassAnnotation                   = "kubernetes.io/ingress.class"
+	IngressDisabledAnnotation                = "ingress-doperator.fiction.si/disabled"
+	IngressRemovedAnnotation                 = "ingress-doperator.fiction.si/removed"
+	IgnoreIngressAnnotation                  = "ingress-doperator.fiction.si/ignore-ingress"
+	OriginalIngressClassAnnotation           = "ingress-doperator.fiction.si/original-ingress-class"
+	OriginalIngressClassNameAnnotation       = "ingress-doperator.fiction.si/original-ingress-classname"
+	ExternalDNSIngressHostnameSource         = "external-dns.alpha.kubernetes.io/ingress-hostname-source"
+	ExternalDNSHostnameAnnotation            = "external-dns.alpha.kubernetes.io/hostname"
+	OriginalExternalDNSHostname              = "ingress-doperator.fiction.si/original-external-dns-hostname"
+	OriginalExternalDNSIngressHostnameSource = "ingress-doperator.fiction.si/original-external-dns-ingress-hostname-source"
+	FinalizerName                            = "ingress-doperator.fiction.si/finalizer"
+	HTTPRouteSnippetsFilterAnnotation        = "ingress-doperator.fiction.si/httproute-snippets-filter"
+	HTTPRouteAuthenticationAnnotation        = "ingress-doperator.fiction.si/httproute-authentication-filter"
+	HTTPRouteRequestHeaderAnnotation         = "ingress-doperator.fiction.si/httproute-request-header-modifier-filter"
+	DisabledIngressClassName                 = "ingress-doperator-disabled"
+	DisabledIngressClassController           = "dummy.io/no-controller"
+	IngressDisabledReasonNormal              = "normal"
+	IngressDisabledReasonExternalDNS         = "external-dns"
+	DefaultGatewayAnnotationFilters          = "ingress.kubernetes.io,cert-manager.io," +
 		"nginx.ingress.kubernetes.io,kubectl.kubernetes.io,kubernetes.io/ingress.class," +
 		"traefik.ingress.kubernetes.io,ingress-doperator.fiction.si"
 	DefaultHTTPRouteAnnotationFilters = "ingress.kubernetes.io,cert-manager.io," +
@@ -74,11 +80,13 @@ type IngressPostProcessingMode string
 
 const (
 	// IngressPostProcessingModeNone leaves the source Ingress unchanged
-	IngressPostProcessingModeNone IngressPostProcessingMode = "as-is"
+	IngressPostProcessingModeNone IngressPostProcessingMode = "none"
 	// IngressPostProcessingModeDisable removes the ingress class to disable processing
 	IngressPostProcessingModeDisable IngressPostProcessingMode = "disable"
 	// IngressPostProcessingModeRemove deletes the source Ingress resource
 	IngressPostProcessingModeRemove IngressPostProcessingMode = "remove"
+	// IngressPostProcessingModeDisableExternalDNS forces external-dns to only read annotations
+	IngressPostProcessingModeDisableExternalDNS IngressPostProcessingMode = "disable-external-dns"
 )
 
 const requeueAfterError = 30 * time.Second
@@ -184,7 +192,7 @@ func (r *IngressReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 		return ctrl.Result{}, nil
 	}
 
-	if ingress.Annotations != nil && ingress.Annotations[IngressDisabledAnnotation] == fmt.Sprintf("%t", true) {
+	if ingress.Annotations != nil && ingress.Annotations[IngressDisabledAnnotation] == IngressDisabledReasonNormal {
 		logger.V(1).Info("Ingress is disabled, skipping reconciliation",
 			"namespace", ingress.Namespace,
 			"name", ingress.Name)
@@ -251,6 +259,8 @@ func (r *IngressReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 		return ctrl.Result{}, nil
 	case IngressPostProcessingModeNone:
 		// Do nothing, continue with normal processing
+	case IngressPostProcessingModeDisableExternalDNS:
+		// Do nothing, continue with normal processing
 	}
 
 	// List Ingresses (all or filtered by namespace)
@@ -266,6 +276,7 @@ func (r *IngressReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 	}
 
 	disableAfterReconcile := r.IngressPostProcessingMode == IngressPostProcessingModeDisable
+	disableExternalDNSAfterReconcile := r.IngressPostProcessingMode == IngressPostProcessingModeDisableExternalDNS
 	if r.OneGatewayPerIngress {
 		// Mode: One Gateway per Ingress
 		result, ok := r.reconcileOneGatewayPerIngress(ctx, ingressList.Items)
@@ -273,6 +284,12 @@ func (r *IngressReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 			if disableAfterReconcile {
 				if err := r.disableIngress(ctx, &ingress); err != nil {
 					logger.Error(err, "failed to disable source Ingress")
+					return ctrl.Result{RequeueAfter: requeueAfterError}, nil
+				}
+			}
+			if disableExternalDNSAfterReconcile {
+				if err := r.disableExternalDNS(ctx, &ingress); err != nil {
+					logger.Error(err, "failed to disable external-dns for source Ingress")
 					return ctrl.Result{RequeueAfter: requeueAfterError}, nil
 				}
 			}
@@ -288,6 +305,12 @@ func (r *IngressReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 		if disableAfterReconcile {
 			if err := r.disableIngress(ctx, &ingress); err != nil {
 				logger.Error(err, "failed to disable source Ingress")
+				return ctrl.Result{RequeueAfter: requeueAfterError}, nil
+			}
+		}
+		if disableExternalDNSAfterReconcile {
+			if err := r.disableExternalDNS(ctx, &ingress); err != nil {
+				logger.Error(err, "failed to disable external-dns for source Ingress")
 				return ctrl.Result{RequeueAfter: requeueAfterError}, nil
 			}
 		}
@@ -974,7 +997,7 @@ func (r *IngressReconciler) disableIngress(ctx context.Context, ingress *network
 	logger := log.FromContext(ctx)
 
 	// Check if already disabled
-	if ingress.Annotations != nil && ingress.Annotations[IngressDisabledAnnotation] == fmt.Sprintf("%t", true) {
+	if ingress.Annotations != nil && ingress.Annotations[IngressDisabledAnnotation] == IngressDisabledReasonNormal {
 		if r.ClearIngressStatusOnDisable {
 			if err := r.clearIngressStatus(ctx, ingress); err != nil {
 				return err
@@ -1028,7 +1051,7 @@ func (r *IngressReconciler) disableIngress(ctx context.Context, ingress *network
 
 	// Mark as disabled
 	if modified {
-		ingress.Annotations[IngressDisabledAnnotation] = fmt.Sprintf("%t", true)
+		ingress.Annotations[IngressDisabledAnnotation] = IngressDisabledReasonNormal
 
 		if err := r.Update(ctx, ingress); err != nil {
 			return fmt.Errorf("failed to update Ingress to disable it: %w", err)
@@ -1042,6 +1065,62 @@ func (r *IngressReconciler) disableIngress(ctx context.Context, ingress *network
 		}
 	}
 
+	return nil
+}
+
+func (r *IngressReconciler) disableExternalDNS(ctx context.Context, ingress *networkingv1.Ingress) error {
+	logger := log.FromContext(ctx)
+
+	if ingress.Annotations == nil {
+		ingress.Annotations = make(map[string]string)
+	}
+
+	modified := false
+
+	if hostname, exists := ingress.Annotations[ExternalDNSHostnameAnnotation]; exists && hostname != "" {
+		if _, saved := ingress.Annotations[OriginalExternalDNSHostname]; !saved {
+			ingress.Annotations[OriginalExternalDNSHostname] = hostname
+			modified = true
+			logger.Info("Found external-dns hostname annotation; storing original value",
+				"value", hostname)
+			r.recordWarning(ingress, "ExternalDNSHostnameAnnotationPresent",
+				fmt.Sprintf("external-dns hostname annotation present (%s); stored in %s",
+					hostname, OriginalExternalDNSHostname))
+		}
+	}
+
+	if source, exists := ingress.Annotations[ExternalDNSIngressHostnameSource]; exists {
+		if _, saved := ingress.Annotations[OriginalExternalDNSIngressHostnameSource]; !saved {
+			ingress.Annotations[OriginalExternalDNSIngressHostnameSource] = source
+			modified = true
+			logger.Info("Found external-dns ingress hostname source annotation; storing original value",
+				"value", source)
+		}
+	}
+
+	if ingress.Annotations[IngressDisabledAnnotation] != IngressDisabledReasonNormal &&
+		ingress.Annotations[IngressDisabledAnnotation] != IngressDisabledReasonExternalDNS {
+		ingress.Annotations[IngressDisabledAnnotation] = IngressDisabledReasonExternalDNS
+		modified = true
+	}
+
+	if ingress.Annotations[ExternalDNSIngressHostnameSource] != "annotation-only" {
+		ingress.Annotations[ExternalDNSIngressHostnameSource] = "annotation-only"
+		modified = true
+		logger.Info("Set external-dns ingress hostname source to annotation-only",
+			"value", "annotation-only")
+	}
+
+	if !modified {
+		return nil
+	}
+
+	if err := r.Update(ctx, ingress); err != nil {
+		return fmt.Errorf("failed to update Ingress to disable external-dns: %w", err)
+	}
+
+	logger.Info("Successfully updated Ingress to disable external-dns processing",
+		"namespace", ingress.Namespace, "name", ingress.Name)
 	return nil
 }
 

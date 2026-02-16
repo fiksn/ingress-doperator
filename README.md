@@ -10,7 +10,8 @@ It can transparently create `Gateway`, `Httproute` (and possibly
 `SnippetsFilter` to translate known `nginx.ingress.kubernetes.io`
 annotations) from `Ingress` resources.
 Depending on `--ingress-postprocessing` it can either ("disable") disable the
-original ingress, remove it completely ("remove") or just leave it (for future
+original ingress, remove it completely ("remove"), force external-dns to only
+read annotations ("disable-external-dns"), or just leave it (for future
 reference).
 
 !!! Nginx ingress controller is [deprecated](https://kubernetes.io/blog/2025/11/11/ingress-nginx-retirement/) and
@@ -465,7 +466,8 @@ The operator accepts the following command-line flags:
 --hostname-rewrite-from string                Domain suffix to match for rewriting (e.g., 'domain.cc')
 --hostname-rewrite-to string                  Replacement domain suffix (e.g., 'foo.domain.cc').
                                               Transforms 'a.b.domain.cc' to 'a.b.foo.domain.cc'
---ingress-postprocessing string               Post processing mode: none, disable, or remove (default: "none")
+--ingress-postprocessing string               Post processing mode: none, disable, remove, or disable-external-dns
+                                              (default: "none")
 --gateway-annotation-filters string           Comma-separated list of annotation prefixes to exclude from Gateway
                                               (default: "ingress.kubernetes.io,cert-manager.io,
                                               nginx.ingress.kubernetes.io")
@@ -620,23 +622,19 @@ This will:
 
 This prevents nginx-ingress from processing the Ingress while keeping it in the cluster for reference.
 
-### Complete Migration Example
+### Disabling external-dns on Source Ingress
+
+Use `--ingress-postprocessing=disable-external-dns` to disable  external-dns 
+for migrated ingresses.
 
 ```bash
-# Step 1: Create Gateway/HTTPRoute with transformed hostnames (no DNS conflict)
-./bin/operator \
-  --hostname-rewrite-from=domain.cc \
-  --hostname-rewrite-to=migration.domain.cc
-
-# Step 2: Test the Gateway setup at migration.domain.cc hostnames
-
-# Step 3: When ready, disable source Ingress and use original hostnames
-./bin/operator --ingress-postprocessing=disable
-
-# Step 4: Update DNS to point to Gateway
-
-# Step 5: Clean up old Ingresses when satisfied
+./bin/operator --ingress-postprocessing=disable-external-dns
 ```
+
+This will:
+- Set `external-dns.alpha.kubernetes.io/ingress-hostname-source=annotation-only`
+- If `external-dns.alpha.kubernetes.io/hostname` exists, save it to
+  `ingress-doperator.fiction.si/original-external-dns-hostname` and emit a warning
 
 ## Deletion behaviour
 
@@ -734,6 +732,30 @@ Remove managed HTTPRoutes and automatic SnippetsFilters:
 
 ```bash
 ./bin/reenabler --remove-derived-resources
+```
+
+Restore external-dns annotations saved by ingress-doperator:
+
+```bash
+./bin/reenabler --restore-external-dns=true
+```
+
+Skip restoring external-dns annotations:
+
+```bash
+./bin/reenabler --restore=false
+```
+
+Restore only ingress class settings:
+
+```bash
+./bin/reenabler --restore-class=true
+```
+
+Delete disabled Ingresses managed by ingress-doperator:
+
+```bash
+./bin/reenabler --dangerously-delete-ingresses
 ```
 
 ## Behaviour

@@ -21,6 +21,7 @@ import (
 	"flag"
 	"fmt"
 	"os"
+	"strconv"
 
 	// Import all Kubernetes client auth plugins (e.g. Azure, GCP, OIDC, etc.)
 	_ "k8s.io/client-go/plugin/pkg/client/auth"
@@ -47,6 +48,27 @@ var (
 	setupLog = ctrl.Log.WithName("setup")
 )
 
+type trackedBool struct {
+	value bool
+	set   bool
+}
+
+func (b *trackedBool) Set(s string) error {
+	b.set = true
+	v, err := strconv.ParseBool(s)
+	if err != nil {
+		return err
+	}
+	b.value = v
+	return nil
+}
+
+func (b *trackedBool) String() string {
+	return strconv.FormatBool(b.value)
+}
+
+func (b *trackedBool) IsBoolFlag() bool { return true }
+
 func init() {
 	utilruntime.Must(clientgoscheme.AddToScheme(scheme))
 	utilruntime.Must(gatewayv1.Install(scheme))
@@ -56,10 +78,23 @@ func main() {
 	var namespace string
 	var verbosity int
 	var removeDerivedResources bool
+	var restore trackedBool
+	var restoreClass trackedBool
+	var restoreExternalDNS trackedBool
+	var dangerouslyDeleteIngresses bool
 
 	flag.StringVar(&namespace, "namespace", "", "If set, only process Ingresses in this namespace")
 	flag.BoolVar(&removeDerivedResources, "remove-derived-resources", false,
 		"If true, remove managed HTTPRoutes and automatic SnippetsFilters derived from the Ingress")
+	restore.value = true
+	flag.Var(&restore, "restore",
+		"If true, restore both ingress class and external-dns annotations")
+	flag.Var(&restoreClass, "restore-class",
+		"If true, restore ingress class settings saved by ingress-doperator")
+	flag.Var(&restoreExternalDNS, "restore-external-dns",
+		"If true, restore external-dns annotations saved by ingress-doperator")
+	flag.BoolVar(&dangerouslyDeleteIngresses, "dangerously-delete-ingresses", false,
+		"If true, delete disabled Ingresses managed by ingress-doperator")
 	flag.IntVar(&verbosity, "v", 0, "Log verbosity (0 = info, higher = more verbose)")
 	opts := zap.Options{
 		Development: true,
@@ -74,6 +109,35 @@ func main() {
 
 	ctrl.SetLogger(zap.New(zap.UseFlagOptions(&opts)))
 
+	if dangerouslyDeleteIngresses {
+		if restoreClass.set || restoreExternalDNS.set {
+			setupLog.Error(fmt.Errorf("invalid flag combination"),
+				"--dangerously-delete-ingresses cannot be combined with restore flags")
+			os.Exit(1)
+		}
+		if removeDerivedResources {
+			setupLog.Error(fmt.Errorf("invalid flag combination"),
+				"--dangerously-delete-ingresses cannot be combined with --remove-derived-resources")
+			os.Exit(1)
+		}
+		restore.value = false
+	}
+
+	if removeDerivedResources && (restoreClass.set || restoreExternalDNS.set || restore.value) {
+		setupLog.Error(fmt.Errorf("invalid flag combination"),
+			"--remove-derived-resources cannot be combined with restore flags")
+		os.Exit(1)
+	}
+
+	if restoreClass.set || restoreExternalDNS.set {
+		restore.value = false
+	}
+
+	if restore.value {
+		restoreClass.value = true
+		restoreExternalDNS.value = true
+	}
+
 	cfg := ctrl.GetConfigOrDie()
 	cli, err := client.New(cfg, client.Options{Scheme: scheme})
 	if err != nil {
@@ -82,13 +146,29 @@ func main() {
 	}
 
 	ctx := context.Background()
-	if err := runReenabler(ctx, cli, namespace, removeDerivedResources); err != nil {
+	if err := runReenabler(
+		ctx,
+		cli,
+		namespace,
+		removeDerivedResources,
+		restoreClass.value,
+		restoreExternalDNS.value,
+		dangerouslyDeleteIngresses,
+	); err != nil {
 		setupLog.Error(err, "reenabler failed")
 		os.Exit(1)
 	}
 }
 
-func runReenabler(ctx context.Context, cli client.Client, namespace string, removeDerivedResources bool) error {
+func runReenabler(
+	ctx context.Context,
+	cli client.Client,
+	namespace string,
+	removeDerivedResources bool,
+	restoreClass bool,
+	restoreExternalDNS bool,
+	dangerouslyDeleteIngresses bool,
+) error {
 	list := &networkingv1.IngressList{}
 	if namespace != "" {
 		if err := cli.List(ctx, list, client.InNamespace(namespace)); err != nil {
@@ -102,20 +182,60 @@ func runReenabler(ctx context.Context, cli client.Client, namespace string, remo
 
 	manager := utils.HTTPRouteManager{Client: cli}
 
+	if dangerouslyDeleteIngresses {
+		for i := range list.Items {
+			ingress := &list.Items[i]
+			ok, reason, err := checkDeleteEligibility(ctx, cli, &manager, ingress)
+			if err != nil {
+				return err
+			}
+			if !ok {
+				return fmt.Errorf("refusing to delete ingress %s/%s: %s", ingress.Namespace, ingress.Name, reason)
+			}
+		}
+	}
+
 	for i := range list.Items {
 		ingress := &list.Items[i]
-		if !isDisabledIngress(ingress) {
+		disabled := isDisabledIngress(ingress)
+		if dangerouslyDeleteIngresses && shouldDeleteIngress(ingress) {
+			ok, reason, err := checkDeleteEligibility(ctx, cli, &manager, ingress)
+			if err != nil {
+				setupLog.Error(err, "failed to verify managed resources for ingress",
+					"namespace", ingress.Namespace,
+					"name", ingress.Name)
+				continue
+			}
+			if !ok {
+				setupLog.Info("Skipping ingress deletion due to failed checks",
+					"namespace", ingress.Namespace,
+					"name", ingress.Name,
+					"reason", reason)
+				continue
+			}
+			if err := cli.Delete(ctx, ingress); err != nil {
+				setupLog.Error(err, "failed to delete ingress",
+					"namespace", ingress.Namespace,
+					"name", ingress.Name)
+				continue
+			}
+			setupLog.Info("Deleted disabled Ingress",
+				"namespace", ingress.Namespace,
+				"name", ingress.Name)
+			continue
+		}
+		if !disabled && !(restoreExternalDNS && needsExternalDNSRestore(ingress)) {
 			continue
 		}
 
-		if err := restoreIngressClass(ctx, cli, ingress); err != nil {
-			setupLog.Error(err, "failed to restore ingress class",
+		if err := restoreIngressState(ctx, cli, ingress, disabled && restoreClass, restoreExternalDNS); err != nil {
+			setupLog.Error(err, "failed to restore ingress state",
 				"namespace", ingress.Namespace,
 				"name", ingress.Name)
 			continue
 		}
 
-		if removeDerivedResources {
+		if disabled && restoreClass && removeDerivedResources {
 			if err := removeManagedHTTPRoutes(ctx, &manager, ingress); err != nil {
 				setupLog.Error(err, "failed to remove HTTPRoutes for ingress",
 					"namespace", ingress.Namespace,
@@ -128,15 +248,21 @@ func runReenabler(ctx context.Context, cli client.Client, namespace string, remo
 					"name", ingress.Name)
 				continue
 			}
-		} else {
+		} else if disabled && restoreClass {
 			setupLog.Info("Leaving derived resources in place (remove-derived-resources=false)",
 				"namespace", ingress.Namespace,
 				"name", ingress.Name)
 		}
 
-		setupLog.Info("Re-enabled Ingress",
-			"namespace", ingress.Namespace,
-			"name", ingress.Name)
+		if disabled && restoreClass {
+			setupLog.Info("Re-enabled Ingress",
+				"namespace", ingress.Namespace,
+				"name", ingress.Name)
+		} else {
+			setupLog.Info("Restored external-dns annotations for Ingress",
+				"namespace", ingress.Namespace,
+				"name", ingress.Name)
+		}
 	}
 
 	return nil
@@ -146,20 +272,29 @@ func isDisabledIngress(ingress *networkingv1.Ingress) bool {
 	if ingress == nil {
 		return false
 	}
+	if ingress.Annotations == nil {
+		return false
+	}
+	if ingress.Annotations[controller.IngressDisabledAnnotation] == "" {
+		return false
+	}
 	if ingress.Spec.IngressClassName != nil &&
 		*ingress.Spec.IngressClassName == controller.DisabledIngressClassName {
 		return true
 	}
-	if ingress.Annotations == nil {
-		return false
-	}
 	if ingress.Annotations[controller.IngressClassAnnotation] == controller.DisabledIngressClassName {
 		return true
 	}
-	return ingress.Annotations[controller.IngressDisabledAnnotation] == fmt.Sprintf("%t", true)
+	return false
 }
 
-func restoreIngressClass(ctx context.Context, cli client.Client, ingress *networkingv1.Ingress) error {
+func restoreIngressState(
+	ctx context.Context,
+	cli client.Client,
+	ingress *networkingv1.Ingress,
+	restoreClass bool,
+	restoreExternalDNS bool,
+) error {
 	if ingress == nil {
 		return nil
 	}
@@ -169,27 +304,132 @@ func restoreIngressClass(ctx context.Context, cli client.Client, ingress *networ
 		annotations = map[string]string{}
 	}
 
-	originalClassName := annotations[controller.OriginalIngressClassNameAnnotation]
-	originalClassAnnotation := annotations[controller.OriginalIngressClassAnnotation]
+	modified := false
+	if restoreClass {
+		originalClassName := annotations[controller.OriginalIngressClassNameAnnotation]
+		originalClassAnnotation := annotations[controller.OriginalIngressClassAnnotation]
 
-	if originalClassName != "" {
-		updated.Spec.IngressClassName = &originalClassName
-	} else {
-		updated.Spec.IngressClassName = nil
+		if originalClassName != "" {
+			updated.Spec.IngressClassName = &originalClassName
+		} else {
+			updated.Spec.IngressClassName = nil
+		}
+
+		if originalClassAnnotation != "" {
+			annotations[controller.IngressClassAnnotation] = originalClassAnnotation
+		} else {
+			delete(annotations, controller.IngressClassAnnotation)
+		}
+
+		delete(annotations, controller.IngressDisabledAnnotation)
+		delete(annotations, controller.OriginalIngressClassNameAnnotation)
+		delete(annotations, controller.OriginalIngressClassAnnotation)
+		modified = true
 	}
 
-	if originalClassAnnotation != "" {
-		annotations[controller.IngressClassAnnotation] = originalClassAnnotation
-	} else {
-		delete(annotations, controller.IngressClassAnnotation)
-	}
+	if restoreExternalDNS {
+		if originalHostname, ok := annotations[controller.OriginalExternalDNSHostname]; ok {
+			if originalHostname != "" {
+				annotations[controller.ExternalDNSHostnameAnnotation] = originalHostname
+			} else {
+				delete(annotations, controller.ExternalDNSHostnameAnnotation)
+			}
+			delete(annotations, controller.OriginalExternalDNSHostname)
+			modified = true
+		}
 
-	delete(annotations, controller.IngressDisabledAnnotation)
-	delete(annotations, controller.OriginalIngressClassNameAnnotation)
-	delete(annotations, controller.OriginalIngressClassAnnotation)
+		if originalSource, ok := annotations[controller.OriginalExternalDNSIngressHostnameSource]; ok {
+			if originalSource != "" {
+				annotations[controller.ExternalDNSIngressHostnameSource] = originalSource
+			} else {
+				delete(annotations, controller.ExternalDNSIngressHostnameSource)
+			}
+			delete(annotations, controller.OriginalExternalDNSIngressHostnameSource)
+			modified = true
+		} else if _, exists := annotations[controller.ExternalDNSIngressHostnameSource]; exists {
+			delete(annotations, controller.ExternalDNSIngressHostnameSource)
+			modified = true
+		}
+	}
 
 	updated.Annotations = annotations
+	if !modified {
+		return nil
+	}
 	return cli.Update(ctx, updated)
+}
+
+func needsExternalDNSRestore(ingress *networkingv1.Ingress) bool {
+	if ingress == nil || ingress.Annotations == nil {
+		return false
+	}
+	if _, ok := ingress.Annotations[controller.OriginalExternalDNSHostname]; ok {
+		return true
+	}
+	if _, ok := ingress.Annotations[controller.OriginalExternalDNSIngressHostnameSource]; ok {
+		return true
+	}
+	_, ok := ingress.Annotations[controller.ExternalDNSIngressHostnameSource]
+	return ok
+}
+
+func shouldDeleteIngress(ingress *networkingv1.Ingress) bool {
+	if ingress == nil || ingress.Annotations == nil {
+		return false
+	}
+	disabledValue := ingress.Annotations[controller.IngressDisabledAnnotation]
+	if disabledValue == "" {
+		return false
+	}
+	switch disabledValue {
+	case controller.IngressDisabledReasonNormal:
+		return isDisabledIngress(ingress)
+	case controller.IngressDisabledReasonExternalDNS:
+		if ingress.Annotations[controller.ExternalDNSIngressHostnameSource] == "" {
+			return false
+		}
+		if _, ok := ingress.Annotations[controller.OriginalExternalDNSHostname]; ok {
+			return true
+		}
+		if _, ok := ingress.Annotations[controller.OriginalExternalDNSIngressHostnameSource]; ok {
+			return true
+		}
+		return false
+	default:
+		return false
+	}
+}
+
+func checkDeleteEligibility(
+	ctx context.Context,
+	cli client.Client,
+	manager *utils.HTTPRouteManager,
+	ingress *networkingv1.Ingress,
+) (bool, string, error) {
+	if ingress == nil {
+		return false, "missing ingress", nil
+	}
+	if ingress.Annotations == nil || ingress.Annotations[controller.IngressDisabledAnnotation] == "" {
+		return false, "missing ingress-doperator disabled annotation", nil
+	}
+	if !shouldDeleteIngress(ingress) {
+		return false, "disabled annotation does not satisfy delete criteria", nil
+	}
+
+	hasRoute, hasGateway, err := hasManagedResources(ctx, cli, manager, ingress)
+	if err != nil {
+		return false, "", err
+	}
+	if !hasRoute && !hasGateway {
+		return false, "missing managed HTTPRoute and Gateway", nil
+	}
+	if !hasRoute {
+		return false, "missing managed HTTPRoute", nil
+	}
+	if !hasGateway {
+		return false, "missing managed Gateway", nil
+	}
+	return true, "", nil
 }
 
 func removeManagedHTTPRoutes(
@@ -216,6 +456,45 @@ func removeManagedHTTPRoutes(
 	}
 
 	return nil
+}
+
+func hasManagedResources(
+	ctx context.Context,
+	cli client.Client,
+	manager *utils.HTTPRouteManager,
+	ingress *networkingv1.Ingress,
+) (bool, bool, error) {
+	if manager == nil || ingress == nil {
+		return false, false, nil
+	}
+	routes, err := manager.GetHTTPRoutesWithPrefix(ctx, ingress.Namespace, ingress.Name)
+	if err != nil {
+		return false, false, err
+	}
+	hasRoute := false
+	for _, route := range routes {
+		httpRoute := route
+		if utils.IsManagedByUsForIngress(&httpRoute, ingress.Namespace, ingress.Name) {
+			hasRoute = true
+			break
+		}
+	}
+	if !hasRoute {
+		return false, false, nil
+	}
+
+	gateways := &gatewayv1.GatewayList{}
+	if err := cli.List(ctx, gateways); err != nil {
+		return false, false, err
+	}
+	for i := range gateways.Items {
+		gateway := &gateways.Items[i]
+		if utils.IsManagedByUsWithIngress(gateway, ingress.Namespace, ingress.Name) {
+			return true, true, nil
+		}
+	}
+
+	return hasRoute, false, nil
 }
 
 func removeAutomaticSnippetsFilter(ctx context.Context, cli client.Client, ingress *networkingv1.Ingress) error {

@@ -102,7 +102,7 @@ The following table lists the configurable parameters of the ingress-doperator c
 | `operator.enableDeletion` | Delete resources when Ingress is deleted | `false` |
 | `operator.hostnameRewriteFrom` | Comma-separated domain suffixes to match | `""` |
 | `operator.hostnameRewriteTo` | Comma-separated replacement domain suffixes | `""` |
-| `operator.ingressPostProcessing` | How to postprocess Ingress: `none`, `disable`, or `remove` | `"none"` |
+| `operator.ingressPostProcessing` | How to postprocess Ingress: `none`, `disable`, `remove`, or `disable-external-dns` | `"none"` |
 | `operator.private` | Apply private annotations to all Gateways | `false` |
 | `operator.privateIngressClassPattern` | Pattern for private ingress classes | `"*private*"` |
 | `operator.leaderElect` | Enable leader election | `false` |

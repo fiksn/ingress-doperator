@@ -251,6 +251,8 @@ func main() {
 		setupLog.Info("Ingress post processing mode: disable")
 	case controller.IngressPostProcessingModeRemove:
 		setupLog.Info("Ingress post processing mode: remove")
+	case controller.IngressPostProcessingModeDisableExternalDNS:
+		setupLog.Info("Ingress post processing mode: disable-external-dns")
 	}
 
 	// +kubebuilder:scaffold:builder
@@ -360,7 +362,8 @@ func parseOperatorConfig() (operatorConfig, zap.Options, error) {
 			"Must have same number of items as --hostname-rewrite-from.")
 	flag.StringVar(&cfg.IngressPostProcessing, "ingress-postprocessing", "none",
 		"How to handle the post processing of ingress: 'none' (no action), "+
-			"'disable' (remove ingress class), 'remove' (delete ingress)")
+			"'disable' (remove ingress class), 'remove' (delete ingress), "+
+			"'disable-external-dns' (force external-dns to read annotations only)")
 	flag.StringVar(&cfg.GatewayAnnotations, "gateway-annotations", DefaultGatewayAnnotations,
 		"Comma-separated key=value pairs for Gateway metadata annotations (applied to all Gateways)")
 	flag.StringVar(&cfg.GatewayInfraAnnotations, "gateway-infrastructure-annotations",
@@ -469,9 +472,11 @@ func parseIngressPostProcessingMode(value string) (controller.IngressPostProcess
 		return controller.IngressPostProcessingModeDisable, nil
 	case "remove":
 		return controller.IngressPostProcessingModeRemove, nil
+	case "disable-external-dns":
+		return controller.IngressPostProcessingModeDisableExternalDNS, nil
 	default:
 		return controller.IngressPostProcessingModeNone,
-			fmt.Errorf("invalid ingress-post-processing value %q (allowed: none, disable, remove)", value)
+			fmt.Errorf("invalid ingress-post-processing value %q (allowed: none, disable, remove, disable-external-dns)", value)
 	}
 }
 
