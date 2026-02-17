@@ -457,6 +457,10 @@ func parseOperatorConfig() (operatorConfig, zap.Options, error) {
 
 	cfg.GatewayFilters = splitCSV(cfg.GatewayAnnotationFilters)
 	cfg.HTTPRouteFilters = splitCSV(cfg.HTTPRouteAnnotationFilters)
+	if cfg.IngressPostProcessingMode == controller.IngressPostProcessingModeDisableExternalDNS {
+		cfg.GatewayFilters = appendFilterIfMissing(cfg.GatewayFilters, "external-dns.alpha.kubernetes.io")
+		cfg.HTTPRouteFilters = appendFilterIfMissing(cfg.HTTPRouteFilters, "external-dns.alpha.kubernetes.io")
+	}
 	cfg.GatewayAnnotationsMap = parseKeyValueCSV(cfg.GatewayAnnotations)
 	cfg.GatewayInfraAnnotationsMap = parseKeyValueCSV(cfg.GatewayInfraAnnotations)
 	cfg.PrivateInfraAnnotationsMap = parseKeyValueCSV(cfg.PrivateAnnotations)
@@ -609,6 +613,15 @@ func splitCSV(raw string) []string {
 		return nil
 	}
 	return strings.Split(raw, ",")
+}
+
+func appendFilterIfMissing(filters []string, value string) []string {
+	for _, item := range filters {
+		if strings.TrimSpace(item) == value {
+			return filters
+		}
+	}
+	return append(filters, value)
 }
 
 func parseKeyValueCSV(raw string) map[string]string {

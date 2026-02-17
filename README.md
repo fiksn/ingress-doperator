@@ -10,9 +10,13 @@ It can transparently create `Gateway`, `Httproute` (and possibly
 `SnippetsFilter` to translate known `nginx.ingress.kubernetes.io`
 annotations) from `Ingress` resources.
 Depending on `--ingress-postprocessing` it can either ("disable") disable the
-original ingress, remove it completely ("remove"), force external-dns to only
-read annotations ("disable-external-dns"), or just leave it (for future
-reference).
+original ingress, disable DNS records using external-dns ("disable-external-dns"),
+remove it completely ("remove") or just leave it (for future reference).
+
+If you use [external-dns](https://github.com/kubernetes-sigs/external-dns) on your cluster the simplest
+option is `--ingress-postprocessing disable-external-dns` to just "move" DNS records from `Ingress` to `Httproute`.
+In case anything goes wrong you can stop the operator and use [reenabler](#re-enabling-disabled-ingresses)
+CLI tool to get old state back with `--restore-external-dns` flag.
 
 !!! Nginx ingress controller is [deprecated](https://kubernetes.io/blog/2025/11/11/ingress-nginx-retirement/) and
 will not get security updates after March 2026 !!!
@@ -710,10 +714,8 @@ spec:
 
 ## Re-enabling disabled Ingresses
 
-The `reenabler` CLI restores Ingresses that were disabled via
-`--ingress-postprocessing=disable` by restoring the original ingress class and
-removing ingress-doperator disable annotations. It also deletes managed
-HTTPRoutes generated from those Ingresses.
+The `reenabler` CLI tool can restore Ingresses that were disabled via
+operator.
 
 Build and run:
 
@@ -734,22 +736,10 @@ Remove managed HTTPRoutes and automatic SnippetsFilters:
 ./bin/reenabler --remove-derived-resources
 ```
 
-Restore external-dns annotations saved by ingress-doperator:
+Restore DNS:
 
 ```bash
 ./bin/reenabler --restore-external-dns=true
-```
-
-Skip restoring external-dns annotations:
-
-```bash
-./bin/reenabler --restore=false
-```
-
-Restore only ingress class settings:
-
-```bash
-./bin/reenabler --restore-class=true
 ```
 
 Delete disabled Ingresses managed by ingress-doperator:

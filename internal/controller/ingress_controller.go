@@ -68,10 +68,10 @@ const (
 	DisabledIngressClassController           = "dummy.io/no-controller"
 	IngressDisabledReasonNormal              = "normal"
 	IngressDisabledReasonExternalDNS         = "external-dns"
-	DefaultGatewayAnnotationFilters          = "ingress.kubernetes.io,cert-manager.io," +
+	DefaultGatewayAnnotationFilters          = "ingress.kubernetes.io," +
 		"nginx.ingress.kubernetes.io,kubectl.kubernetes.io,kubernetes.io/ingress.class," +
 		"traefik.ingress.kubernetes.io,ingress-doperator.fiction.si"
-	DefaultHTTPRouteAnnotationFilters = "ingress.kubernetes.io,cert-manager.io," +
+	DefaultHTTPRouteAnnotationFilters = "ingress.kubernetes.io," +
 		"nginx.ingress.kubernetes.io,kubectl.kubernetes.io,kubernetes.io/ingress.class," +
 		"traefik.ingress.kubernetes.io,ingress-doperator.fiction.si"
 )
