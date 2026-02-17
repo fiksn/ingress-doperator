@@ -59,6 +59,7 @@ const (
 	ExternalDNSHostnameAnnotation            = "external-dns.alpha.kubernetes.io/hostname"
 	OriginalExternalDNSHostname              = "ingress-doperator.fiction.si/original-external-dns-hostname"
 	OriginalExternalDNSIngressHostnameSource = "ingress-doperator.fiction.si/original-external-dns-ingress-hostname-source"
+	ExternalDNSHostnameSourceAnnotationOnly  = "annotation-only"
 	FinalizerName                            = "ingress-doperator.fiction.si/finalizer"
 	HTTPRouteSnippetsFilterAnnotation        = "ingress-doperator.fiction.si/httproute-snippets-filter"
 	HTTPRouteAuthenticationAnnotation        = "ingress-doperator.fiction.si/httproute-authentication-filter"
@@ -289,7 +290,7 @@ func (r *IngressReconciler) shouldSkipIngress(
 		return true
 	}
 
-	if ingress.Annotations != nil && ingress.Annotations[IngressDisabledAnnotation] == IngressDisabledReasonNormal {
+	if ingress.Annotations != nil && ingress.Annotations[IngressDisabledAnnotation] != "" {
 		logger.V(1).Info("Ingress is disabled, skipping reconciliation",
 			"namespace", ingress.Namespace,
 			"name", ingress.Name)
@@ -1116,11 +1117,11 @@ func (r *IngressReconciler) disableExternalDNS(ctx context.Context, ingress *net
 		modified = true
 	}
 
-	if ingress.Annotations[ExternalDNSIngressHostnameSource] != "annotation-only" {
-		ingress.Annotations[ExternalDNSIngressHostnameSource] = "annotation-only"
+	if ingress.Annotations[ExternalDNSIngressHostnameSource] != ExternalDNSHostnameSourceAnnotationOnly {
+		ingress.Annotations[ExternalDNSIngressHostnameSource] = ExternalDNSHostnameSourceAnnotationOnly
 		modified = true
 		logger.Info("Set external-dns ingress hostname source to annotation-only",
-			"value", "annotation-only")
+			"value", ExternalDNSHostnameSourceAnnotationOnly)
 	}
 
 	if !modified {
