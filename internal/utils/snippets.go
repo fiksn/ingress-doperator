@@ -72,6 +72,10 @@ const (
 	contentTypeNosniffKey    = "content-type-nosniff"
 	referrerPolicyKey        = "referrer-policy"
 	sslProxyHeadersKey       = "ssl-proxy-headers"
+	allowlistSourceRangeKey  = "allowlist-source-range"
+	whitelistSourceRangeKey  = "whitelist-source-range"
+	denylistSourceRangeKey   = "denylist-source-range"
+	blacklistSourceRangeKey  = "blacklist-source-range"
 )
 
 var nginxIngressDirectiveWhitelist = map[string]struct{}{
@@ -390,6 +394,8 @@ type nginxIngressSnippetState struct {
 	contentTypeNosniff    bool
 	referrerPolicy        string
 	sslProxyHeaders       []sslProxyHeader
+	whitelistSourceRanges []string
+	blacklistSourceRanges []string
 	warnings              []string
 }
 
@@ -428,11 +434,27 @@ func ingestNginxIngressAnnotations(annotations map[string]string, keys []ingress
 }
 
 func applyIngressAnnotationValue(state *nginxIngressSnippetState, suffix, value string) bool {
+	parsedRanges := func(raw string) []string {
+		return ParseCommaSeparatedAnnotation(map[string]string{"value": raw}, "value")
+	}
+
 	switch suffix {
 	case configurationSnippetKey, serverSnippetKey, authSnippetKey:
 		return true
 	case proxyBodySizeKey:
 		state.proxyBodySizeValue = value
+		return true
+	case allowlistSourceRangeKey, whitelistSourceRangeKey:
+		state.whitelistSourceRanges = append(
+			state.whitelistSourceRanges,
+			parsedRanges(value)...,
+		)
+		return true
+	case denylistSourceRangeKey, blacklistSourceRangeKey:
+		state.blacklistSourceRanges = append(
+			state.blacklistSourceRanges,
+			parsedRanges(value)...,
+		)
 		return true
 	case clientMaxBodySizeKey:
 		state.clientMaxBodySize = value
@@ -585,7 +607,44 @@ func buildNginxSnippetBlocks(lines []string, state nginxIngressSnippetState) []m
 		})
 	}
 
+	locationLines := make([]string, 0)
+	for _, cidr := range uniqueStrings(state.blacklistSourceRanges) {
+		locationLines = append(locationLines, fmt.Sprintf("deny %s;", cidr))
+	}
+	for _, cidr := range uniqueStrings(state.whitelistSourceRanges) {
+		locationLines = append(locationLines, fmt.Sprintf("allow %s;", cidr))
+	}
+	if len(state.whitelistSourceRanges) > 0 {
+		locationLines = append(locationLines, "deny all;")
+	}
+	if len(locationLines) > 0 {
+		snippets = append(snippets, map[string]interface{}{
+			"context": "http.server.location",
+			"value":   strings.Join(locationLines, "\n"),
+		})
+	}
+
 	return snippets
+}
+
+func uniqueStrings(values []string) []string {
+	if len(values) == 0 {
+		return values
+	}
+	seen := make(map[string]struct{}, len(values))
+	out := make([]string, 0, len(values))
+	for _, value := range values {
+		trimmed := strings.TrimSpace(value)
+		if trimmed == "" {
+			continue
+		}
+		if _, ok := seen[trimmed]; ok {
+			continue
+		}
+		seen[trimmed] = struct{}{}
+		out = append(out, trimmed)
+	}
+	return out
 }
 
 func escapeHeaderValue(value string) string {

@@ -458,8 +458,10 @@ func parseOperatorConfig() (operatorConfig, zap.Options, error) {
 	cfg.GatewayFilters = splitCSV(cfg.GatewayAnnotationFilters)
 	cfg.HTTPRouteFilters = splitCSV(cfg.HTTPRouteAnnotationFilters)
 	if cfg.IngressPostProcessingMode == controller.IngressPostProcessingModeDisableExternalDNS {
-		cfg.GatewayFilters = appendFilterIfMissing(cfg.GatewayFilters, "external-dns.alpha.kubernetes.io")
-		cfg.HTTPRouteFilters = appendFilterIfMissing(cfg.HTTPRouteFilters, "external-dns.alpha.kubernetes.io")
+		cfg.GatewayFilters = appendFilterIfMissing(cfg.GatewayFilters, controller.ExternalDNSIngressHostnameSource)
+		cfg.GatewayFilters = appendFilterIfMissing(cfg.GatewayFilters, controller.ExternalDNSHostnameAnnotation)
+		cfg.HTTPRouteFilters = appendFilterIfMissing(cfg.HTTPRouteFilters, controller.ExternalDNSIngressHostnameSource)
+		cfg.HTTPRouteFilters = appendFilterIfMissing(cfg.HTTPRouteFilters, controller.ExternalDNSHostnameAnnotation)
 	}
 	cfg.GatewayAnnotationsMap = parseKeyValueCSV(cfg.GatewayAnnotations)
 	cfg.GatewayInfraAnnotationsMap = parseKeyValueCSV(cfg.GatewayInfraAnnotations)
