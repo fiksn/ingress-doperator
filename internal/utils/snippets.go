@@ -831,14 +831,10 @@ func EnsureSnippetsFilterCopyForHTTPRoute(
 	desired.SetAnnotations(annotations)
 	desired.Object["spec"] = spec
 
-	if scheme != nil && ownerHTTPRouteName != "" {
-		owner := &gatewayv1.HTTPRoute{}
-		if err := c.Get(ctx, types.NamespacedName{Namespace: destNamespace, Name: ownerHTTPRouteName}, owner); err == nil {
-			if err := controllerutil.SetControllerReference(owner, desired, scheme); err != nil {
-				return false, err
-			}
-		}
-	}
+	// Intentionally do not set an ownerRef on copied SnippetsFilters.
+	// These copies can be shared across multiple Ingresses in the same namespace.
+	// Setting a single ownerRef causes GC to delete the shared copy when that one
+	// HTTPRoute is deleted or recreated.
 
 	existing := &unstructured.Unstructured{}
 	existing.SetGroupVersionKind(gvk)
