@@ -47,6 +47,44 @@ rules:
       - get
       - update
       - patch
+  # NGINX Gateway Fabric CRDs (snippets, auth, rate limit, etc.)
+  - apiGroups:
+      - gateway.nginx.org
+    resources:
+      - snippetsfilters
+      - snippetspolicies
+      - authenticationfilters
+      - requestheadermodifierfilters
+      - ratelimitpolicies
+    verbs:
+      - get
+      - list
+      - watch
+      - create
+      - update
+      - patch
+      - delete
+  - apiGroups:
+      - gateway.nginx.org
+    resources:
+      - snippetsfilters/status
+      - snippetspolicies/status
+      - authenticationfilters/status
+      - requestheadermodifierfilters/status
+      - ratelimitpolicies/status
+    verbs:
+      - get
+      - update
+      - patch
+  # CRDs (used to detect installed versions)
+  - apiGroups:
+      - apiextensions.k8s.io
+    resources:
+      - customresourcedefinitions
+    verbs:
+      - get
+      - list
+      - watch
   # ReferenceGrant for cross-namespace secret access
   - apiGroups:
       - gateway.networking.k8s.io

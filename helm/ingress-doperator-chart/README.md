@@ -103,14 +103,23 @@ The following table lists the configurable parameters of the ingress-doperator c
 | `operator.hostnameRewriteFrom` | Comma-separated domain suffixes to match | `""` |
 | `operator.hostnameRewriteTo` | Comma-separated replacement domain suffixes | `""` |
 | `operator.ingressPostProcessing` | How to postprocess Ingress: `none`, `disable`, `remove`, or `disable-external-dns` | `"none"` |
+| `operator.ingressClassSnippetsFilter` | SnippetsFilter mappings for ingress class patterns | `""` |
+| `operator.ingressNameSnippetsFilter` | SnippetsFilter mappings for ingress name patterns | `""` |
+| `operator.ingressAnnotationSnippetsAdd` | SnippetsFilter add rules based on ingress annotations | `""` |
+| `operator.ingressAnnotationSnippetsRemove` | SnippetsFilter remove rules based on ingress annotations | `""` |
+| `operator.privateAnnotations` | Comma-separated key=value pairs that define private infrastructure annotations | `"service.beta.kubernetes.io/aws-load-balancer-internal=true,service.beta.kubernetes.io/aws-load-balancer-nlb-target-type=ip,service.beta.kubernetes.io/aws-load-balancer-type=nlb"` |
 | `operator.private` | Apply private annotations to all Gateways | `false` |
 | `operator.privateIngressClassPattern` | Pattern for private ingress classes | `"*private*"` |
+| `operator.reconcileCachePersist` | Persist reconcile cache to ConfigMaps | `true` |
+| `operator.reconcileCacheMaxEntries` | Max entries in reconcile cache (0 = unlimited) | `0` |
+| `operator.clearIngressStatusOnDisable` | Clear status.loadBalancer when disabling an Ingress | `true` |
 | `operator.leaderElect` | Enable leader election | `false` |
 | `operator.metricsBindAddress` | Metrics server bind address | `"0"` (disabled) |
 | `operator.metricsSecure` | Serve metrics over HTTPS | `true` |
 | `operator.healthProbeBindAddress` | Health probe bind address | `":8081"` |
 | `operator.enableHTTP2` | Enable HTTP/2 | `false` |
 | `operator.useIngress2Gateway` | Use ingress2gateway library | `false` |
+| `operator.logVerbosity` | Log verbosity (0 = info, higher = more verbose) | `0` |
 
 ### Service Configuration
 

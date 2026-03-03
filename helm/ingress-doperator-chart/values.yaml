@@ -74,6 +74,12 @@ operator:
   # How to post process ingress
   ingressPostProcessing: "none"
 
+  # Snippets filter configuration
+  ingressClassSnippetsFilter: ""
+  ingressNameSnippetsFilter: ""
+  ingressAnnotationSnippetsAdd: ""
+  ingressAnnotationSnippetsRemove: ""
+
   # Gateway annotations (comma-separated key=value pairs)
   gatewayAnnotations: "cert-manager.io/acme-challenge-type=dns01,cert-manager.io/acme-dns01-provider=default,cert-manager.io/cluster-issuer=letsencrypt-cert-manager"
 
@@ -98,6 +104,13 @@ operator:
   ingress2GatewayProvider: "ingress-nginx"
   ingress2GatewayIngressClass: "nginx"
 
+  # Reconcile cache configuration
+  reconcileCachePersist: true
+  reconcileCacheMaxEntries: 0
+
+  # Ingress status handling on disable
+  clearIngressStatusOnDisable: true
+
   # Leader election
   leaderElect: false
 
@@ -110,6 +123,9 @@ operator:
 
   # HTTP/2 configuration
   enableHTTP2: false
+
+  # Logging verbosity (0 = info, higher = more verbose)
+  logVerbosity: 0
 
 # Service configuration for metrics and health probes
 service:

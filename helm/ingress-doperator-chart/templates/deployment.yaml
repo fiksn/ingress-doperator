@@ -52,6 +52,18 @@ spec:
             - --hostname-rewrite-to={{ .Values.operator.hostnameRewriteTo }}
             {{- end }}
             - --ingress-postprocessing={{ .Values.operator.ingressPostProcessing }}
+            {{- if .Values.operator.ingressClassSnippetsFilter }}
+            - --ingress-class-snippets-filter={{ .Values.operator.ingressClassSnippetsFilter }}
+            {{- end }}
+            {{- if .Values.operator.ingressNameSnippetsFilter }}
+            - --ingress-name-snippets-filter={{ .Values.operator.ingressNameSnippetsFilter }}
+            {{- end }}
+            {{- if .Values.operator.ingressAnnotationSnippetsAdd }}
+            - --ingress-annotation-snippets-add={{ .Values.operator.ingressAnnotationSnippetsAdd }}
+            {{- end }}
+            {{- if .Values.operator.ingressAnnotationSnippetsRemove }}
+            - --ingress-annotation-snippets-remove={{ .Values.operator.ingressAnnotationSnippetsRemove }}
+            {{- end }}
             {{- if .Values.operator.gatewayAnnotations }}
             - --gateway-annotations={{ .Values.operator.gatewayAnnotations }}
             {{- end }}
@@ -67,6 +79,15 @@ spec:
             - --private-ingress-class-pattern={{ .Values.operator.privateIngressClassPattern }}
             - --gateway-annotation-filters={{ .Values.operator.gatewayAnnotationFilters }}
             - --httproute-annotation-filters={{ .Values.operator.httpRouteAnnotationFilters }}
+            {{- if not .Values.operator.reconcileCachePersist }}
+            - --reconcile-cache-persist=false
+            {{- end }}
+            {{- if gt (.Values.operator.reconcileCacheMaxEntries | int) 0 }}
+            - --reconcile-cache-max-entries={{ .Values.operator.reconcileCacheMaxEntries }}
+            {{- end }}
+            {{- if not .Values.operator.clearIngressStatusOnDisable }}
+            - --clear-ingress-status-on-disable=false
+            {{- end }}
             {{- if .Values.operator.useIngress2Gateway }}
             - --use-ingress2gateway=true
             - --ingress2gateway-provider={{ .Values.operator.ingress2GatewayProvider }}
@@ -84,6 +105,9 @@ spec:
             {{- end }}
             {{- if .Values.operator.enableHTTP2 }}
             - --enable-http2=true
+            {{- end }}
+            {{- if gt (.Values.operator.logVerbosity | int) 0 }}
+            - --v={{ .Values.operator.logVerbosity }}
             {{- end }}
             {{- if .Values.certificates.metrics.path }}
             - --metrics-cert-path={{ .Values.certificates.metrics.path }}
