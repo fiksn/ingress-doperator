@@ -72,6 +72,8 @@ func main() {
 	var ingressAnnotationSnippetsRemove string
 	var useIngress2Gateway bool
 	var ingressClassFilter string
+	var ingressClassIgnoreFilter string
+	var ingressClassEmpty string
 	var verbosity int
 
 	flag.StringVar(&metricsAddr, "metrics-bind-address", ":8080",
@@ -122,8 +124,13 @@ func main() {
 	flag.StringVar(&ingress2GatewayIngressClass, "ingress2gateway-ingress-class", "nginx",
 		"Ingress class name for provider-specific filtering in ingress2gateway")
 	flag.StringVar(&ingressClassFilter, "ingress-class-filter", "*",
-		"Glob pattern to filter which ingress classes to process (e.g., '*private*', 'nginx', '*'). "+
-			"Default '*' processes all classes.")
+		"Comma-separated list of glob patterns to filter which ingress classes to process "+
+			"(e.g., '*private*', 'nginx', '*'). Default '*' processes all classes.")
+	flag.StringVar(&ingressClassIgnoreFilter, "ingress-class-ignore", "",
+		"Comma-separated list of glob patterns for ingress classes to ignore. "+
+			"If an ingress class matches this list, it is skipped even if it matches --ingress-class-filter.")
+	flag.StringVar(&ingressClassEmpty, "ingress-class-empty", "none",
+		"Value to use when an Ingress has no class set. This value is matched against class filters.")
 	flag.IntVar(&verbosity, "v", 0, "Log verbosity (0 = info, higher = more verbose)")
 
 	opts := zap.Options{
@@ -240,7 +247,9 @@ func main() {
 		Client:                          mgr.GetClient(),
 		Scheme:                          mgr.GetScheme(),
 		Translator:                      trans,
-		IngressClassFilter:              ingressClassFilter,
+		IngressClassFilters:             ingressClassFilters,
+		IngressClassIgnoreFilters:       ingressClassIgnoreFilters,
+		IngressClassEmpty:               ingressClassEmpty,
 		IngressClassSnippetsFilters:     parsedSnippetsFilters,
 		IngressNameSnippetsFilters:      parsedNameSnippetsFilters,
 		IngressAnnotationSnippetsAdd:    parsedAnnotationAddRules,
@@ -276,3 +285,5 @@ func main() {
 		os.Exit(1)
 	}
 }
+	ingressClassFilters := utils.ParseCommaSeparatedList(ingressClassFilter)
+	ingressClassIgnoreFilters := utils.ParseCommaSeparatedList(ingressClassIgnoreFilter)

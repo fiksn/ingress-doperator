@@ -21,6 +21,7 @@ import (
 	"fmt"
 	"path/filepath"
 	"sort"
+	"strings"
 	"sync"
 	"time"
 
@@ -113,7 +114,9 @@ type IngressReconciler struct {
 	PrivateInfrastructureAnnotations map[string]string
 	ApplyPrivateToAll                bool
 	PrivateIngressClassPattern       string
-	IngressClassFilter               string
+	IngressClassFilters              []string
+	IngressClassIgnoreFilters        []string
+	IngressClassEmpty                string
 	UseIngress2Gateway               bool
 	Ingress2GatewayProvider          string
 	Ingress2GatewayIngressClass      string
@@ -282,11 +285,20 @@ func (r *IngressReconciler) shouldSkipIngress(
 		return true
 	}
 
+	if r.matchesIngressClassIgnoreFilter(ingress) {
+		ingressClass := r.getIngressClass(ingress)
+		logger.V(1).Info("Ingress class matches ignore filter, skipping reconciliation",
+			"ingressClass", ingressClass,
+			"ignoreFilter", strings.Join(r.IngressClassIgnoreFilters, ","))
+		metrics.IngressReconcileSkipsTotal.WithLabelValues("class-ignore", ingress.Namespace, ingress.Name).Inc()
+		return true
+	}
+
 	if !r.matchesIngressClassFilter(ingress) {
 		ingressClass := r.getIngressClass(ingress)
 		logger.V(1).Info("Ingress class does not match filter, skipping reconciliation",
 			"ingressClass", ingressClass,
-			"filter", r.IngressClassFilter)
+			"filter", strings.Join(r.IngressClassFilters, ","))
 		metrics.IngressReconcileSkipsTotal.WithLabelValues("class-filter", ingress.Namespace, ingress.Name).Inc()
 		return true
 	}
@@ -1280,35 +1292,47 @@ func (r *IngressReconciler) getIngressClass(ingress *networkingv1.Ingress) strin
 		}
 	}
 
+	if r.IngressClassEmpty != "" {
+		return r.IngressClassEmpty
+	}
 	return ""
 }
 
-// matchesIngressClassFilter checks if the Ingress class matches the configured filter pattern
+// matchesIngressClassFilter checks if the Ingress class matches any configured filter pattern
 func (r *IngressReconciler) matchesIngressClassFilter(ingress *networkingv1.Ingress) bool {
-	// Default filter "*" matches everything
-	if r.IngressClassFilter == "" {
+	return matchIngressClassPatterns(r.IngressClassFilters, r.getIngressClass(ingress), "ingress class filter")
+}
+
+func (r *IngressReconciler) matchesIngressClassIgnoreFilter(ingress *networkingv1.Ingress) bool {
+	return matchIngressClassPatterns(r.IngressClassIgnoreFilters, r.getIngressClass(ingress), "ingress class ignore filter")
+}
+
+func matchIngressClassPatterns(patterns []string, ingressClass, label string) bool {
+	if len(patterns) == 0 {
 		return false
 	}
-	if r.IngressClassFilter == "*" {
-		return true
+	for _, pattern := range patterns {
+		if pattern == "*" {
+			return true
+		}
 	}
-
-	ingressClass := r.getIngressClass(ingress)
-
-	// Empty ingress class only matches "*"
 	if ingressClass == "" {
 		return false
 	}
-
-	// Use filepath.Match for glob pattern matching
-	matched, err := filepath.Match(r.IngressClassFilter, ingressClass)
-	if err != nil {
-		// If pattern is invalid, log error and don't match
-		log.Log.Error(err, "Invalid ingress class filter pattern", "pattern", r.IngressClassFilter)
-		return false
+	for _, pattern := range patterns {
+		if pattern == "" || pattern == "*" {
+			continue
+		}
+		matched, err := filepath.Match(pattern, ingressClass)
+		if err != nil {
+			log.Log.Error(err, "Invalid ingress class filter pattern", "pattern", pattern, "filterType", label)
+			continue
+		}
+		if matched {
+			return true
+		}
 	}
-
-	return matched
+	return false
 }
 
 func (r *IngressReconciler) applyGateway(

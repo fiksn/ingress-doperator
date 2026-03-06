@@ -39,6 +39,10 @@ spec:
             - --watch-namespace={{ .Values.operator.watchNamespace }}
             {{- end }}
             - --ingress-class-filter={{ .Values.operator.ingressClassFilter }}
+            {{- if .Values.operator.ingressClassIgnoreFilter }}
+            - --ingress-class-ignore={{ .Values.operator.ingressClassIgnoreFilter }}
+            {{- end }}
+            - --ingress-class-empty={{ .Values.operator.ingressClassEmpty }}
             {{- if .Values.operator.oneGatewayPerIngress }}
             - --one-gateway-per-ingress=true
             {{- end }}

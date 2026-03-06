@@ -97,7 +97,9 @@ The following table lists the configurable parameters of the ingress-doperator c
 | `operator.gatewayName` | Name of the Gateway resource | `ingress-gateway` |
 | `operator.gatewayClassName` | GatewayClass to use | `nginx` |
 | `operator.watchNamespace` | Namespace to watch (empty = all namespaces) | `""` |
-| `operator.ingressClassFilter` | Glob pattern to filter ingress classes | `"*"` |
+| `operator.ingressClassFilter` | Comma-separated glob patterns to filter ingress classes | `"*"` |
+| `operator.ingressClassIgnoreFilter` | Comma-separated glob patterns for ingress classes to ignore | `""` |
+| `operator.ingressClassEmpty` | Value used when an Ingress has no class set | `"none"` |
 | `operator.oneGatewayPerIngress` | Create separate Gateway per Ingress | `false` |
 | `operator.enableDeletion` | Delete resources when Ingress is deleted | `false` |
 | `operator.hostnameRewriteFrom` | Comma-separated domain suffixes to match | `""` |

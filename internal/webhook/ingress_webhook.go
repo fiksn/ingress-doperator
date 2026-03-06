@@ -22,6 +22,7 @@ import (
 	"fmt"
 	"net/http"
 	"path/filepath"
+	"strings"
 
 	networkingv1 "k8s.io/api/networking/v1"
 	"k8s.io/apimachinery/pkg/runtime"
@@ -51,7 +52,9 @@ type IngressMutator struct {
 	decoder                         admission.Decoder
 	Scheme                          *runtime.Scheme
 	Translator                      *translator.Translator
-	IngressClassFilter              string
+	IngressClassFilters             []string
+	IngressClassIgnoreFilters       []string
+	IngressClassEmpty               string
 	IngressClassSnippetsFilters     []utils.IngressClassSnippetsFilter
 	IngressNameSnippetsFilters      []utils.IngressClassSnippetsFilter
 	IngressAnnotationSnippetsAdd    []utils.IngressAnnotationSnippetsRule
@@ -79,12 +82,21 @@ func (m *IngressMutator) Handle(ctx context.Context, req admission.Request) admi
 		return admission.Allowed("ignored")
 	}
 
+	// Check if this Ingress matches the ingress class ignore filter
+	if m.matchesIngressClassIgnoreFilter(ingress) {
+		ingressClass := m.getIngressClass(ingress)
+		logger.Info("Ingress class matches ignore filter, allowing without mutation",
+			"ingressClass", ingressClass,
+			"ignoreFilter", strings.Join(m.IngressClassIgnoreFilters, ","))
+		return admission.Allowed("ingress class ignored")
+	}
+
 	// Check if this Ingress matches the ingress class filter
 	if !m.matchesIngressClassFilter(ingress) {
 		ingressClass := m.getIngressClass(ingress)
 		logger.Info("Ingress class does not match filter, allowing without mutation",
 			"ingressClass", ingressClass,
-			"filter", m.IngressClassFilter)
+			"filter", strings.Join(m.IngressClassFilters, ","))
 		return admission.Allowed("ingress class filtered")
 	}
 
@@ -574,34 +586,47 @@ func (m *IngressMutator) getIngressClass(ingress *networkingv1.Ingress) string {
 		}
 	}
 
+	if m.IngressClassEmpty != "" {
+		return m.IngressClassEmpty
+	}
 	return ""
 }
 
-// matchesIngressClassFilter checks if the Ingress class matches the configured filter pattern
+// matchesIngressClassFilter checks if the Ingress class matches any configured filter pattern
 func (m *IngressMutator) matchesIngressClassFilter(ingress *networkingv1.Ingress) bool {
-	// Default filter "*" matches everything
-	if m.IngressClassFilter == "" {
+	return matchIngressClassPatterns(m.IngressClassFilters, m.getIngressClass(ingress), "ingress class filter")
+}
+
+func (m *IngressMutator) matchesIngressClassIgnoreFilter(ingress *networkingv1.Ingress) bool {
+	return matchIngressClassPatterns(m.IngressClassIgnoreFilters, m.getIngressClass(ingress), "ingress class ignore filter")
+}
+
+func matchIngressClassPatterns(patterns []string, ingressClass, label string) bool {
+	if len(patterns) == 0 {
 		return false
 	}
-	if m.IngressClassFilter == "*" {
-		return true
+	for _, pattern := range patterns {
+		if pattern == "*" {
+			return true
+		}
 	}
-
-	ingressClass := m.getIngressClass(ingress)
-
-	// Empty ingress class only matches "*"
 	if ingressClass == "" {
 		return false
 	}
-
-	// Use filepath.Match for glob pattern matching
-	matched, err := filepath.Match(m.IngressClassFilter, ingressClass)
-	if err != nil {
-		// If pattern is invalid, log error and don't match
-		log.FromContext(context.Background()).Error(err, "Invalid ingress class filter pattern",
-			"pattern", m.IngressClassFilter)
-		return false
+	for _, pattern := range patterns {
+		if pattern == "" || pattern == "*" {
+			continue
+		}
+		matched, err := filepath.Match(pattern, ingressClass)
+		if err != nil {
+			log.FromContext(context.Background()).Error(err, "Invalid ingress class filter pattern",
+				"pattern", pattern,
+				"filterType", label)
+			continue
+		}
+		if matched {
+			return true
+		}
 	}
-
-	return matched
+	return false
 }

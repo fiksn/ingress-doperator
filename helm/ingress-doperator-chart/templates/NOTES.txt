@@ -15,6 +15,9 @@ Configuration:
 - Watching: All namespaces
 {{- end }}
 - Ingress Class Filter: {{ .Values.operator.ingressClassFilter }}
+{{- if .Values.operator.ingressClassIgnoreFilter }}
+- Ingress Class Ignore Filter: {{ .Values.operator.ingressClassIgnoreFilter }}
+{{- end }}
 - One Gateway Per Ingress: {{ .Values.operator.oneGatewayPerIngress }}
 - Enable Deletion: {{ .Values.operator.enableDeletion }}
 

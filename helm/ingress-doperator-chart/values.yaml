@@ -58,8 +58,14 @@ operator:
   # Namespace to watch (empty means all namespaces)
   watchNamespace: ""
 
-  # Ingress class filter (glob pattern, default "*" processes all)
+  # Ingress class filter (comma-separated glob patterns, default "*" processes all)
   ingressClassFilter: "*"
+
+  # Ingress class ignore filter (comma-separated glob patterns, empty = no ignores)
+  ingressClassIgnoreFilter: ""
+
+  # Ingress class empty value (used when no class set)
+  ingressClassEmpty: "none"
 
   # If true, create a separate Gateway for each Ingress
   oneGatewayPerIngress: false

@@ -263,7 +263,12 @@ webhooks:
 --gateway-annotations string                Comma-separated key=value pairs for Gateway annotations
 --gateway-annotation-filters string         Comma-separated list of annotation prefixes to exclude from Gateway
 --httproute-annotation-filters string       Comma-separated list of annotation prefixes to exclude from HTTPRoute
---ingress-class-filter string               Glob pattern to filter which ingress classes to process (default: "*")
+--ingress-class-filter string               Comma-separated list of glob patterns to filter which ingress classes to process
+                                            (default: "*")
+--ingress-class-ignore string               Comma-separated list of glob patterns for ingress classes to ignore
+                                            (default: "")
+--ingress-class-empty string                Value to use when an Ingress has no class set
+                                            (default: "none")
 --ingress-class-snippets-filter string      Comma-separated list of pattern:snippetsFilterName entries
 --ingress-name-snippets-filter string       Comma-separated list of pattern:snippetsFilterName entries
 --ingress-annotation-snippets-add string    Semicolon-separated list of key=value:filter1,filter2 entries
@@ -462,7 +467,12 @@ The operator accepts the following command-line flags:
 --gateway-class-name string                   GatewayClass for created Gateway resources (default: "nginx")
 --watch-namespace string                      If specified, only watch Ingresses in this namespace
                                               (default: watch all namespaces)
---ingress-class-filter string                 Glob pattern to filter which ingress classes to process (default: "*")
+--ingress-class-filter string                 Comma-separated list of glob patterns to filter which ingress classes to process
+                                              (default: "*")
+--ingress-class-ignore string                 Comma-separated list of glob patterns for ingress classes to ignore
+                                              (default: "")
+--ingress-class-empty string                  Value to use when an Ingress has no class set
+                                              (default: "none")
 --one-gateway-per-ingress                     Create a separate Gateway for each Ingress with the same name
                                               (default: false)
 --enable-deletion                             Delete HTTPRoute and Gateway when Ingress is deleted

@@ -191,7 +191,9 @@ func main() {
 		PrivateInfrastructureAnnotations: cfg.PrivateInfraAnnotationsMap,
 		ApplyPrivateToAll:                cfg.Private,
 		PrivateIngressClassPattern:       cfg.PrivateIngressClassPattern,
-		IngressClassFilter:               cfg.IngressClassFilter,
+		IngressClassFilters:              cfg.IngressClassFilters,
+		IngressClassIgnoreFilters:        cfg.IngressClassIgnoreFilters,
+		IngressClassEmpty:                cfg.IngressClassEmpty,
 		IngressClassSnippetsFilters:      cfg.ParsedClassSnippetsFilters,
 		IngressNameSnippetsFilters:       cfg.ParsedNameSnippetsFilters,
 		IngressAnnotationSnippetsAdd:     cfg.ParsedAnnotationSnippetsAdd,
@@ -309,6 +311,8 @@ type operatorConfig struct {
 	PrivateAnnotations              string
 	PrivateIngressClassPattern      string
 	IngressClassFilter              string
+	IngressClassIgnoreFilter        string
+	IngressClassEmpty               string
 	IngressClassSnippetsFilters     string
 	IngressNameSnippetsFilters      string
 	IngressAnnotationSnippetsAdd    string
@@ -330,6 +334,8 @@ type operatorConfig struct {
 	GatewayAnnotationsMap          map[string]string
 	GatewayInfraAnnotationsMap     map[string]string
 	PrivateInfraAnnotationsMap     map[string]string
+	IngressClassFilters            []string
+	IngressClassIgnoreFilters      []string
 }
 
 func parseOperatorConfig() (operatorConfig, zap.Options, error) {
@@ -347,8 +353,13 @@ func parseOperatorConfig() (operatorConfig, zap.Options, error) {
 	flag.StringVar(&cfg.WatchNamespace, "watch-namespace", "",
 		"If specified, only watch Ingresses in this namespace (default: watch all namespaces)")
 	flag.StringVar(&cfg.IngressClassFilter, "ingress-class-filter", "*",
-		"Glob pattern to filter which ingress classes to process (e.g., '*private*', 'nginx', '*'). "+
-			"Default '*' processes all classes.")
+		"Comma-separated list of glob patterns to filter which ingress classes to process "+
+			"(e.g., '*private*', 'nginx', '*'). Default '*' processes all classes.")
+	flag.StringVar(&cfg.IngressClassIgnoreFilter, "ingress-class-ignore", "",
+		"Comma-separated list of glob patterns for ingress classes to ignore. "+
+			"If an ingress class matches this list, it is skipped even if it matches --ingress-class-filter.")
+	flag.StringVar(&cfg.IngressClassEmpty, "ingress-class-empty", "none",
+		"Value to use when an Ingress has no class set. This value is matched against class filters.")
 	flag.BoolVar(&cfg.OneGatewayPerIngress, "one-gateway-per-ingress", false,
 		"If true, create a separate Gateway for each Ingress with the same name")
 	flag.BoolVar(&cfg.EnableDeletion, "enable-deletion", false,
@@ -457,6 +468,8 @@ func parseOperatorConfig() (operatorConfig, zap.Options, error) {
 
 	cfg.GatewayFilters = splitCSV(cfg.GatewayAnnotationFilters)
 	cfg.HTTPRouteFilters = splitCSV(cfg.HTTPRouteAnnotationFilters)
+	cfg.IngressClassFilters = utils.ParseCommaSeparatedList(cfg.IngressClassFilter)
+	cfg.IngressClassIgnoreFilters = utils.ParseCommaSeparatedList(cfg.IngressClassIgnoreFilter)
 	if cfg.IngressPostProcessingMode == controller.IngressPostProcessingModeDisableExternalDNS {
 		cfg.GatewayFilters = appendFilterIfMissing(cfg.GatewayFilters, controller.ExternalDNSIngressHostnameSource)
 		cfg.GatewayFilters = appendFilterIfMissing(cfg.GatewayFilters, controller.ExternalDNSHostnameAnnotation)
