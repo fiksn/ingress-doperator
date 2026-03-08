@@ -339,6 +339,66 @@ func (r *IngressReconciler) shouldSkipIngress(
 	return false
 }
 
+func (r *IngressReconciler) shouldIncludeIngressForSynthesis(
+	ingress *networkingv1.Ingress,
+	logger logr.Logger,
+) bool {
+	if ingress == nil {
+		return false
+	}
+
+	if ingress.Annotations != nil && ingress.Annotations[IgnoreIngressAnnotation] == fmt.Sprintf("%t", true) {
+		logger.V(1).Info("Ingress has ignore annotation, skipping synthesis",
+			"namespace", ingress.Namespace,
+			"name", ingress.Name)
+		return false
+	}
+
+	if r.matchesIngressClassIgnoreFilter(ingress) {
+		ingressClass := r.getIngressClass(ingress)
+		logger.V(1).Info("Ingress class matches ignore filter, skipping synthesis",
+			"ingressClass", ingressClass,
+			"ignoreFilter", strings.Join(r.IngressClassIgnoreFilters, ","))
+		metrics.IngressReconcileSkipsTotal.WithLabelValues("class-ignore", ingress.Namespace, ingress.Name).Inc()
+		return false
+	}
+
+	if !r.matchesIngressClassFilter(ingress) {
+		ingressClass := r.getIngressClass(ingress)
+		logger.V(1).Info("Ingress class does not match filter, skipping synthesis",
+			"ingressClass", ingressClass,
+			"filter", strings.Join(r.IngressClassFilters, ","))
+		metrics.IngressReconcileSkipsTotal.WithLabelValues("class-filter", ingress.Namespace, ingress.Name).Inc()
+		return false
+	}
+
+	if ingress.Annotations != nil && ingress.Annotations[IngressRemovedAnnotation] == fmt.Sprintf("%t", true) {
+		logger.V(1).Info("Ingress marked for removal by ingress-doperator, skipping synthesis",
+			"namespace", ingress.Namespace,
+			"name", ingress.Name)
+		metrics.IngressReconcileSkipsTotal.WithLabelValues("removed", ingress.Namespace, ingress.Name).Inc()
+		return false
+	}
+
+	if r.getIngressClass(ingress) == DisabledIngressClassName {
+		logger.V(1).Info("Ingress uses disabled class, skipping synthesis",
+			"namespace", ingress.Namespace,
+			"name", ingress.Name)
+		metrics.IngressReconcileSkipsTotal.WithLabelValues("disabled-class", ingress.Namespace, ingress.Name).Inc()
+		return false
+	}
+
+	if r.wasSelfDeleted(ingress) {
+		logger.V(1).Info("Ingress was deleted by ingress-doperator, skipping synthesis",
+			"namespace", ingress.Namespace,
+			"name", ingress.Name)
+		metrics.IngressReconcileSkipsTotal.WithLabelValues("self-deleted", ingress.Namespace, ingress.Name).Inc()
+		return false
+	}
+
+	return true
+}
+
 func (r *IngressReconciler) resolveIngressPostProcessingMode(
 	ingress *networkingv1.Ingress,
 ) IngressPostProcessingMode {
@@ -363,6 +423,9 @@ func (r *IngressReconciler) reconcileOneGatewayPerIngress(
 	hadError := false
 
 	for _, ingress := range ingresses {
+		if !r.shouldIncludeIngressForSynthesis(&ingress, logger) {
+			continue
+		}
 		// Use translator to create Gateway and HTTPRoute
 		// Override gateway name to match ingress name for one-per-ingress mode
 		transConfig := trans.Config
@@ -444,7 +507,13 @@ func (r *IngressReconciler) reconcileSharedGateways(
 	hadError := false
 
 	// Group Ingresses by IngressClass
-	ingressesByClass := r.groupIngressesByClass(ingresses)
+	filteredIngresses := make([]networkingv1.Ingress, 0, len(ingresses))
+	for _, ingress := range ingresses {
+		if r.shouldIncludeIngressForSynthesis(&ingress, logger) {
+			filteredIngresses = append(filteredIngresses, ingress)
+		}
+	}
+	ingressesByClass := r.groupIngressesByClass(filteredIngresses)
 
 	// For each IngressClass, create a Gateway by merging listeners from all ingresses
 	for ingressClass, classIngresses := range ingressesByClass {
@@ -1484,6 +1553,9 @@ func (r *IngressReconciler) enqueueAllIngresses(ctx context.Context) []reconcile
 	}
 	requests := make([]reconcile.Request, 0, len(list.Items))
 	for _, ingress := range list.Items {
+		if !r.shouldEnqueueIngressByClass(&ingress) {
+			continue
+		}
 		requests = append(requests, reconcile.Request{
 			NamespacedName: types.NamespacedName{
 				Namespace: ingress.Namespace,
@@ -1538,6 +1610,9 @@ func (r *IngressReconciler) enqueueIngressesForSnippetsName(
 		return requests
 	}
 	for _, ingress := range list.Items {
+		if !r.shouldEnqueueIngressByClass(&ingress) {
+			continue
+		}
 		ingressClass := r.getIngressClass(&ingress)
 		for _, mapping := range r.IngressClassSnippetsFilters {
 			if mapping.Pattern == "" || mapping.Name != filterName {
@@ -1612,6 +1687,9 @@ func (r *IngressReconciler) enqueueIngressesForAnnotation(
 	}
 	requests := make([]reconcile.Request, 0, len(list.Items))
 	for _, ingress := range list.Items {
+		if !r.shouldEnqueueIngressByClass(&ingress) {
+			continue
+		}
 		names := utils.ParseCommaSeparatedAnnotation(ingress.Annotations, annotationKey)
 		for _, name := range names {
 			if name == filterName {
@@ -1666,6 +1744,19 @@ func (r *IngressReconciler) shouldSkipReconcile(ingress *networkingv1.Ingress) b
 	}
 	if time.Since(time.Unix(last.UpdatedAtUnix, 0)) > utils.ReconcileCacheTTL {
 		delete(r.ReconcileCache, key)
+		return false
+	}
+	return true
+}
+
+func (r *IngressReconciler) shouldEnqueueIngressByClass(ingress *networkingv1.Ingress) bool {
+	if ingress == nil {
+		return false
+	}
+	if r.matchesIngressClassIgnoreFilter(ingress) {
+		return false
+	}
+	if !r.matchesIngressClassFilter(ingress) {
 		return false
 	}
 	return true

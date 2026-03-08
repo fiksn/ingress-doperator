@@ -166,6 +166,8 @@ func main() {
 		setupLog.Error(err, "Invalid ingress-annotation-snippets-remove value")
 		os.Exit(1)
 	}
+	ingressClassFilters := utils.ParseCommaSeparatedList(ingressClassFilter)
+	ingressClassIgnoreFilters := utils.ParseCommaSeparatedList(ingressClassIgnoreFilter)
 
 	mgr, err := ctrl.NewManager(ctrl.GetConfigOrDie(), ctrl.Options{
 		Scheme: scheme,
@@ -285,5 +287,3 @@ func main() {
 		os.Exit(1)
 	}
 }
-	ingressClassFilters := utils.ParseCommaSeparatedList(ingressClassFilter)
-	ingressClassIgnoreFilters := utils.ParseCommaSeparatedList(ingressClassIgnoreFilter)
