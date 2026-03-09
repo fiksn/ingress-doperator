@@ -266,7 +266,10 @@ func processIngress(
 		ingress.Annotations != nil &&
 		ingress.Annotations[controller.IngressDisabledAnnotation] == controller.IngressDisabledReasonExternalDNS {
 		if err := disableExternalDNSForDerived(ctx, cli, manager, ingress); err != nil {
-			return err
+			setupLog.Info("Skipping derived external-dns update; proceeding with ingress-only restore",
+				"namespace", ingress.Namespace,
+				"name", ingress.Name,
+				"error", err)
 		}
 	}
 	if err := restoreIngressState(ctx, cli, ingress, disabled && opts.restoreClass, opts.restoreExternalDNS); err != nil {
@@ -357,6 +360,10 @@ func shouldRestoreIngress(ingress *networkingv1.Ingress, disabled bool, restoreE
 	}
 	if !restoreExternalDNS {
 		return false
+	}
+	if ingress != nil && ingress.Annotations != nil &&
+		ingress.Annotations[controller.IngressDisabledAnnotation] == controller.IngressDisabledReasonExternalDNS {
+		return true
 	}
 	return needsExternalDNSRestore(ingress)
 }
