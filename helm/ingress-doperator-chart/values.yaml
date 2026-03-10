@@ -92,14 +92,9 @@ operator:
   # Gateway infrastructure annotations (comma-separated key=value pairs)
   gatewayInfraAnnotations: ""
 
-  # Private annotations (comma-separated key=value pairs)
-  privateAnnotations: "service.beta.kubernetes.io/aws-load-balancer-internal=true,service.beta.kubernetes.io/aws-load-balancer-nlb-target-type=ip,service.beta.kubernetes.io/aws-load-balancer-type=nlb"
-
-  # If true, apply private annotations to all Gateways
-  private: false
-
-  # Glob pattern for ingress classes that should get private annotations
-  privateIngressClassPattern: "*private*"
+  # Class-based infrastructure annotations (pattern:key=value,key=value;pattern2:key=value;!:key=value as fallback)
+  annotationsByClass: "*private*:service.beta.kubernetes.io/aws-load-balancer-internal=true,service.beta.kubernetes.io/aws-load-balancer-scheme=internal;*public*:service.beta.kubernetes.io/aws-load-balancer-internal=false,service.beta.kubernetes.io/aws-load-balancer-scheme=internet-facing;*:service.beta.kubernetes.io/aws-load-balancer-nlb-target-type=ip,service.beta.kubernetes.io/aws-load-balancer-type=nlb"
+  # annotationsByClass: "*private*:service.beta.kubernetes.io/aws-load-balancer-internal=true,service.beta.kubernetes.io/aws-load-balancer-scheme=internal;*public*:service.beta.kubernetes.io/aws-load-balancer-internal=false,service.beta.kubernetes.io/aws-load-balancer-scheme=internet-facing;*:service.beta.kubernetes.io/aws-load-balancer-type=external" # when using `https://github.com/kubernetes-sigs/aws-load-balancer-controller`
 
   # Annotation filters (comma-separated prefixes to exclude)
   gatewayAnnotationFilters: "ingress.kubernetes.io,cert-manager.io,nginx.ingress.kubernetes.io,kubectl.kubernetes.io,kubernetes.io/ingress.class,traefik.ingress.kubernetes.io,ingress-doperator.fiction.si"

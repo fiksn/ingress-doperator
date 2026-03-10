@@ -500,11 +500,8 @@ The operator accepts the following command-line flags:
                                               (default: "nginx")
 --gateway-annotations string                  Comma-separated key=value pairs for Gateway metadata annotations
 --gateway-infrastructure-annotations string   Comma-separated key=value pairs for Gateway infrastructure annotations
---private-annotations string                  Comma-separated key=value pairs defining what 'private' means for
-                                              infrastructure annotations
---private                                     If true, apply private annotations to all Gateways (default: false)
---private-ingress-class-pattern string        Glob pattern for ingress class names that should get private
-                                              infrastructure annotations (default: "*private*")
+--annotations-by-class string                 Semicolon-separated ingressClassPattern:key=value pairs for Gateway
+                                              infrastructure annotations (e.g., '*private*:k=v,k2=v2;*:k3=v3;!:k4=v4')
 --reconcile-cache-persist                     Persist reconcile cache to ConfigMaps (default: true)
 --reconcile-cache-max-entries int             Max entries in reconcile cache (0 = unlimited)
 --clear-ingress-status-on-disable             Clear status.loadBalancer when disabling an Ingress (default: true)

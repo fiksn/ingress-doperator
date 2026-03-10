@@ -109,9 +109,7 @@ The following table lists the configurable parameters of the ingress-doperator c
 | `operator.ingressNameSnippetsFilter` | SnippetsFilter mappings for ingress name patterns | `""` |
 | `operator.ingressAnnotationSnippetsAdd` | SnippetsFilter add rules based on ingress annotations | `""` |
 | `operator.ingressAnnotationSnippetsRemove` | SnippetsFilter remove rules based on ingress annotations | `""` |
-| `operator.privateAnnotations` | Comma-separated key=value pairs that define private infrastructure annotations | `"service.beta.kubernetes.io/aws-load-balancer-internal=true,service.beta.kubernetes.io/aws-load-balancer-nlb-target-type=ip,service.beta.kubernetes.io/aws-load-balancer-type=nlb"` |
-| `operator.private` | Apply private annotations to all Gateways | `false` |
-| `operator.privateIngressClassPattern` | Pattern for private ingress classes | `"*private*"` |
+| `operator.annotationsByClass` | Class-based Gateway infrastructure annotations (`pattern:key=value,key=value;pattern2:key=value`) | `""` |
 | `operator.reconcileCachePersist` | Persist reconcile cache to ConfigMaps | `true` |
 | `operator.reconcileCacheMaxEntries` | Max entries in reconcile cache (0 = unlimited) | `0` |
 | `operator.clearIngressStatusOnDisable` | Clear status.loadBalancer when disabling an Ingress | `true` |

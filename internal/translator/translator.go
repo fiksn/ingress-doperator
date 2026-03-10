@@ -34,6 +34,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/log"
 	gatewayv1 "sigs.k8s.io/gateway-api/apis/v1"
 	gatewayv1beta1 "sigs.k8s.io/gateway-api/apis/v1beta1"
+
 )
 
 const (
@@ -62,9 +63,7 @@ type Config struct {
 	HostnameRewriteTo                string
 	DefaultGatewayAnnotations        map[string]string
 	GatewayInfrastructureAnnotations map[string]string
-	PrivateInfrastructureAnnotations map[string]string
-	ApplyPrivateToAll                bool
-	PrivateIngressClassPattern       string
+	InfrastructureAnnotationsByClass []IngressClassAnnotationsRule
 	GatewayAnnotationFilters         []string
 	HTTPRouteAnnotationFilters       []string
 	UseIngress2Gateway               bool
@@ -212,10 +211,9 @@ func (t *Translator) translateWithIngress2Gateway(
 
 	// Apply infrastructure annotations even in ingress2gateway mode
 	ingressClass := t.GetIngressClass(ingress)
-	applyPrivateAnnotations := t.ShouldApplyPrivateAnnotations(ingressClass)
+	applyClassAnnotations := t.shouldApplyClassInfrastructureAnnotations(ingressClass)
 
-	if len(t.Config.GatewayInfrastructureAnnotations) > 0 ||
-		(applyPrivateAnnotations && len(t.Config.PrivateInfrastructureAnnotations) > 0) {
+	if len(t.Config.GatewayInfrastructureAnnotations) > 0 || applyClassAnnotations {
 		if gateway.Spec.Infrastructure == nil {
 			gateway.Spec.Infrastructure = &gatewayv1.GatewayInfrastructure{
 				Annotations: make(map[gatewayv1.AnnotationKey]gatewayv1.AnnotationValue),
@@ -230,11 +228,9 @@ func (t *Translator) translateWithIngress2Gateway(
 			gateway.Spec.Infrastructure.Annotations[gatewayv1.AnnotationKey(key)] = gatewayv1.AnnotationValue(value)
 		}
 
-		// Apply private annotations if conditions are met
-		if applyPrivateAnnotations {
-			for key, value := range t.Config.PrivateInfrastructureAnnotations {
-				gateway.Spec.Infrastructure.Annotations[gatewayv1.AnnotationKey(key)] = gatewayv1.AnnotationValue(value)
-			}
+		// Apply class-based infrastructure annotations if conditions are met
+		if applyClassAnnotations {
+			t.applyClassInfrastructureAnnotations(ingressClass, gateway.Spec.Infrastructure.Annotations)
 		}
 	}
 
@@ -339,19 +335,18 @@ func (t *Translator) TranslateMultipleToSharedGateway(
 	}
 	gateway.Annotations[SourceAnnotation] = strings.Join(sourceNames, ",")
 
-	// Check if any ingress in this group should have private annotations
-	applyPrivateAnnotations := false
+	// Check if any ingress in this group should have class-based infra annotations
+	applyClassAnnotations := false
 	for _, ingress := range ingresses {
 		ingressClass := t.GetIngressClass(&ingress)
-		if t.ShouldApplyPrivateAnnotations(ingressClass) {
-			applyPrivateAnnotations = true
+		if t.shouldApplyClassInfrastructureAnnotations(ingressClass) {
+			applyClassAnnotations = true
 			break
 		}
 	}
 
 	// Add infrastructure annotations if any are configured
-	if len(t.Config.GatewayInfrastructureAnnotations) > 0 ||
-		(applyPrivateAnnotations && len(t.Config.PrivateInfrastructureAnnotations) > 0) {
+	if len(t.Config.GatewayInfrastructureAnnotations) > 0 || applyClassAnnotations {
 		gateway.Spec.Infrastructure = &gatewayv1.GatewayInfrastructure{
 			Annotations: make(map[gatewayv1.AnnotationKey]gatewayv1.AnnotationValue),
 		}
@@ -361,10 +356,11 @@ func (t *Translator) TranslateMultipleToSharedGateway(
 			gateway.Spec.Infrastructure.Annotations[gatewayv1.AnnotationKey(key)] = gatewayv1.AnnotationValue(value)
 		}
 
-		// Apply private annotations if any ingress matches conditions
-		if applyPrivateAnnotations {
-			for key, value := range t.Config.PrivateInfrastructureAnnotations {
-				gateway.Spec.Infrastructure.Annotations[gatewayv1.AnnotationKey(key)] = gatewayv1.AnnotationValue(value)
+		// Apply class-based annotations for all matching ingress classes
+		if applyClassAnnotations {
+			for _, ingress := range ingresses {
+				ingressClass := t.GetIngressClass(&ingress)
+				t.applyClassInfrastructureAnnotations(ingressClass, gateway.Spec.Infrastructure.Annotations)
 			}
 		}
 	}
@@ -520,13 +516,12 @@ func (t *Translator) TranslateToGateway(ingress *networkingv1.Ingress) *gatewayv
 	gateway.Annotations[ManagedByAnnotation] = ManagedByValue
 	gateway.Annotations[SourceAnnotation] = fmt.Sprintf("%s/%s", ingress.Namespace, ingress.Name)
 
-	// Determine if private annotations should be applied
+	// Determine if class-based infra annotations should be applied
 	ingressClass := t.GetIngressClass(ingress)
-	applyPrivateAnnotations := t.ShouldApplyPrivateAnnotations(ingressClass)
+	applyClassAnnotations := t.shouldApplyClassInfrastructureAnnotations(ingressClass)
 
 	// Add infrastructure annotations if any are configured
-	if len(t.Config.GatewayInfrastructureAnnotations) > 0 ||
-		(applyPrivateAnnotations && len(t.Config.PrivateInfrastructureAnnotations) > 0) {
+	if len(t.Config.GatewayInfrastructureAnnotations) > 0 || applyClassAnnotations {
 		gateway.Spec.Infrastructure = &gatewayv1.GatewayInfrastructure{
 			Annotations: make(map[gatewayv1.AnnotationKey]gatewayv1.AnnotationValue),
 		}
@@ -536,11 +531,9 @@ func (t *Translator) TranslateToGateway(ingress *networkingv1.Ingress) *gatewayv
 			gateway.Spec.Infrastructure.Annotations[gatewayv1.AnnotationKey(key)] = gatewayv1.AnnotationValue(value)
 		}
 
-		// Apply private annotations if conditions are met
-		if applyPrivateAnnotations {
-			for key, value := range t.Config.PrivateInfrastructureAnnotations {
-				gateway.Spec.Infrastructure.Annotations[gatewayv1.AnnotationKey(key)] = gatewayv1.AnnotationValue(value)
-			}
+		// Apply class-based annotations if conditions are met
+		if applyClassAnnotations {
+			t.applyClassInfrastructureAnnotations(ingressClass, gateway.Spec.Infrastructure.Annotations)
 		}
 	}
 
@@ -971,24 +964,75 @@ func (t *Translator) GetIngressClass(ingress *networkingv1.Ingress) string {
 	return "default"
 }
 
-// ShouldApplyPrivateAnnotations determines if private annotations should be applied
-func (t *Translator) ShouldApplyPrivateAnnotations(ingressClass string) bool {
-	// Apply to all if flag is set
-	if t.Config.ApplyPrivateToAll {
+func (t *Translator) shouldApplyClassInfrastructureAnnotations(ingressClass string) bool {
+	hasFallback := false
+	matchedNonFallback := false
+	for _, rule := range t.Config.InfrastructureAnnotationsByClass {
+		if rule.Pattern == "" {
+			continue
+		}
+		if rule.Pattern == "!" {
+			if len(rule.Annotations) > 0 {
+				hasFallback = true
+			}
+			continue
+		}
+		matched, err := filepath.Match(rule.Pattern, ingressClass)
+		if err != nil {
+			logger := log.Log.WithName("classInfraAnnotations")
+			logger.Error(err, "Invalid ingress class pattern", "pattern", rule.Pattern)
+			continue
+		}
+		if matched && len(rule.Annotations) > 0 {
+			matchedNonFallback = true
+		}
+	}
+	if matchedNonFallback {
 		return true
 	}
-	// Apply if ingress class matches pattern
-	if t.Config.PrivateIngressClassPattern == "" {
-		return false
+	return hasFallback
+}
+
+func (t *Translator) applyClassInfrastructureAnnotations(
+	ingressClass string,
+	annotations map[gatewayv1.AnnotationKey]gatewayv1.AnnotationValue,
+) {
+	if annotations == nil {
+		return
 	}
-	matched, err := filepath.Match(t.Config.PrivateIngressClassPattern, ingressClass)
-	if err != nil {
-		// Invalid pattern, log and return false
-		logger := log.Log.WithName("shouldApplyPrivateAnnotations")
-		logger.Error(err, "Invalid pattern", "pattern", t.Config.PrivateIngressClassPattern)
-		return false
+	matchedNonFallback := false
+	for _, rule := range t.Config.InfrastructureAnnotationsByClass {
+		if rule.Pattern == "" {
+			continue
+		}
+		if rule.Pattern == "!" {
+			continue
+		}
+		matched, err := filepath.Match(rule.Pattern, ingressClass)
+		if err != nil {
+			logger := log.Log.WithName("classInfraAnnotations")
+			logger.Error(err, "Invalid ingress class pattern", "pattern", rule.Pattern)
+			continue
+		}
+		if !matched {
+			continue
+		}
+		matchedNonFallback = true
+		for key, value := range rule.Annotations {
+			annotations[gatewayv1.AnnotationKey(key)] = gatewayv1.AnnotationValue(value)
+		}
 	}
-	return matched
+	if matchedNonFallback {
+		return
+	}
+	for _, rule := range t.Config.InfrastructureAnnotationsByClass {
+		if rule.Pattern != "!" {
+			continue
+		}
+		for key, value := range rule.Annotations {
+			annotations[gatewayv1.AnnotationKey(key)] = gatewayv1.AnnotationValue(value)
+		}
+	}
 }
 
 // GetNamespacesWithTLS collects unique namespaces that have Ingresses with TLS configuration

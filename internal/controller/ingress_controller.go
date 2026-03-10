@@ -111,9 +111,7 @@ type IngressReconciler struct {
 	HTTPRouteAnnotationFilters       []string
 	DefaultGatewayAnnotations        map[string]string
 	GatewayInfrastructureAnnotations map[string]string
-	PrivateInfrastructureAnnotations map[string]string
-	ApplyPrivateToAll                bool
-	PrivateIngressClassPattern       string
+	InfrastructureAnnotationsByClass []translator.IngressClassAnnotationsRule
 	IngressClassFilters              []string
 	IngressClassIgnoreFilters        []string
 	IngressClassEmpty                string
@@ -153,9 +151,7 @@ func (r *IngressReconciler) getTranslator() *translator.Translator {
 		HostnameRewriteTo:                r.HostnameRewriteTo,
 		DefaultGatewayAnnotations:        r.DefaultGatewayAnnotations,
 		GatewayInfrastructureAnnotations: r.GatewayInfrastructureAnnotations,
-		PrivateInfrastructureAnnotations: r.PrivateInfrastructureAnnotations,
-		ApplyPrivateToAll:                r.ApplyPrivateToAll,
-		PrivateIngressClassPattern:       r.PrivateIngressClassPattern,
+		InfrastructureAnnotationsByClass: r.InfrastructureAnnotationsByClass,
 		GatewayAnnotationFilters:         r.GatewayAnnotationFilters,
 		HTTPRouteAnnotationFilters:       r.HTTPRouteAnnotationFilters,
 		UseIngress2Gateway:               r.UseIngress2Gateway,

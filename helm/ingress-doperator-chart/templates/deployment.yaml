@@ -74,13 +74,9 @@ spec:
             {{- if .Values.operator.gatewayInfraAnnotations }}
             - --gateway-infrastructure-annotations={{ .Values.operator.gatewayInfraAnnotations }}
             {{- end }}
-            {{- if .Values.operator.privateAnnotations }}
-            - --private-annotations={{ .Values.operator.privateAnnotations }}
+            {{- if .Values.operator.annotationsByClass }}
+            - --annotations-by-class={{ .Values.operator.annotationsByClass }}
             {{- end }}
-            {{- if .Values.operator.private }}
-            - --private=true
-            {{- end }}
-            - --private-ingress-class-pattern={{ .Values.operator.privateIngressClassPattern }}
             - --gateway-annotation-filters={{ .Values.operator.gatewayAnnotationFilters }}
             - --httproute-annotation-filters={{ .Values.operator.httpRouteAnnotationFilters }}
             {{- if not .Values.operator.reconcileCachePersist }}

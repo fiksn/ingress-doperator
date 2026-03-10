@@ -49,6 +49,7 @@ import (
 
 	"github.com/fiksn/ingress-doperator/internal/controller"
 	_ "github.com/fiksn/ingress-doperator/internal/metrics" // Import to register metrics
+	"github.com/fiksn/ingress-doperator/internal/translator"
 	"github.com/fiksn/ingress-doperator/internal/utils"
 	// +kubebuilder:scaffold:imports
 )
@@ -59,9 +60,6 @@ var (
 )
 
 const (
-	DefaultPrivateInfraAnnotations = "service.beta.kubernetes.io/aws-load-balancer-internal=true," +
-		"service.beta.kubernetes.io/aws-load-balancer-nlb-target-type=ip," +
-		"service.beta.kubernetes.io/aws-load-balancer-type=nlb"
 	DefaultGatewayInfraAnnotations = ""
 	DefaultGatewayAnnotations      = "cert-manager.io/acme-challenge-type=dns01," +
 		"cert-manager.io/acme-dns01-provider=default," +
@@ -188,9 +186,7 @@ func main() {
 		HTTPRouteAnnotationFilters:       cfg.HTTPRouteFilters,
 		DefaultGatewayAnnotations:        cfg.GatewayAnnotationsMap,
 		GatewayInfrastructureAnnotations: cfg.GatewayInfraAnnotationsMap,
-		PrivateInfrastructureAnnotations: cfg.PrivateInfraAnnotationsMap,
-		ApplyPrivateToAll:                cfg.Private,
-		PrivateIngressClassPattern:       cfg.PrivateIngressClassPattern,
+		InfrastructureAnnotationsByClass: cfg.InfrastructureAnnotationsByClass,
 		IngressClassFilters:              cfg.IngressClassFilters,
 		IngressClassIgnoreFilters:        cfg.IngressClassIgnoreFilters,
 		IngressClassEmpty:                cfg.IngressClassEmpty,
@@ -307,9 +303,7 @@ type operatorConfig struct {
 	IngressPostProcessing           string
 	GatewayAnnotations              string
 	GatewayInfraAnnotations         string
-	Private                         bool
-	PrivateAnnotations              string
-	PrivateIngressClassPattern      string
+	AnnotationsByClass              string
 	IngressClassFilter              string
 	IngressClassIgnoreFilter        string
 	IngressClassEmpty               string
@@ -333,7 +327,7 @@ type operatorConfig struct {
 	HTTPRouteFilters               []string
 	GatewayAnnotationsMap          map[string]string
 	GatewayInfraAnnotationsMap     map[string]string
-	PrivateInfraAnnotationsMap     map[string]string
+	InfrastructureAnnotationsByClass []translator.IngressClassAnnotationsRule
 	IngressClassFilters            []string
 	IngressClassIgnoreFilters      []string
 }
@@ -380,11 +374,9 @@ func parseOperatorConfig() (operatorConfig, zap.Options, error) {
 	flag.StringVar(&cfg.GatewayInfraAnnotations, "gateway-infrastructure-annotations",
 		DefaultGatewayInfraAnnotations,
 		"Comma-separated key=value pairs for Gateway infrastructure annotations (applied to all Gateways)")
-	flag.StringVar(&cfg.PrivateAnnotations, "private-annotations", DefaultPrivateInfraAnnotations,
-		"Comma-separated key=value pairs defining what 'private' means for Gateway infrastructure annotations")
-	flag.BoolVar(&cfg.Private, "private", false, "If true, apply private annotations to all Gateways")
-	flag.StringVar(&cfg.PrivateIngressClassPattern, "private-ingress-class-pattern", "*private*",
-		"Glob pattern for ingress class names (e.g., '*private') that should get private infrastructure annotations")
+	flag.StringVar(&cfg.AnnotationsByClass, "annotations-by-class", "",
+		"Semicolon-separated list of ingressClassPattern:key=value pairs for Gateway infrastructure annotations "+
+			"(e.g., '*private*:k=v,k2=v2;*:k3=v3').")
 	flag.StringVar(&cfg.IngressClassSnippetsFilters, "ingress-class-snippets-filter", "",
 		"Comma-separated list of pattern:snippetsFilterName entries. "+
 			"If ingress class matches the glob, the SnippetsFilter is copied from the Gateway namespace and attached.")
@@ -478,7 +470,10 @@ func parseOperatorConfig() (operatorConfig, zap.Options, error) {
 	}
 	cfg.GatewayAnnotationsMap = parseKeyValueCSV(cfg.GatewayAnnotations)
 	cfg.GatewayInfraAnnotationsMap = parseKeyValueCSV(cfg.GatewayInfraAnnotations)
-	cfg.PrivateInfraAnnotationsMap = parseKeyValueCSV(cfg.PrivateAnnotations)
+	cfg.InfrastructureAnnotationsByClass, err = translator.ParseIngressClassAnnotationsByClass(cfg.AnnotationsByClass)
+	if err != nil {
+		return cfg, opts, fmt.Errorf("invalid annotations-by-class value: %w", err)
+	}
 
 	return cfg, opts, nil
 }
