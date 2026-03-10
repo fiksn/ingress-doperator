@@ -17,6 +17,12 @@ If you use [external-dns](https://github.com/kubernetes-sigs/external-dns) on yo
 option is `--ingress-postprocessing disable-external-dns` to just "move" DNS records from `Ingress` to `Httproute`.
 In case anything goes wrong you can stop the operator and use [reenabler](#re-enabling-disabled-ingresses)
 CLI tool to get old state back with `--restore-external-dns` flag.
+Note that this last option depends on fairly recent version of `external-dns` that understands
+`external-dns.alpha.kubernetes.io/gateway-hostname-source` annotation. Else you will still have to remote `Httproute`.
+
+Very important:
+`kubectl delete --cascade=orphan` should be used when removing ingresses as there is an `ownerReference` on
+automatically generated objects.
 
 !!! Nginx ingress controller is [deprecated](https://kubernetes.io/blog/2025/11/11/ingress-nginx-retirement/) and
 will not get security updates after March 2026 !!!

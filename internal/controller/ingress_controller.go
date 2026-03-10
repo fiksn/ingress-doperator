@@ -57,9 +57,11 @@ const (
 	OriginalIngressClassAnnotation           = "ingress-doperator.fiction.si/original-ingress-class"
 	OriginalIngressClassNameAnnotation       = "ingress-doperator.fiction.si/original-ingress-classname"
 	ExternalDNSIngressHostnameSource         = "external-dns.alpha.kubernetes.io/ingress-hostname-source"
+	ExternalDNSGatewayHostnameSource         = "external-dns.alpha.kubernetes.io/gateway-hostname-source"
 	ExternalDNSHostnameAnnotation            = "external-dns.alpha.kubernetes.io/hostname"
 	OriginalExternalDNSHostname              = "ingress-doperator.fiction.si/original-external-dns-hostname"
 	OriginalExternalDNSIngressHostnameSource = "ingress-doperator.fiction.si/original-external-dns-ingress-hostname-source"
+	OriginalExternalDNSGatewayHostnameSource = "ingress-doperator.fiction.si/original-external-dns-gateway-hostname-source"
 	ExternalDNSHostnameSourceAnnotationOnly  = "annotation-only"
 	FinalizerName                            = "ingress-doperator.fiction.si/finalizer"
 	HTTPRouteSnippetsFilterAnnotation        = "ingress-doperator.fiction.si/httproute-snippets-filter"
@@ -439,6 +441,7 @@ func (r *IngressReconciler) reconcileOneGatewayPerIngress(
 		if r.IngressPostProcessingMode != IngressPostProcessingModeRemove {
 			setGatewayOwnerReference(gateway, &ingress)
 		}
+		setHTTPRouteOwnerReference(httpRoute, &ingress)
 
 		r.applyHTTPRouteExtensionRefs(ctx, &ingress, httpRoute)
 
@@ -561,6 +564,8 @@ func (r *IngressReconciler) reconcileSharedGateways(
 			classTrans := translator.New(transConfig)
 
 			httpRoute := classTrans.TranslateToHTTPRoute(&ingress)
+
+			setHTTPRouteOwnerReference(httpRoute, &ingress)
 
 			r.applyHTTPRouteExtensionRefs(ctx, &ingress, httpRoute)
 
@@ -1281,8 +1286,9 @@ func (r *IngressReconciler) removeIngress(ctx context.Context, ingress *networki
 	if ingress.Annotations != nil && ingress.Annotations[IngressRemovedAnnotation] == fmt.Sprintf("%t", true) {
 		logger.Info("Ingress already marked for removal, proceeding with deletion")
 		r.markSelfDeleted(ingress)
-		// Delete the Ingress resource
-		if err := r.Delete(ctx, ingress); err != nil {
+		// Delete the Ingress resource without cascading to dependents
+		orphan := metav1.DeletePropagationOrphan
+		if err := r.Delete(ctx, ingress, &client.DeleteOptions{PropagationPolicy: &orphan}); err != nil {
 			if apierrors.IsNotFound(err) {
 				return nil // Already deleted
 			}
@@ -1308,8 +1314,9 @@ func (r *IngressReconciler) removeIngress(ctx context.Context, ingress *networki
 
 	r.markSelfDeleted(ingress)
 
-	// Delete the Ingress resource
-	if err := r.Delete(ctx, ingress); err != nil {
+	// Delete the Ingress resource without cascading to dependents
+	orphan := metav1.DeletePropagationOrphan
+	if err := r.Delete(ctx, ingress, &client.DeleteOptions{PropagationPolicy: &orphan}); err != nil {
 		if apierrors.IsNotFound(err) {
 			return nil // Already deleted
 		}
@@ -1855,6 +1862,24 @@ func setGatewayOwnerReference(gateway *gatewayv1.Gateway, ingress *networkingv1.
 	controller := true
 	blockOwnerDeletion := false
 	gateway.OwnerReferences = []metav1.OwnerReference{
+		{
+			APIVersion:         ingress.APIVersion,
+			Kind:               ingress.Kind,
+			Name:               ingress.Name,
+			UID:                ingress.UID,
+			Controller:         &controller,
+			BlockOwnerDeletion: &blockOwnerDeletion,
+		},
+	}
+}
+
+func setHTTPRouteOwnerReference(httpRoute *gatewayv1.HTTPRoute, ingress *networkingv1.Ingress) {
+	if httpRoute == nil || ingress == nil {
+		return
+	}
+	controller := true
+	blockOwnerDeletion := false
+	httpRoute.OwnerReferences = []metav1.OwnerReference{
 		{
 			APIVersion:         ingress.APIVersion,
 			Kind:               ingress.Kind,

@@ -173,6 +173,10 @@ func parseSSLProxyHeaders(raw string) ([]sslProxyHeader, []string) {
 			warnings = append(warnings, "ssl-proxy-headers entry must be HEADER:value")
 			continue
 		}
+		if containsUnsafeSnippetChars(header) || containsUnsafeSnippetChars(value) {
+			warnings = append(warnings, "ssl-proxy-headers entry contains unsafe characters")
+			continue
+		}
 		headerVar := strings.ReplaceAll(header, "-", "_")
 		key := headerVar + "\x00" + value
 		if _, ok := seen[key]; ok {
@@ -471,6 +475,9 @@ func ingestNginxIngressAnnotations(annotations map[string]string, keys []ingress
 			if !isWhitelistedNginxIngressDirective(entry.suffix) {
 				continue
 			}
+			if !isSafeSnippetValue(&state, entry.fullKey, value) {
+				continue
+			}
 			if entry.suffix == "proxy-buffer-size" {
 				state.proxyBufferSize = value
 			}
@@ -495,30 +502,43 @@ func applyIngressAnnotationValue(state *nginxIngressSnippetState, suffix, value 
 	case configurationSnippetKey, serverSnippetKey, authSnippetKey:
 		return true
 	case proxyBodySizeKey:
+		if !isSafeSnippetValue(state, suffix, value) {
+			return true
+		}
 		state.proxyBodySizeValue = value
 		return true
 	case allowlistSourceRangeKey, whitelistSourceRangeKey:
-		state.whitelistSourceRanges = append(
-			state.whitelistSourceRanges,
-			parsedRanges(value)...,
-		)
+		ranges := parsedRanges(value)
+		ranges = filterSafeSnippetValues(state, suffix, ranges)
+		state.whitelistSourceRanges = append(state.whitelistSourceRanges, ranges...)
 		return true
 	case denylistSourceRangeKey, blacklistSourceRangeKey:
-		state.blacklistSourceRanges = append(
-			state.blacklistSourceRanges,
-			parsedRanges(value)...,
-		)
+		ranges := parsedRanges(value)
+		ranges = filterSafeSnippetValues(state, suffix, ranges)
+		state.blacklistSourceRanges = append(state.blacklistSourceRanges, ranges...)
 		return true
 	case clientMaxBodySizeKey:
+		if !isSafeSnippetValue(state, suffix, value) {
+			return true
+		}
 		state.clientMaxBodySize = value
 		return true
 	case proxyRedirectFromKey:
+		if !isSafeSnippetValue(state, suffix, value) {
+			return true
+		}
 		state.proxyRedirectFrom = value
 		return true
 	case proxyRedirectToKey:
+		if !isSafeSnippetValue(state, suffix, value) {
+			return true
+		}
 		state.proxyRedirectTo = value
 		return true
 	case proxyBuffersNumberKey:
+		if !isSafeSnippetValue(state, suffix, value) {
+			return true
+		}
 		state.proxyBuffersNumber = value
 		return true
 	case sslRedirectKey:
@@ -551,6 +571,9 @@ func applyIngressAnnotationValue(state *nginxIngressSnippetState, suffix, value 
 		}
 		return true
 	case rewriteTargetKey:
+		if !isSafeSnippetValue(state, suffix, value) {
+			return true
+		}
 		state.rewriteTarget = value
 		return true
 	case useRegexKey:
@@ -576,6 +599,9 @@ func applyLegacyIngressAnnotationValue(state *nginxIngressSnippetState, suffix, 
 		}
 		return true
 	case referrerPolicyKey:
+		if !isSafeSnippetValue(state, suffix, value) {
+			return true
+		}
 		state.referrerPolicy = value
 		return true
 	case sslProxyHeadersKey:
@@ -743,6 +769,50 @@ func uniqueStrings(values []string) []string {
 
 func escapeHeaderValue(value string) string {
 	return strings.ReplaceAll(value, "\"", "\\\"")
+}
+
+// sanitizeQuotedRegex escapes backslashes and double quotes in a location path
+// so paths cannot escape NGINX configuration.
+func sanitizeQuotedRegex(path string) string {
+	builder := strings.Builder{}
+	builder.Grow(2 * len(path))
+	// note that iterating over a string iterates over its runes, not bytes
+	for _, r := range path {
+		if r == '\\' || r == '"' {
+			builder.WriteByte('\\')
+		}
+		builder.WriteRune(r)
+	}
+	return builder.String()
+}
+
+func containsUnsafeSnippetChars(value string) bool {
+	return strings.ContainsAny(value, "\r\n;{}")
+}
+
+func isSafeSnippetValue(state *nginxIngressSnippetState, key, value string) bool {
+	if containsUnsafeSnippetChars(value) {
+		state.warnings = append(state.warnings,
+			fmt.Sprintf("annotation %s contains unsafe characters (\\n, \\r, ';', '{', '}'); ignoring", key))
+		return false
+	}
+	return true
+}
+
+func filterSafeSnippetValues(state *nginxIngressSnippetState, key string, values []string) []string {
+	if len(values) == 0 {
+		return values
+	}
+	out := make([]string, 0, len(values))
+	for _, value := range values {
+		if containsUnsafeSnippetChars(value) {
+			state.warnings = append(state.warnings,
+				fmt.Sprintf("annotation %s contains unsafe characters (\\n, \\r, ';', '{', '}'); ignoring value %q", key, value))
+			continue
+		}
+		out = append(out, value)
+	}
+	return out
 }
 
 // NginxIngressSnippetWarningAnnotations returns full annotation keys that should emit warnings when ignored.

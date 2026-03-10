@@ -21,6 +21,7 @@ import (
 	"flag"
 	"fmt"
 	"os"
+	"path/filepath"
 	"strconv"
 
 	// Import all Kubernetes client auth plugins (e.g. Azure, GCP, OIDC, etc.)
@@ -29,8 +30,10 @@ import (
 	"go.uber.org/zap/zapcore"
 	networkingv1 "k8s.io/api/networking/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	utilruntime "k8s.io/apimachinery/pkg/util/runtime"
 	clientgoscheme "k8s.io/client-go/kubernetes/scheme"
@@ -83,8 +86,12 @@ func main() {
 	var restoreExternalDNS trackedBool
 	var dangerouslyDeleteIngresses bool
 	var preventFurtherReconciliation bool
+	var markIgnoreIngress bool
+	var ingressNamePattern string
 
 	flag.StringVar(&namespace, "namespace", "", "If set, only process Ingresses in this namespace")
+	flag.StringVar(&ingressNamePattern, "ingress-name", "",
+		"If set, only process Ingresses whose name matches any of the glob patterns (comma-separated, e.g., 'api-*,web-?')")
 	flag.BoolVar(&removeDerivedResources, "remove-derived-resources", false,
 		"If true, remove managed HTTPRoutes and automatic SnippetsFilters derived from the Ingress")
 	restore.value = true
@@ -98,6 +105,8 @@ func main() {
 		"If true, delete disabled Ingresses managed by ingress-doperator")
 	flag.BoolVar(&preventFurtherReconciliation, "prevent-further-reconciliation", false,
 		"If true, mark restored Ingresses as disabled to stop future reconciles")
+	flag.BoolVar(&markIgnoreIngress, "mark-ignore-ingress", false,
+		"If true, add ingress-doperator.fiction.si/ignore-ingress=true to restored Ingresses")
 	flag.IntVar(&verbosity, "v", 0, "Log verbosity (0 = info, higher = more verbose)")
 	opts := zap.Options{
 		Development: true,
@@ -153,11 +162,13 @@ func main() {
 		ctx,
 		cli,
 		namespace,
+		ingressNamePattern,
 		removeDerivedResources,
 		restoreClass.value,
 		restoreExternalDNS.value,
 		dangerouslyDeleteIngresses,
 		preventFurtherReconciliation,
+		markIgnoreIngress,
 	); err != nil {
 		setupLog.Error(err, "reenabler failed")
 		os.Exit(1)
@@ -168,11 +179,13 @@ func runReenabler(
 	ctx context.Context,
 	cli client.Client,
 	namespace string,
+	ingressNamePattern string,
 	removeDerivedResources bool,
 	restoreClass bool,
 	restoreExternalDNS bool,
 	dangerouslyDeleteIngresses bool,
 	preventFurtherReconciliation bool,
+	markIgnoreIngress bool,
 ) error {
 	opts := reenablerOptions{
 		removeDerivedResources:       removeDerivedResources,
@@ -180,9 +193,10 @@ func runReenabler(
 		restoreExternalDNS:           restoreExternalDNS,
 		dangerouslyDeleteIngresses:   dangerouslyDeleteIngresses,
 		preventFurtherReconciliation: preventFurtherReconciliation,
+		markIgnoreIngress:            markIgnoreIngress,
 	}
 
-	ingresses, err := listIngresses(ctx, cli, namespace)
+	ingresses, err := listIngresses(ctx, cli, namespace, ingressNamePattern)
 	if err != nil {
 		return err
 	}
@@ -213,9 +227,10 @@ type reenablerOptions struct {
 	restoreExternalDNS           bool
 	dangerouslyDeleteIngresses   bool
 	preventFurtherReconciliation bool
+	markIgnoreIngress            bool
 }
 
-func listIngresses(ctx context.Context, cli client.Client, namespace string) ([]networkingv1.Ingress, error) {
+func listIngresses(ctx context.Context, cli client.Client, namespace, namePattern string) ([]networkingv1.Ingress, error) {
 	list := &networkingv1.IngressList{}
 	if namespace != "" {
 		if err := cli.List(ctx, list, client.InNamespace(namespace)); err != nil {
@@ -226,7 +241,35 @@ func listIngresses(ctx context.Context, cli client.Client, namespace string) ([]
 			return nil, err
 		}
 	}
-	return list.Items, nil
+	if namePattern == "" {
+		return list.Items, nil
+	}
+	filtered, err := filterIngressesByName(list.Items, namePattern)
+	if err != nil {
+		return nil, err
+	}
+	return filtered, nil
+}
+
+func filterIngressesByName(ingresses []networkingv1.Ingress, pattern string) ([]networkingv1.Ingress, error) {
+	patterns := utils.ParseCommaSeparatedList(pattern)
+	if len(patterns) == 0 {
+		return ingresses, nil
+	}
+	matches := make([]networkingv1.Ingress, 0, len(ingresses))
+	for _, ingress := range ingresses {
+		for _, item := range patterns {
+			ok, err := filepath.Match(item, ingress.Name)
+			if err != nil {
+				return nil, fmt.Errorf("invalid ingress-name pattern %q: %w", item, err)
+			}
+			if ok {
+				matches = append(matches, ingress)
+				break
+			}
+		}
+	}
+	return matches, nil
 }
 
 func preflightDelete(
@@ -256,27 +299,36 @@ func processIngress(
 	opts reenablerOptions,
 ) error {
 	disabled := isDisabledIngress(ingress)
+	if opts.restoreExternalDNS {
+		hasRoute, _, err := hasManagedResources(ctx, cli, manager, ingress)
+		if err != nil {
+			return err
+		}
+		if hasRoute {
+			if err := disableExternalDNSForDerived(ctx, cli, manager, ingress); err != nil {
+				setupLog.Info("Skipping derived external-dns update; proceeding with ingress-only restore",
+					"namespace", ingress.Namespace,
+					"name", ingress.Name,
+					"error", err)
+			}
+		}
+	}
 	if opts.dangerouslyDeleteIngresses && shouldDeleteIngress(ingress) {
 		return deleteIngressIfEligible(ctx, cli, manager, ingress)
 	}
 	if !shouldRestoreIngress(ingress, disabled, opts.restoreExternalDNS) {
 		return nil
 	}
-	if opts.restoreExternalDNS &&
-		ingress.Annotations != nil &&
-		ingress.Annotations[controller.IngressDisabledAnnotation] == controller.IngressDisabledReasonExternalDNS {
-		if err := disableExternalDNSForDerived(ctx, cli, manager, ingress); err != nil {
-			setupLog.Info("Skipping derived external-dns update; proceeding with ingress-only restore",
-				"namespace", ingress.Namespace,
-				"name", ingress.Name,
-				"error", err)
-		}
-	}
 	if err := restoreIngressState(ctx, cli, ingress, disabled && opts.restoreClass, opts.restoreExternalDNS); err != nil {
 		return err
 	}
 	if opts.preventFurtherReconciliation && (opts.restoreClass || opts.restoreExternalDNS) {
 		if err := markIngressDisabled(ctx, cli, ingress, opts.restoreClass); err != nil {
+			return err
+		}
+	}
+	if opts.markIgnoreIngress && (opts.restoreClass || opts.restoreExternalDNS) {
+		if err := markIngressIgnored(ctx, cli, ingress); err != nil {
 			return err
 		}
 	}
@@ -316,16 +368,30 @@ func markIngressDisabled(
 	if ingress == nil {
 		return nil
 	}
-	updated := ingress.DeepCopy()
-	if updated.Annotations == nil {
-		updated.Annotations = map[string]string{}
+	return updateIngressWithRetry(ctx, cli, ingress, func(updated *networkingv1.Ingress) (bool, error) {
+		if updated.Annotations == nil {
+			updated.Annotations = map[string]string{}
+		}
+		if useNormal {
+			updated.Annotations[controller.IngressDisabledAnnotation] = controller.IngressDisabledReasonNormal
+		} else {
+			updated.Annotations[controller.IngressDisabledAnnotation] = controller.IngressDisabledReasonExternalDNS
+		}
+		return true, nil
+	})
+}
+
+func markIngressIgnored(ctx context.Context, cli client.Client, ingress *networkingv1.Ingress) error {
+	if ingress == nil {
+		return nil
 	}
-	if useNormal {
-		updated.Annotations[controller.IngressDisabledAnnotation] = controller.IngressDisabledReasonNormal
-	} else {
-		updated.Annotations[controller.IngressDisabledAnnotation] = controller.IngressDisabledReasonExternalDNS
-	}
-	return cli.Update(ctx, updated)
+	return updateIngressWithRetry(ctx, cli, ingress, func(updated *networkingv1.Ingress) (bool, error) {
+		if updated.Annotations == nil {
+			updated.Annotations = map[string]string{}
+		}
+		updated.Annotations[controller.IgnoreIngressAnnotation] = fmt.Sprintf("%t", true)
+		return true, nil
+	})
 }
 
 func deleteIngressIfEligible(
@@ -345,7 +411,8 @@ func deleteIngressIfEligible(
 			"reason", reason)
 		return nil
 	}
-	if err := cli.Delete(ctx, ingress); err != nil {
+	orphan := metav1.DeletePropagationOrphan
+	if err := cli.Delete(ctx, ingress, &client.DeleteOptions{PropagationPolicy: &orphan}); err != nil {
 		return err
 	}
 	setupLog.Info("Deleted disabled Ingress",
@@ -398,70 +465,107 @@ func restoreIngressState(
 	if ingress == nil {
 		return nil
 	}
-	updated := ingress.DeepCopy()
-	annotations := updated.Annotations
-	if annotations == nil {
-		annotations = map[string]string{}
-	}
-
-	modified := false
-	if restoreClass {
-		originalClassName := annotations[controller.OriginalIngressClassNameAnnotation]
-		originalClassAnnotation := annotations[controller.OriginalIngressClassAnnotation]
-
-		if originalClassName != "" {
-			updated.Spec.IngressClassName = &originalClassName
-		} else {
-			updated.Spec.IngressClassName = nil
+	return updateIngressWithRetry(ctx, cli, ingress, func(updated *networkingv1.Ingress) (bool, error) {
+		annotations := updated.Annotations
+		if annotations == nil {
+			annotations = map[string]string{}
 		}
 
-		if originalClassAnnotation != "" {
-			annotations[controller.IngressClassAnnotation] = originalClassAnnotation
-		} else {
-			delete(annotations, controller.IngressClassAnnotation)
-		}
+		modified := false
+		if restoreClass {
+			originalClassName := annotations[controller.OriginalIngressClassNameAnnotation]
+			originalClassAnnotation := annotations[controller.OriginalIngressClassAnnotation]
 
-		delete(annotations, controller.IngressDisabledAnnotation)
-		delete(annotations, controller.OriginalIngressClassNameAnnotation)
-		delete(annotations, controller.OriginalIngressClassAnnotation)
-		modified = true
-	}
-
-	if restoreExternalDNS {
-		if originalHostname, ok := annotations[controller.OriginalExternalDNSHostname]; ok {
-			if originalHostname != "" {
-				annotations[controller.ExternalDNSHostnameAnnotation] = originalHostname
+			if originalClassName != "" {
+				updated.Spec.IngressClassName = &originalClassName
 			} else {
-				delete(annotations, controller.ExternalDNSHostnameAnnotation)
+				updated.Spec.IngressClassName = nil
 			}
-			delete(annotations, controller.OriginalExternalDNSHostname)
-			modified = true
-		}
 
-		if originalSource, ok := annotations[controller.OriginalExternalDNSIngressHostnameSource]; ok {
-			if originalSource != "" {
-				annotations[controller.ExternalDNSIngressHostnameSource] = originalSource
+			if originalClassAnnotation != "" {
+				annotations[controller.IngressClassAnnotation] = originalClassAnnotation
 			} else {
-				delete(annotations, controller.ExternalDNSIngressHostnameSource)
+				delete(annotations, controller.IngressClassAnnotation)
 			}
-			delete(annotations, controller.OriginalExternalDNSIngressHostnameSource)
-			modified = true
-		} else if _, exists := annotations[controller.ExternalDNSIngressHostnameSource]; exists {
-			delete(annotations, controller.ExternalDNSIngressHostnameSource)
-			modified = true
-		}
 
-		if annotations[controller.IngressDisabledAnnotation] == controller.IngressDisabledReasonExternalDNS {
 			delete(annotations, controller.IngressDisabledAnnotation)
+			delete(annotations, controller.OriginalIngressClassNameAnnotation)
+			delete(annotations, controller.OriginalIngressClassAnnotation)
 			modified = true
 		}
-	}
 
-	updated.Annotations = annotations
-	if !modified {
+		if restoreExternalDNS {
+			if originalHostname, ok := annotations[controller.OriginalExternalDNSHostname]; ok {
+				if originalHostname != "" {
+					annotations[controller.ExternalDNSHostnameAnnotation] = originalHostname
+				} else {
+					delete(annotations, controller.ExternalDNSHostnameAnnotation)
+				}
+				delete(annotations, controller.OriginalExternalDNSHostname)
+				modified = true
+			}
+
+			if originalSource, ok := annotations[controller.OriginalExternalDNSIngressHostnameSource]; ok {
+				if originalSource != "" {
+					annotations[controller.ExternalDNSIngressHostnameSource] = originalSource
+				} else {
+					delete(annotations, controller.ExternalDNSIngressHostnameSource)
+				}
+				delete(annotations, controller.OriginalExternalDNSIngressHostnameSource)
+				modified = true
+			} else if _, exists := annotations[controller.ExternalDNSIngressHostnameSource]; exists {
+				delete(annotations, controller.ExternalDNSIngressHostnameSource)
+				modified = true
+			}
+
+			if annotations[controller.IngressDisabledAnnotation] == controller.IngressDisabledReasonExternalDNS {
+				delete(annotations, controller.IngressDisabledAnnotation)
+				modified = true
+			}
+		}
+
+		updated.Annotations = annotations
+		return modified, nil
+	})
+}
+
+func updateIngressWithRetry(
+	ctx context.Context,
+	cli client.Client,
+	ingress *networkingv1.Ingress,
+	mutate func(*networkingv1.Ingress) (bool, error),
+) error {
+	if ingress == nil {
 		return nil
 	}
-	return cli.Update(ctx, updated)
+	key := types.NamespacedName{Namespace: ingress.Namespace, Name: ingress.Name}
+	var lastErr error
+	for attempt := 0; attempt < 3; attempt++ {
+		current := &networkingv1.Ingress{}
+		if err := cli.Get(ctx, key, current); err != nil {
+			return err
+		}
+		updated := current.DeepCopy()
+		modified, err := mutate(updated)
+		if err != nil {
+			return err
+		}
+		if !modified {
+			return nil
+		}
+		if err := cli.Update(ctx, updated); err != nil {
+			if apierrors.IsConflict(err) {
+				lastErr = err
+				continue
+			}
+			return err
+		}
+		return nil
+	}
+	if lastErr != nil {
+		return lastErr
+	}
+	return fmt.Errorf("failed to update ingress %s/%s after retries", ingress.Namespace, ingress.Name)
 }
 
 func needsExternalDNSRestore(ingress *networkingv1.Ingress) bool {
@@ -476,6 +580,43 @@ func needsExternalDNSRestore(ingress *networkingv1.Ingress) bool {
 	}
 	_, ok := ingress.Annotations[controller.ExternalDNSIngressHostnameSource]
 	return ok
+}
+
+func isManagedByUsForIngressWithReason(route *gatewayv1.HTTPRoute, ingressNamespace, ingressName string) bool {
+	if route == nil {
+		return false
+	}
+	annotations := route.GetAnnotations()
+	if annotations == nil {
+		setupLog.Info("Skipping HTTPRoute not managed by ingress-doperator (missing annotations)",
+			"namespace", route.Namespace,
+			"name", route.Name)
+		return false
+	}
+	if annotations[utils.ManagedByAnnotation] != utils.ManagedByValue {
+		setupLog.Info("Skipping HTTPRoute not managed by ingress-doperator (managed-by mismatch)",
+			"namespace", route.Namespace,
+			"name", route.Name,
+			"managedBy", annotations[utils.ManagedByAnnotation])
+		return false
+	}
+	source := annotations[utils.SourceAnnotation]
+	if source == "" {
+		setupLog.Info("Skipping HTTPRoute not managed by ingress-doperator (missing source annotation)",
+			"namespace", route.Namespace,
+			"name", route.Name)
+		return false
+	}
+	expected := fmt.Sprintf("%s/%s", ingressNamespace, ingressName)
+	if source != expected {
+		setupLog.Info("Skipping HTTPRoute not managed by ingress-doperator (source mismatch)",
+			"namespace", route.Namespace,
+			"name", route.Name,
+			"expected", expected,
+			"actual", source)
+		return false
+	}
+	return true
 }
 
 func shouldDeleteIngress(ingress *networkingv1.Ingress) bool {
@@ -660,11 +801,13 @@ func disableExternalDNSForDerived(
 	if err != nil {
 		return err
 	}
+	managedRoutes := make([]gatewayv1.HTTPRoute, 0, len(routes))
 	for _, route := range routes {
 		httpRoute := route
-		if !utils.IsManagedByUsForIngress(&httpRoute, ingress.Namespace, ingress.Name) {
-			return fmt.Errorf("httproute %s/%s not managed by ingress-doperator", httpRoute.Namespace, httpRoute.Name)
+		if !isManagedByUsForIngressWithReason(&httpRoute, ingress.Namespace, ingress.Name) {
+			continue
 		}
+		managedRoutes = append(managedRoutes, httpRoute)
 	}
 
 	allRoutes := &gatewayv1.HTTPRouteList{}
@@ -689,14 +832,18 @@ func disableExternalDNSForDerived(
 		}
 	}
 
-	if len(routes) == 0 {
+	if len(managedRoutes) == 0 {
 		return fmt.Errorf("missing managed derived resources (httproutes=0)")
 	}
 
-	for _, route := range routes {
+	for _, route := range managedRoutes {
 		httpRoute := route
 		updated := httpRoute.DeepCopy()
-		annotations, modified, warning := applyExternalDNSDisableAnnotations(updated.Annotations)
+		annotations, modified, warning := applyExternalDNSDisableAnnotations(
+			updated.Annotations,
+			controller.ExternalDNSGatewayHostnameSource,
+			controller.OriginalExternalDNSGatewayHostnameSource,
+		)
 		if annotations[controller.IngressDisabledAnnotation] == "" {
 			annotations[controller.IngressDisabledAnnotation] = controller.IngressDisabledReasonExternalDNS
 			modified = true
@@ -739,7 +886,11 @@ func disableExternalDNSForDerived(
 			continue
 		}
 		updated := gateway.DeepCopy()
-		annotations, modified, warning := applyExternalDNSDisableAnnotations(updated.Annotations)
+		annotations, modified, warning := applyExternalDNSDisableAnnotations(
+			updated.Annotations,
+			controller.ExternalDNSGatewayHostnameSource,
+			controller.OriginalExternalDNSGatewayHostnameSource,
+		)
 		updated.Annotations = annotations
 		if warning {
 			setupLog.Info("external-dns hostname annotation present on Gateway; storing original value",
@@ -756,31 +907,39 @@ func disableExternalDNSForDerived(
 	return nil
 }
 
-func applyExternalDNSDisableAnnotations(annotations map[string]string) (map[string]string, bool, bool) {
+func applyExternalDNSDisableAnnotations(
+	annotations map[string]string,
+	sourceKey string,
+	originalSourceKey string,
+) (map[string]string, bool, bool) {
 	if annotations == nil {
 		annotations = map[string]string{}
 	}
 	modified := false
 	warning := false
-
-	if hostname, exists := annotations[controller.ExternalDNSHostnameAnnotation]; exists && hostname != "" {
-		if _, saved := annotations[controller.OriginalExternalDNSHostname]; !saved {
-			annotations[controller.OriginalExternalDNSHostname] = hostname
-			modified = true
-			warning = true
-		}
-	}
-
-	if source, exists := annotations[controller.ExternalDNSIngressHostnameSource]; exists {
-		if _, saved := annotations[controller.OriginalExternalDNSIngressHostnameSource]; !saved {
-			annotations[controller.OriginalExternalDNSIngressHostnameSource] = source
-			modified = true
-		}
-	}
-
-	if annotations[controller.ExternalDNSIngressHostnameSource] != controller.ExternalDNSHostnameSourceAnnotationOnly {
-		annotations[controller.ExternalDNSIngressHostnameSource] = controller.ExternalDNSHostnameSourceAnnotationOnly
+	prevSource, hadSource := annotations[sourceKey]
+	changedSource := false
+	if prevSource != controller.ExternalDNSHostnameSourceAnnotationOnly {
+		annotations[sourceKey] = controller.ExternalDNSHostnameSourceAnnotationOnly
 		modified = true
+		changedSource = true
+	}
+
+	if changedSource {
+		if hostname, exists := annotations[controller.ExternalDNSHostnameAnnotation]; exists && hostname != "" {
+			if _, saved := annotations[controller.OriginalExternalDNSHostname]; !saved {
+				annotations[controller.OriginalExternalDNSHostname] = hostname
+				modified = true
+				warning = true
+			}
+		}
+
+		if hadSource {
+			if _, saved := annotations[originalSourceKey]; !saved {
+				annotations[originalSourceKey] = prevSource
+				modified = true
+			}
+		}
 	}
 
 	return annotations, modified, warning
