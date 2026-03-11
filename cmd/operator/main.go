@@ -318,18 +318,18 @@ type operatorConfig struct {
 	Ingress2GatewayProvider         string
 	Ingress2GatewayIngressClass     string
 
-	ParsedClassSnippetsFilters     []utils.IngressClassSnippetsFilter
-	ParsedNameSnippetsFilters      []utils.IngressClassSnippetsFilter
-	ParsedAnnotationSnippetsAdd    []utils.IngressAnnotationSnippetsRule
-	ParsedAnnotationSnippetsRemove []utils.IngressAnnotationSnippetsRule
-	IngressPostProcessingMode      controller.IngressPostProcessingMode
-	GatewayFilters                 []string
-	HTTPRouteFilters               []string
-	GatewayAnnotationsMap          map[string]string
-	GatewayInfraAnnotationsMap     map[string]string
+	ParsedClassSnippetsFilters       []utils.IngressClassSnippetsFilter
+	ParsedNameSnippetsFilters        []utils.IngressClassSnippetsFilter
+	ParsedAnnotationSnippetsAdd      []utils.IngressAnnotationSnippetsRule
+	ParsedAnnotationSnippetsRemove   []utils.IngressAnnotationSnippetsRule
+	IngressPostProcessingMode        controller.IngressPostProcessingMode
+	GatewayFilters                   []string
+	HTTPRouteFilters                 []string
+	GatewayAnnotationsMap            map[string]string
+	GatewayInfraAnnotationsMap       map[string]string
 	InfrastructureAnnotationsByClass []translator.IngressClassAnnotationsRule
-	IngressClassFilters            []string
-	IngressClassIgnoreFilters      []string
+	IngressClassFilters              []string
+	IngressClassIgnoreFilters        []string
 }
 
 func parseOperatorConfig() (operatorConfig, zap.Options, error) {

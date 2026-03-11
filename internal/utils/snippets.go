@@ -773,6 +773,8 @@ func escapeHeaderValue(value string) string {
 
 // sanitizeQuotedRegex escapes backslashes and double quotes in a location path
 // so paths cannot escape NGINX configuration.
+//
+//nolint:unused // Reserved for future use in rewrite path sanitization.
 func sanitizeQuotedRegex(path string) string {
 	builder := strings.Builder{}
 	builder.Grow(2 * len(path))
