@@ -169,6 +169,7 @@ func main() {
 		}
 	}
 
+	// Setup Ingress controller (manages Ingress → HTTPRoute translation)
 	if err = (&controller.IngressReconciler{
 		Client:                           mgr.GetClient(),
 		Scheme:                           mgr.GetScheme(),
@@ -209,6 +210,20 @@ func main() {
 		},
 	}).SetupWithManager(mgr); err != nil {
 		setupLog.Error(err, "unable to create controller", "controller", "Ingress")
+		os.Exit(1)
+	}
+
+	// Setup HTTPRoute controller (manages Gateway listeners based on HTTPRoutes)
+	if err = (&controller.HTTPRouteReconciler{
+		Client:              mgr.GetClient(),
+		Scheme:              mgr.GetScheme(),
+		GatewayNamespace:    cfg.GatewayNamespace,
+		GatewayName:         cfg.GatewayName,
+		GatewayClassName:    cfg.GatewayClassName,
+		HostnameRewriteFrom: cfg.HostnameRewriteFrom,
+		HostnameRewriteTo:   cfg.HostnameRewriteTo,
+	}).SetupWithManager(mgr); err != nil {
+		setupLog.Error(err, "unable to create controller", "controller", "HTTPRoute")
 		os.Exit(1)
 	}
 

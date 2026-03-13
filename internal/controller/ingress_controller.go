@@ -73,7 +73,8 @@ const (
 	IngressDisabledReasonExternalDNS         = "external-dns"
 	DefaultGatewayAnnotationFilters          = "ingress.kubernetes.io," +
 		"nginx.ingress.kubernetes.io,kubectl.kubernetes.io,kubernetes.io/ingress.class," +
-		"traefik.ingress.kubernetes.io,ingress-doperator.fiction.si"
+		"traefik.ingress.kubernetes.io,ingress-doperator.fiction.si," +
+		"external-dns.alpha.kubernetes.io"
 	DefaultHTTPRouteAnnotationFilters = "ingress.kubernetes.io," +
 		"nginx.ingress.kubernetes.io,kubectl.kubernetes.io,kubernetes.io/ingress.class," +
 		"traefik.ingress.kubernetes.io,ingress-doperator.fiction.si"
@@ -197,77 +198,10 @@ func (r *IngressReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 		logger.V(1).Info("Added finalizer to Ingress")
 	}
 
-	// Handle source Ingress based on configured mode
-	effectiveMode := r.resolveIngressPostProcessingMode(&ingress)
-	switch effectiveMode {
-	case IngressPostProcessingModeRemove:
-		if err := r.removeIngress(ctx, &ingress); err != nil {
-			logger.Error(err, "failed to remove source Ingress")
-			return ctrl.Result{RequeueAfter: requeueAfterError}, nil
-		}
-		// After removal, no further processing needed
-		return ctrl.Result{}, nil
-	case IngressPostProcessingModeNone:
-		// Do nothing, continue with normal processing
-	case IngressPostProcessingModeDisableExternalDNS:
-		// Do nothing, continue with normal processing
-	}
-
-	// List Ingresses (all or filtered by namespace)
-	var ingressList networkingv1.IngressList
-	listOpts := []client.ListOption{}
-	if r.WatchNamespace != "" {
-		listOpts = append(listOpts, client.InNamespace(r.WatchNamespace))
-	}
-
-	if err := r.List(ctx, &ingressList, listOpts...); err != nil {
-		logger.Error(err, "unable to list Ingresses")
-		return ctrl.Result{RequeueAfter: requeueAfterError}, nil
-	}
-
-	disableAfterReconcile := effectiveMode == IngressPostProcessingModeDisable
-	disableExternalDNSAfterReconcile := effectiveMode == IngressPostProcessingModeDisableExternalDNS
-	if r.OneGatewayPerIngress {
-		// Mode: One Gateway per Ingress
-		result, ok := r.reconcileOneGatewayPerIngress(ctx, ingressList.Items)
-		if ok {
-			if disableAfterReconcile {
-				if err := r.disableIngress(ctx, &ingress); err != nil {
-					logger.Error(err, "failed to disable source Ingress")
-					return ctrl.Result{RequeueAfter: requeueAfterError}, nil
-				}
-			}
-			if disableExternalDNSAfterReconcile {
-				if err := r.disableExternalDNS(ctx, &ingress); err != nil {
-					logger.Error(err, "failed to disable external-dns for source Ingress")
-					return ctrl.Result{RequeueAfter: requeueAfterError}, nil
-				}
-			}
-			r.recordNormal(&ingress, "ReconcileSuccess", "Ingress reconcile completed")
-		}
-		r.maybeRecordReconcile(&ingress, result, nil)
-		return result, nil
-	}
-
-	// Mode: Shared Gateways (group by IngressClass)
-	result, ok := r.reconcileSharedGateways(ctx, ingressList.Items)
-	if ok {
-		if disableAfterReconcile {
-			if err := r.disableIngress(ctx, &ingress); err != nil {
-				logger.Error(err, "failed to disable source Ingress")
-				return ctrl.Result{RequeueAfter: requeueAfterError}, nil
-			}
-		}
-		if disableExternalDNSAfterReconcile {
-			if err := r.disableExternalDNS(ctx, &ingress); err != nil {
-				logger.Error(err, "failed to disable external-dns for source Ingress")
-				return ctrl.Result{RequeueAfter: requeueAfterError}, nil
-			}
-		}
-		r.recordNormal(&ingress, "ReconcileSuccess", "Ingress reconcile completed")
-	}
-	r.maybeRecordReconcile(&ingress, result, nil)
-	return result, nil
+	// Translate this Ingress to HTTPRoute (Gateway listeners are managed by HTTPRoute controller)
+	result, err := r.reconcileIngressToHTTPRoute(ctx, &ingress)
+	r.maybeRecordReconcile(&ingress, result, err)
+	return result, err
 }
 
 func (r *IngressReconciler) shouldSkipIngress(
@@ -335,6 +269,98 @@ func (r *IngressReconciler) shouldSkipIngress(
 	}
 
 	return false
+}
+
+// reconcileIngressToHTTPRoute translates a single Ingress to HTTPRoute
+// Gateway listeners are managed separately by the HTTPRoute controller
+func (r *IngressReconciler) reconcileIngressToHTTPRoute(
+	ctx context.Context,
+	ingress *networkingv1.Ingress,
+) (ctrl.Result, error) {
+	logger := log.FromContext(ctx)
+
+	// Check if this Ingress should be processed
+	if !r.shouldIncludeIngressForSynthesis(ingress, logger) {
+		logger.V(1).Info("Skipping Ingress synthesis", "namespace", ingress.Namespace, "name", ingress.Name)
+		return ctrl.Result{}, nil
+	}
+
+	// Handle source Ingress post-processing mode
+	effectiveMode := r.resolveIngressPostProcessingMode(ingress)
+
+	// Get translator
+	trans := r.getTranslator()
+
+	// Determine Gateway name based on mode
+	var gatewayName string
+	if r.OneGatewayPerIngress {
+		// One Gateway per Ingress mode - use ingress name
+		gatewayName = ingress.Name
+	} else {
+		// Shared Gateway mode - use ingress class
+		ingressClass := r.getIngressClass(ingress)
+		gatewayName = r.getGatewayNameForClass(ingressClass)
+	}
+
+	// Override gateway name in translator config
+	transConfig := trans.Config
+	transConfig.GatewayName = gatewayName
+	singleTrans := translator.New(transConfig)
+
+	// Translate to HTTPRoute (we no longer create Gateway here)
+	httpRoute := singleTrans.TranslateToHTTPRoute(ingress)
+	setHTTPRouteOwnerReference(httpRoute, ingress)
+
+	// Apply extension refs (snippets, auth, headers)
+	r.applyHTTPRouteExtensionRefs(ctx, ingress, httpRoute)
+
+	// Resolve any named ports before applying
+	if err := r.HTTPRouteManager.ResolveNamedPorts(ctx, ingress, httpRoute); err != nil {
+		logger.Error(err, "failed to resolve named ports")
+		// Continue anyway with fallback ports
+	}
+
+	// Split HTTPRoute if it exceeds the Gateway API limit
+	httpRoutes := r.HTTPRouteManager.SplitHTTPRouteIfNeeded(httpRoute)
+
+	// Apply all HTTPRoute(s) with proper cleanup of obsolete split routes
+	metricRecorder := func(operation, namespace, name string) {
+		metrics.HTTPRouteResourcesTotal.WithLabelValues(operation, namespace, name).Inc()
+	}
+	if err := r.HTTPRouteManager.ApplyHTTPRoutesAtomic(ctx, ingress, httpRoutes, metricRecorder); err != nil {
+		logger.Error(err, "failed to apply HTTPRoutes")
+		r.logErrorRateLimited(err, "apply-httproutes", "failed to apply HTTPRoutes")
+		return ctrl.Result{RequeueAfter: requeueAfterError}, err
+	}
+
+	logger.V(1).Info("HTTPRoute applied successfully", "namespace", httpRoute.Namespace, "name", httpRoute.Name)
+
+	// Handle post-processing based on mode
+	switch effectiveMode {
+	case IngressPostProcessingModeRemove:
+		if err := r.removeIngress(ctx, ingress); err != nil {
+			logger.Error(err, "failed to remove source Ingress")
+			return ctrl.Result{RequeueAfter: requeueAfterError}, err
+		}
+		logger.Info("Removed source Ingress", "namespace", ingress.Namespace, "name", ingress.Name)
+	case IngressPostProcessingModeDisable:
+		if err := r.disableIngress(ctx, ingress); err != nil {
+			logger.Error(err, "failed to disable source Ingress")
+			return ctrl.Result{RequeueAfter: requeueAfterError}, err
+		}
+		logger.Info("Disabled source Ingress", "namespace", ingress.Namespace, "name", ingress.Name)
+	case IngressPostProcessingModeDisableExternalDNS:
+		if err := r.disableExternalDNS(ctx, ingress); err != nil {
+			logger.Error(err, "failed to disable external-dns for source Ingress")
+			return ctrl.Result{RequeueAfter: requeueAfterError}, err
+		}
+		logger.Info("Disabled external-dns on source Ingress", "namespace", ingress.Namespace, "name", ingress.Name)
+	case IngressPostProcessingModeNone:
+		// Do nothing
+	}
+
+	r.recordNormal(ingress, "ReconcileSuccess", "Ingress reconciled to HTTPRoute successfully")
+	return ctrl.Result{}, nil
 }
 
 func (r *IngressReconciler) shouldIncludeIngressForSynthesis(
@@ -845,16 +871,6 @@ func (r *IngressReconciler) handleDeletion(ctx context.Context, ingress *network
 
 	if err := r.deleteManagedHTTPRoutes(ctx, ingress, logger); err != nil {
 		return ctrl.Result{}, err
-	}
-
-	if r.OneGatewayPerIngress {
-		if err := r.cleanupOneGatewayPerIngress(ctx, ingress, logger); err != nil {
-			return ctrl.Result{}, err
-		}
-	} else {
-		if err := r.cleanupSharedGateway(ctx, ingress, logger); err != nil {
-			return ctrl.Result{}, err
-		}
 	}
 
 	return r.finalizeDeletion(ctx, ingress)

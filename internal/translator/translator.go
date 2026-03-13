@@ -312,12 +312,19 @@ func (t *Translator) TranslateMultipleToSharedGateway(
 	gateway.Spec.GatewayClassName = gatewayv1.ObjectName(t.Config.GatewayClassName)
 
 	// Merge annotations from all ingresses (with filtering)
-	gateway.Annotations = make(map[string]string)
+	// Collect all values for each annotation key, then deduplicate
+	annotationValues := make(map[string][]string)
 	for _, ingress := range ingresses {
 		filtered := t.FilterAnnotations(ingress.Annotations, t.Config.GatewayAnnotationFilters)
 		for k, v := range filtered {
-			gateway.Annotations[k] = v
+			annotationValues[k] = append(annotationValues[k], v)
 		}
+	}
+
+	// Build final annotations map with deduplicated, comma-separated values
+	gateway.Annotations = make(map[string]string)
+	for k, values := range annotationValues {
+		gateway.Annotations[k] = deduplicateAndJoin(values)
 	}
 
 	// Apply default gateway annotations
@@ -364,16 +371,15 @@ func (t *Translator) TranslateMultipleToSharedGateway(
 		}
 	}
 
-	// Collect unique hostnames with their TLS configurations, namespace, and unique namespaces
+	// Collect unique hostnames with their TLS configurations and namespaces
+	// Multiple ingresses in different namespaces can define the same hostname
 	type hostnameInfo struct {
-		tlsConfig *networkingv1.IngressTLS
-		namespace string
+		tlsConfig  *networkingv1.IngressTLS
+		namespaces map[string]bool // Track ALL namespaces that define this hostname
 	}
-	hostnameMap := make(map[string]hostnameInfo)
-	namespacesSet := make(map[string]bool)
+	hostnameMap := make(map[string]*hostnameInfo)
 
 	for _, ingress := range ingresses {
-		namespacesSet[ingress.Namespace] = true
 		for _, rule := range ingress.Spec.Rules {
 			if rule.Host != "" {
 				// Find TLS config for this host
@@ -389,18 +395,25 @@ func (t *Translator) TranslateMultipleToSharedGateway(
 						break
 					}
 				}
-				hostnameMap[rule.Host] = hostnameInfo{
-					tlsConfig: tlsConfig,
-					namespace: ingress.Namespace,
+
+				// Get or create hostname info
+				info, exists := hostnameMap[rule.Host]
+				if !exists {
+					info = &hostnameInfo{
+						namespaces: make(map[string]bool),
+					}
+					hostnameMap[rule.Host] = info
+				}
+
+				// Add this namespace to the set for this hostname
+				info.namespaces[ingress.Namespace] = true
+
+				// Update TLS config (prefer non-nil if available)
+				if info.tlsConfig == nil && tlsConfig != nil {
+					info.tlsConfig = tlsConfig
 				}
 			}
 		}
-	}
-
-	// Convert namespaces set to slice for label selector
-	namespacesList := make([]string, 0, len(namespacesSet))
-	for ns := range namespacesSet {
-		namespacesList = append(namespacesList, ns)
 	}
 
 	// Create listeners for each unique hostname
@@ -411,6 +424,30 @@ func (t *Translator) TranslateMultipleToSharedGateway(
 	for hostname, info := range hostnameMap {
 		// Apply hostname transformation for Gateway listener if configured
 		transformedHostname := t.TransformHostname(hostname)
+
+		// Convert namespace set to slice for this specific hostname
+		namespacesForHostname := make([]string, 0, len(info.namespaces))
+		for ns := range info.namespaces {
+			namespacesForHostname = append(namespacesForHostname, ns)
+		}
+
+		// For TLS configuration, pick the first namespace (deterministically sorted)
+		// This is used for the secret reference when multiple namespaces define the same hostname
+		var primaryNamespace string
+		if len(namespacesForHostname) > 0 {
+			// Sort to ensure deterministic selection
+			sortedNamespaces := make([]string, len(namespacesForHostname))
+			copy(sortedNamespaces, namespacesForHostname)
+			// Simple bubble sort for small slices
+			for i := 0; i < len(sortedNamespaces); i++ {
+				for j := i + 1; j < len(sortedNamespaces); j++ {
+					if sortedNamespaces[i] > sortedNamespaces[j] {
+						sortedNamespaces[i], sortedNamespaces[j] = sortedNamespaces[j], sortedNamespaces[i]
+					}
+				}
+			}
+			primaryNamespace = sortedNamespaces[0]
+		}
 
 		listener := gatewayv1.Listener{
 			Name:     gatewayv1.SectionName(transformedHostname), // Use transformed hostname as section name
@@ -428,7 +465,7 @@ func (t *Translator) TranslateMultipleToSharedGateway(
 							{
 								Key:      "kubernetes.io/metadata.name",
 								Operator: metav1.LabelSelectorOpIn,
-								Values:   namespacesList,
+								Values:   namespacesForHostname, // Only namespaces that have this hostname
 							},
 						},
 					},
@@ -438,27 +475,27 @@ func (t *Translator) TranslateMultipleToSharedGateway(
 
 		if info.tlsConfig != nil && info.tlsConfig.SecretName != "" {
 			secretName := info.tlsConfig.SecretName
-			secretNamespace := info.namespace
+			secretNamespace := primaryNamespace
 
 			// Check if hostname was transformed and certificate doesn't match
 			if hostname != transformedHostname && !t.CheckCertificateMatch(hostname, transformedHostname, info.tlsConfig.Hosts) {
 				// Generate new secret name in Gateway namespace (for cert-manager to provision)
 				// Format: automatic-{original-namespace}-{hostname}-tls
 				newSecretName := fmt.Sprintf("automatic-%s-%s-tls",
-					info.namespace,
+					primaryNamespace,
 					strings.ReplaceAll(transformedHostname, ".", "-"))
 				logger.Info("Certificate doesn't match transformed hostname, using automatic secret in Gateway namespace",
 					"original", hostname,
 					"transformed", transformedHostname,
 					"originalSecret", info.tlsConfig.SecretName,
-					"originalNamespace", info.namespace,
+					"originalNamespace", primaryNamespace,
 					"newSecret", newSecretName,
 					"newNamespace", t.Config.GatewayNamespace,
 					"certHosts", info.tlsConfig.Hosts)
 				certMismatches = append(certMismatches,
 					fmt.Sprintf("%s->%s: %s/%s->%s/%s",
 						hostname, transformedHostname,
-						info.namespace, info.tlsConfig.SecretName,
+						primaryNamespace, info.tlsConfig.SecretName,
 						t.Config.GatewayNamespace, newSecretName))
 				secretName = newSecretName
 				secretNamespace = t.Config.GatewayNamespace // cert-manager will create in Gateway namespace
@@ -1114,4 +1151,26 @@ func generateSafeSecretName(namespace, hostname string) string {
 	}
 
 	return safeName
+}
+
+// deduplicateAndJoin deduplicates string values and joins them with commas
+// Used for merging annotation values from multiple ingresses
+func deduplicateAndJoin(values []string) string {
+	if len(values) == 0 {
+		return ""
+	}
+	if len(values) == 1 {
+		return values[0]
+	}
+
+	seen := make(map[string]bool)
+	unique := make([]string, 0, len(values))
+	for _, v := range values {
+		if v != "" && !seen[v] {
+			seen[v] = true
+			unique = append(unique, v)
+		}
+	}
+
+	return strings.Join(unique, ",")
 }
