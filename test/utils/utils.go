@@ -116,8 +116,18 @@ func IsGatewayAPICRDsInstalled() bool {
 	return false
 }
 
-// LoadImageToKindClusterWithName loads a local docker image to the kind cluster
+// LoadImageToKindClusterWithName loads a local docker image to the kind cluster or rancher-desktop
 func LoadImageToKindClusterWithName(name string) error {
+	// Check if we're using rancher-desktop
+	if v, ok := os.LookupEnv("USE_RANCHER_DESKTOP"); ok && v == "true" {
+		_, _ = fmt.Fprintf(GinkgoWriter,
+			"Detected rancher-desktop environment. Skipping image load (image should already be available).\n")
+		// For rancher-desktop, the image is already available to the cluster
+		// since it uses the same Docker daemon
+		return nil
+	}
+
+	// Original Kind logic
 	cluster := defaultKindCluster
 	if v, ok := os.LookupEnv("KIND_CLUSTER"); ok {
 		cluster = v

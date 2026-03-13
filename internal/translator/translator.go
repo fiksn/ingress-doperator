@@ -21,6 +21,7 @@ import (
 	"fmt"
 	"path/filepath"
 	"regexp"
+	"sort"
 	"strings"
 
 	"github.com/kubernetes-sigs/ingress2gateway/pkg/i2gw"
@@ -37,13 +38,14 @@ import (
 )
 
 const (
-	ManagedByAnnotation      = "ingress-doperator.fiction.si/managed-by"
-	ManagedByValue           = "ingress-doperator"
-	SourceAnnotation         = "ingress-doperator.fiction.si/source"
-	MismatchedCertAnnotation = "ingress-doperator.fiction.si/certificate-mismatch"
-	IngressClassAnnotation   = "kubernetes.io/ingress.class"
-	ReferenceGrantName       = "ingress-doperator-gateway-secrets"
-	MaxK8sNameLength         = 253 // Kubernetes resource name max length
+	ManagedByAnnotation       = "ingress-doperator.fiction.si/managed-by"
+	ManagedByValue            = "ingress-doperator"
+	SourceAnnotation          = "ingress-doperator.fiction.si/source"
+	MismatchedCertAnnotation  = "ingress-doperator.fiction.si/certificate-mismatch"
+	IngressClassAnnotation    = "kubernetes.io/ingress.class"
+	ReferenceGrantName        = "ingress-doperator-gateway-secrets"
+	MaxK8sNameLength          = 253 // Kubernetes resource name max length
+	labelSelectorNamespaceKey = "kubernetes.io/metadata.name"
 
 	RequestHeaderAddAnnotation     = "ingress-doperator.fiction.si/request-header-add"
 	RequestHeaderSetAnnotation     = "ingress-doperator.fiction.si/request-header-set"
@@ -306,13 +308,30 @@ func (t *Translator) extractServicesFromIngress(ingress *networkingv1.Ingress) [
 func (t *Translator) TranslateMultipleToSharedGateway(
 	ingresses []networkingv1.Ingress, gatewayName string,
 ) *gatewayv1.Gateway {
+	gateway := t.newSharedGateway(gatewayName)
+	t.applySharedGatewayAnnotations(gateway, ingresses)
+	t.applySharedGatewayInfrastructure(gateway, ingresses)
+
+	listeners, certMismatches := t.buildSharedGatewayListeners(ingresses)
+	if len(certMismatches) > 0 {
+		gateway.Annotations[MismatchedCertAnnotation] = strings.Join(certMismatches, "; ")
+	}
+	gateway.Spec.Listeners = listeners
+	return gateway
+}
+
+func (t *Translator) newSharedGateway(gatewayName string) *gatewayv1.Gateway {
 	gateway := &gatewayv1.Gateway{}
 	gateway.Name = gatewayName
 	gateway.Namespace = t.Config.GatewayNamespace
 	gateway.Spec.GatewayClassName = gatewayv1.ObjectName(t.Config.GatewayClassName)
+	return gateway
+}
 
-	// Merge annotations from all ingresses (with filtering)
-	// Collect all values for each annotation key, then deduplicate
+func (t *Translator) applySharedGatewayAnnotations(
+	gateway *gatewayv1.Gateway,
+	ingresses []networkingv1.Ingress,
+) {
 	annotationValues := make(map[string][]string)
 	for _, ingress := range ingresses {
 		filtered := t.FilterAnnotations(ingress.Annotations, t.Config.GatewayAnnotationFilters)
@@ -321,27 +340,28 @@ func (t *Translator) TranslateMultipleToSharedGateway(
 		}
 	}
 
-	// Build final annotations map with deduplicated, comma-separated values
 	gateway.Annotations = make(map[string]string)
 	for k, values := range annotationValues {
 		gateway.Annotations[k] = deduplicateAndJoin(values)
 	}
 
-	// Apply default gateway annotations
 	for key, value := range t.Config.DefaultGatewayAnnotations {
 		gateway.Annotations[key] = value
 	}
 
 	gateway.Annotations[ManagedByAnnotation] = ManagedByValue
 
-	// Track source ingresses
 	sourceNames := make([]string, 0, len(ingresses))
 	for _, ingress := range ingresses {
 		sourceNames = append(sourceNames, fmt.Sprintf("%s/%s", ingress.Namespace, ingress.Name))
 	}
 	gateway.Annotations[SourceAnnotation] = strings.Join(sourceNames, ",")
+}
 
-	// Check if any ingress in this group should have class-based infra annotations
+func (t *Translator) applySharedGatewayInfrastructure(
+	gateway *gatewayv1.Gateway,
+	ingresses []networkingv1.Ingress,
+) {
 	applyClassAnnotations := false
 	for _, ingress := range ingresses {
 		ingressClass := t.GetIngressClass(&ingress)
@@ -351,106 +371,81 @@ func (t *Translator) TranslateMultipleToSharedGateway(
 		}
 	}
 
-	// Add infrastructure annotations if any are configured
-	if len(t.Config.GatewayInfrastructureAnnotations) > 0 || applyClassAnnotations {
-		gateway.Spec.Infrastructure = &gatewayv1.GatewayInfrastructure{
-			Annotations: make(map[gatewayv1.AnnotationKey]gatewayv1.AnnotationValue),
-		}
-
-		// Apply base infrastructure annotations (applied to all)
-		for key, value := range t.Config.GatewayInfrastructureAnnotations {
-			gateway.Spec.Infrastructure.Annotations[gatewayv1.AnnotationKey(key)] = gatewayv1.AnnotationValue(value)
-		}
-
-		// Apply class-based annotations for all matching ingress classes
-		if applyClassAnnotations {
-			for _, ingress := range ingresses {
-				ingressClass := t.GetIngressClass(&ingress)
-				t.applyClassInfrastructureAnnotations(ingressClass, gateway.Spec.Infrastructure.Annotations)
-			}
-		}
+	if len(t.Config.GatewayInfrastructureAnnotations) == 0 && !applyClassAnnotations {
+		return
 	}
 
-	// Collect unique hostnames with their TLS configurations and namespaces
-	// Multiple ingresses in different namespaces can define the same hostname
-	type hostnameInfo struct {
-		tlsConfig  *networkingv1.IngressTLS
-		namespaces map[string]bool // Track ALL namespaces that define this hostname
+	gateway.Spec.Infrastructure = &gatewayv1.GatewayInfrastructure{
+		Annotations: make(map[gatewayv1.AnnotationKey]gatewayv1.AnnotationValue),
 	}
-	hostnameMap := make(map[string]*hostnameInfo)
 
+	for key, value := range t.Config.GatewayInfrastructureAnnotations {
+		gateway.Spec.Infrastructure.Annotations[gatewayv1.AnnotationKey(key)] = gatewayv1.AnnotationValue(value)
+	}
+
+	if applyClassAnnotations {
+		for _, ingress := range ingresses {
+			ingressClass := t.GetIngressClass(&ingress)
+			t.applyClassInfrastructureAnnotations(ingressClass, gateway.Spec.Infrastructure.Annotations)
+		}
+	}
+}
+
+type sharedHostnameInfo struct {
+	tlsConfig  *networkingv1.IngressTLS
+	namespaces map[string]bool
+}
+
+func (t *Translator) collectSharedHostnameInfo(
+	ingresses []networkingv1.Ingress,
+) map[string]*sharedHostnameInfo {
+	hostnameMap := make(map[string]*sharedHostnameInfo)
 	for _, ingress := range ingresses {
 		for _, rule := range ingress.Spec.Rules {
-			if rule.Host != "" {
-				// Find TLS config for this host
-				var tlsConfig *networkingv1.IngressTLS
-				for _, tls := range ingress.Spec.TLS {
-					for _, host := range tls.Hosts {
-						if host == rule.Host {
-							tlsConfig = &tls
-							break
-						}
-					}
-					if tlsConfig != nil {
-						break
-					}
+			if rule.Host == "" {
+				continue
+			}
+			tlsConfig := findTLSConfigForHostInIngress(&ingress, rule.Host)
+			info, exists := hostnameMap[rule.Host]
+			if !exists {
+				info = &sharedHostnameInfo{
+					namespaces: make(map[string]bool),
 				}
-
-				// Get or create hostname info
-				info, exists := hostnameMap[rule.Host]
-				if !exists {
-					info = &hostnameInfo{
-						namespaces: make(map[string]bool),
-					}
-					hostnameMap[rule.Host] = info
-				}
-
-				// Add this namespace to the set for this hostname
-				info.namespaces[ingress.Namespace] = true
-
-				// Update TLS config (prefer non-nil if available)
-				if info.tlsConfig == nil && tlsConfig != nil {
-					info.tlsConfig = tlsConfig
-				}
+				hostnameMap[rule.Host] = info
+			}
+			info.namespaces[ingress.Namespace] = true
+			if info.tlsConfig == nil && tlsConfig != nil {
+				info.tlsConfig = tlsConfig
 			}
 		}
 	}
+	return hostnameMap
+}
 
-	// Create listeners for each unique hostname
+func (t *Translator) buildSharedGatewayListeners(
+	ingresses []networkingv1.Ingress,
+) ([]gatewayv1.Listener, []string) {
+	hostnameMap := t.collectSharedHostnameInfo(ingresses)
 	listeners := make([]gatewayv1.Listener, 0, len(hostnameMap))
 	certMismatches := make([]string, 0)
 	logger := log.Log.WithName("translator")
 
 	for hostname, info := range hostnameMap {
-		// Apply hostname transformation for Gateway listener if configured
 		transformedHostname := t.TransformHostname(hostname)
 
-		// Convert namespace set to slice for this specific hostname
 		namespacesForHostname := make([]string, 0, len(info.namespaces))
 		for ns := range info.namespaces {
 			namespacesForHostname = append(namespacesForHostname, ns)
 		}
+		sort.Strings(namespacesForHostname)
 
-		// For TLS configuration, pick the first namespace (deterministically sorted)
-		// This is used for the secret reference when multiple namespaces define the same hostname
-		var primaryNamespace string
+		primaryNamespace := ""
 		if len(namespacesForHostname) > 0 {
-			// Sort to ensure deterministic selection
-			sortedNamespaces := make([]string, len(namespacesForHostname))
-			copy(sortedNamespaces, namespacesForHostname)
-			// Simple bubble sort for small slices
-			for i := 0; i < len(sortedNamespaces); i++ {
-				for j := i + 1; j < len(sortedNamespaces); j++ {
-					if sortedNamespaces[i] > sortedNamespaces[j] {
-						sortedNamespaces[i], sortedNamespaces[j] = sortedNamespaces[j], sortedNamespaces[i]
-					}
-				}
-			}
-			primaryNamespace = sortedNamespaces[0]
+			primaryNamespace = namespacesForHostname[0]
 		}
 
 		listener := gatewayv1.Listener{
-			Name:     gatewayv1.SectionName(transformedHostname), // Use transformed hostname as section name
+			Name:     gatewayv1.SectionName(transformedHostname),
 			Hostname: (*gatewayv1.Hostname)(&transformedHostname),
 			Port:     gatewayv1.PortNumber(443),
 			Protocol: gatewayv1.HTTPSProtocolType,
@@ -463,9 +458,9 @@ func (t *Translator) TranslateMultipleToSharedGateway(
 					Selector: &metav1.LabelSelector{
 						MatchExpressions: []metav1.LabelSelectorRequirement{
 							{
-								Key:      "kubernetes.io/metadata.name",
+								Key:      labelSelectorNamespaceKey,
 								Operator: metav1.LabelSelectorOpIn,
-								Values:   namespacesForHostname, // Only namespaces that have this hostname
+								Values:   namespacesForHostname,
 							},
 						},
 					},
@@ -477,10 +472,7 @@ func (t *Translator) TranslateMultipleToSharedGateway(
 			secretName := info.tlsConfig.SecretName
 			secretNamespace := primaryNamespace
 
-			// Check if hostname was transformed and certificate doesn't match
 			if hostname != transformedHostname && !t.CheckCertificateMatch(hostname, transformedHostname, info.tlsConfig.Hosts) {
-				// Generate new secret name in Gateway namespace (for cert-manager to provision)
-				// Format: automatic-{original-namespace}-{hostname}-tls
 				newSecretName := fmt.Sprintf("automatic-%s-%s-tls",
 					primaryNamespace,
 					strings.ReplaceAll(transformedHostname, ".", "-"))
@@ -498,7 +490,7 @@ func (t *Translator) TranslateMultipleToSharedGateway(
 						primaryNamespace, info.tlsConfig.SecretName,
 						t.Config.GatewayNamespace, newSecretName))
 				secretName = newSecretName
-				secretNamespace = t.Config.GatewayNamespace // cert-manager will create in Gateway namespace
+				secretNamespace = t.Config.GatewayNamespace
 			}
 
 			mode := gatewayv1.TLSModeTerminate
@@ -516,13 +508,18 @@ func (t *Translator) TranslateMultipleToSharedGateway(
 		listeners = append(listeners, listener)
 	}
 
-	// Add info annotation if there are certificate changes
-	if len(certMismatches) > 0 {
-		gateway.Annotations[MismatchedCertAnnotation] = strings.Join(certMismatches, "; ")
-	}
+	return listeners, certMismatches
+}
 
-	gateway.Spec.Listeners = listeners
-	return gateway
+func findTLSConfigForHostInIngress(ingress *networkingv1.Ingress, host string) *networkingv1.IngressTLS {
+	for _, tls := range ingress.Spec.TLS {
+		for _, tlsHost := range tls.Hosts {
+			if tlsHost == host {
+				return &tls
+			}
+		}
+	}
+	return nil
 }
 
 // TranslateToGateway converts an Ingress to a Gateway resource
@@ -614,7 +611,7 @@ func (t *Translator) TranslateToGateway(ingress *networkingv1.Ingress) *gatewayv
 					}(),
 					Selector: &metav1.LabelSelector{
 						MatchLabels: map[string]string{
-							"kubernetes.io/metadata.name": ingress.Namespace,
+							labelSelectorNamespaceKey: ingress.Namespace,
 						},
 					},
 				},

@@ -53,8 +53,15 @@ var _ = Describe("Manager", Ordered, func() {
 	// enforce the restricted security policy to the namespace, installing CRDs,
 	// and deploying the controller.
 	BeforeAll(func() {
+		// Clean up any leftover resources from previous test runs
+		By("cleaning up any existing test resources")
+		cmd := exec.Command("kubectl", "delete", "clusterrolebinding", metricsRoleBindingName, "--ignore-not-found")
+		_, _ = utils.Run(cmd)
+		cmd = exec.Command("kubectl", "delete", "ns", namespace, "--ignore-not-found", "--timeout=60s")
+		_, _ = utils.Run(cmd)
+
 		By("creating manager namespace")
-		cmd := exec.Command("kubectl", "create", "ns", namespace)
+		cmd = exec.Command("kubectl", "create", "ns", namespace)
 		_, err := utils.Run(cmd)
 		Expect(err).NotTo(HaveOccurred(), "Failed to create namespace")
 
@@ -170,13 +177,19 @@ var _ = Describe("Manager", Ordered, func() {
 		})
 
 		It("should ensure the metrics endpoint is serving metrics", func() {
-			By("creating a ClusterRoleBinding for the service account to allow access to metrics")
-			cmd := exec.Command("kubectl", "create", "clusterrolebinding", metricsRoleBindingName,
-				"--clusterrole=ingress-doperator-metrics-reader",
-				fmt.Sprintf("--serviceaccount=%s:%s", namespace, serviceAccountName),
-			)
+			By("ensuring ClusterRoleBinding exists for the service account to allow access to metrics")
+			// Use 'kubectl apply' or check if it exists first to make this idempotent
+			cmd := exec.Command("kubectl", "get", "clusterrolebinding", metricsRoleBindingName)
 			_, err := utils.Run(cmd)
-			Expect(err).NotTo(HaveOccurred(), "Failed to create ClusterRoleBinding")
+			if err != nil {
+				// ClusterRoleBinding doesn't exist, create it
+				cmd = exec.Command("kubectl", "create", "clusterrolebinding", metricsRoleBindingName,
+					"--clusterrole=ingress-doperator-metrics-reader",
+					fmt.Sprintf("--serviceaccount=%s:%s", namespace, serviceAccountName),
+				)
+				_, err = utils.Run(cmd)
+				Expect(err).NotTo(HaveOccurred(), "Failed to create ClusterRoleBinding")
+			}
 
 			By("validating that the metrics service is available")
 			cmd = exec.Command("kubectl", "get", "service", metricsServiceName, "-n", namespace)
@@ -268,10 +281,9 @@ var _ = Describe("Manager", Ordered, func() {
 			testNamespace := "test-ingress-translation"
 			gatewayNamespace := "default" // Operator is configured with --gateway-namespace=default
 
-			By("creating test namespace")
+			By("ensuring test namespace exists")
 			cmd := exec.Command("kubectl", "create", "ns", testNamespace)
-			_, err := utils.Run(cmd)
-			Expect(err).NotTo(HaveOccurred(), "Failed to create test namespace")
+			_, _ = utils.Run(cmd) // Ignore error if namespace already exists
 
 			By("creating a sample Ingress resource")
 			sampleIngress := `
@@ -302,7 +314,7 @@ spec:
 `
 			cmd = exec.Command("kubectl", "apply", "-f", "-")
 			cmd.Stdin = strings.NewReader(sampleIngress)
-			_, err = utils.Run(cmd)
+			_, err := utils.Run(cmd)
 			Expect(err).NotTo(HaveOccurred(), "Failed to create sample Ingress")
 
 			By("verifying Gateway resource is created")
@@ -330,7 +342,13 @@ spec:
 			Expect(output).To(Equal("ingress-doperator"), "Gateway should have managed-by annotation")
 
 			By("cleaning up test resources")
-			cmd = exec.Command("kubectl", "delete", "ns", testNamespace)
+			// Delete the test namespace (this removes Ingress, HTTPRoute, etc.)
+			cmd = exec.Command("kubectl", "delete", "ns", testNamespace, "--timeout=60s")
+			_, _ = utils.Run(cmd)
+
+			// Clean up the Gateway in the gateway namespace (created by the operator)
+			// Wait a bit for finalizers to complete
+			cmd = exec.Command("kubectl", "delete", "gateway", "nginx", "-n", gatewayNamespace, "--ignore-not-found")
 			_, _ = utils.Run(cmd)
 		})
 	})

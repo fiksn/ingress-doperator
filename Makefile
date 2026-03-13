@@ -67,27 +67,39 @@ test: manifests generate fmt vet setup-envtest ## Run tests.
 KIND_CLUSTER ?= ingress-doperator-test-e2e
 
 .PHONY: setup-test-e2e
-setup-test-e2e: ## Set up a Kind cluster for e2e tests if it does not exist
-	@command -v $(KIND) >/dev/null 2>&1 || { \
-		echo "Kind is not installed. Please install Kind manually."; \
-		exit 1; \
-	}
-	@case "$$($(KIND) get clusters)" in \
-		*"$(KIND_CLUSTER)"*) \
-			echo "Kind cluster '$(KIND_CLUSTER)' already exists. Skipping creation." ;; \
-		*) \
-			echo "Creating Kind cluster '$(KIND_CLUSTER)'..."; \
-			$(KIND) create cluster --name $(KIND_CLUSTER) ;; \
-	esac
+setup-test-e2e: ## Set up a Kind cluster for e2e tests if it does not exist (skipped for rancher-desktop)
+	@current_context=$$($(KUBECTL) config current-context 2>/dev/null || echo ""); \
+	if echo "$$current_context" | grep -q "rancher-desktop"; then \
+		echo "Detected rancher-desktop context. Skipping Kind cluster setup."; \
+	else \
+		command -v $(KIND) >/dev/null 2>&1 || { \
+			echo "Kind is not installed. Please install Kind manually."; \
+			exit 1; \
+		}; \
+		case "$$($(KIND) get clusters 2>/dev/null || echo '')" in \
+			*"$(KIND_CLUSTER)"*) \
+				echo "Kind cluster '$(KIND_CLUSTER)' already exists. Skipping creation." ;; \
+			*) \
+				echo "Creating Kind cluster '$(KIND_CLUSTER)'..."; \
+				$(KIND) create cluster --name $(KIND_CLUSTER) ;; \
+		esac; \
+	fi
 
 .PHONY: test-e2e
-test-e2e: setup-test-e2e manifests generate fmt vet ## Run the e2e tests. Expected an isolated environment using Kind.
-	KIND=$(KIND) KIND_CLUSTER=$(KIND_CLUSTER) go test -tags=e2e ./test/e2e/ -v -ginkgo.v
+test-e2e: setup-test-e2e manifests generate fmt vet ## Run the e2e tests. Expected an isolated environment using Kind or rancher-desktop.
+	@current_context=$$($(KUBECTL) config current-context 2>/dev/null || echo ""); \
+	use_rancher=$$(echo "$$current_context" | grep -q "rancher-desktop" && echo "true" || echo "false"); \
+	KIND=$(KIND) KIND_CLUSTER=$(KIND_CLUSTER) USE_RANCHER_DESKTOP=$$use_rancher go test -tags=e2e ./test/e2e/ -v -ginkgo.v
 	$(MAKE) cleanup-test-e2e
 
 .PHONY: cleanup-test-e2e
-cleanup-test-e2e: ## Tear down the Kind cluster used for e2e tests
-	@$(KIND) delete cluster --name $(KIND_CLUSTER)
+cleanup-test-e2e: ## Tear down the Kind cluster used for e2e tests (skipped for rancher-desktop)
+	@current_context=$$($(KUBECTL) config current-context 2>/dev/null || echo ""); \
+	if echo "$$current_context" | grep -q "rancher-desktop"; then \
+		echo "Detected rancher-desktop context. Skipping Kind cluster cleanup."; \
+	else \
+		$(KIND) delete cluster --name $(KIND_CLUSTER); \
+	fi
 
 .PHONY: lint
 lint: golangci-lint ## Run golangci-lint linter

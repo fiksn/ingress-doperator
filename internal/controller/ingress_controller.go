@@ -330,29 +330,88 @@ func (r *IngressReconciler) reconcileIngressToHTTPRoute(
 	if err := r.HTTPRouteManager.ApplyHTTPRoutesAtomic(ctx, ingress, httpRoutes, metricRecorder); err != nil {
 		logger.Error(err, "failed to apply HTTPRoutes")
 		r.logErrorRateLimited(err, "apply-httproutes", "failed to apply HTTPRoutes")
-		return ctrl.Result{RequeueAfter: requeueAfterError}, err
+		return ctrl.Result{}, err
 	}
 
 	logger.V(1).Info("HTTPRoute applied successfully", "namespace", httpRoute.Namespace, "name", httpRoute.Name)
+
+	// Ensure Gateway listeners are updated from this Ingress change before post-processing
+	listenerReconciler := &HTTPRouteReconciler{
+		Client:              r.Client,
+		GatewayNamespace:    r.GatewayNamespace,
+		GatewayClassName:    r.GatewayClassName,
+		HostnameRewriteFrom: r.HostnameRewriteFrom,
+		HostnameRewriteTo:   r.HostnameRewriteTo,
+	}
+
+	gateway, canManageGateway, gatewayExists, err := r.ensureGatewayForListenerUpdate(ctx, gatewayName)
+	if err != nil {
+		logger.Error(err, "failed to ensure Gateway for listener update")
+		return ctrl.Result{}, err
+	}
+	if !canManageGateway {
+		logger.Info("Skipping Gateway listener update - Gateway is not managed by us",
+			"namespace", r.GatewayNamespace,
+			"name", gatewayName)
+		return ctrl.Result{}, nil
+	}
+
+	// Ensure ReferenceGrant exists before updating Gateway listeners (cross-namespace secrets)
+	for _, route := range httpRoutes {
+		if route.Namespace != r.GatewayNamespace {
+			if err := listenerReconciler.ensureReferenceGrant(ctx, route); err != nil {
+				logger.Error(err, "failed to ensure ReferenceGrant for HTTPRoute",
+					"namespace", route.Namespace,
+					"name", route.Name)
+			}
+		}
+	}
+
+	updated := false
+	for _, route := range httpRoutes {
+		routeUpdated := listenerReconciler.updateGatewayListeners(ctx, gateway, route, ingress)
+		if routeUpdated {
+			updated = true
+		}
+	}
+	if updated {
+		if gatewayExists {
+			if err := r.Update(ctx, gateway); err != nil {
+				logger.Error(err, "failed to update Gateway after listener changes")
+				return ctrl.Result{}, err
+			}
+			metrics.GatewayResourcesTotal.WithLabelValues("update", gateway.Namespace, gateway.Name).Inc()
+		} else if len(gateway.Spec.Listeners) > 0 {
+			if err := r.Create(ctx, gateway); err != nil {
+				if apierrors.IsAlreadyExists(err) {
+					return ctrl.Result{RequeueAfter: requeueAfterError}, nil
+				}
+				logger.Error(err, "failed to create Gateway after listener changes")
+				return ctrl.Result{}, err
+			}
+			metrics.GatewayResourcesTotal.WithLabelValues("create", gateway.Namespace, gateway.Name).Inc()
+		}
+		logger.Info("Updated Gateway listeners from Ingress", "gateway", gatewayName)
+	}
 
 	// Handle post-processing based on mode
 	switch effectiveMode {
 	case IngressPostProcessingModeRemove:
 		if err := r.removeIngress(ctx, ingress); err != nil {
 			logger.Error(err, "failed to remove source Ingress")
-			return ctrl.Result{RequeueAfter: requeueAfterError}, err
+			return ctrl.Result{}, err
 		}
 		logger.Info("Removed source Ingress", "namespace", ingress.Namespace, "name", ingress.Name)
 	case IngressPostProcessingModeDisable:
 		if err := r.disableIngress(ctx, ingress); err != nil {
 			logger.Error(err, "failed to disable source Ingress")
-			return ctrl.Result{RequeueAfter: requeueAfterError}, err
+			return ctrl.Result{}, err
 		}
 		logger.Info("Disabled source Ingress", "namespace", ingress.Namespace, "name", ingress.Name)
 	case IngressPostProcessingModeDisableExternalDNS:
 		if err := r.disableExternalDNS(ctx, ingress); err != nil {
 			logger.Error(err, "failed to disable external-dns for source Ingress")
-			return ctrl.Result{RequeueAfter: requeueAfterError}, err
+			return ctrl.Result{}, err
 		}
 		logger.Info("Disabled external-dns on source Ingress", "namespace", ingress.Namespace, "name", ingress.Name)
 	case IngressPostProcessingModeNone:
@@ -361,6 +420,38 @@ func (r *IngressReconciler) reconcileIngressToHTTPRoute(
 
 	r.recordNormal(ingress, "ReconcileSuccess", "Ingress reconciled to HTTPRoute successfully")
 	return ctrl.Result{}, nil
+}
+
+func (r *IngressReconciler) ensureGatewayForListenerUpdate(
+	ctx context.Context,
+	gatewayName string,
+) (*gatewayv1.Gateway, bool, bool, error) {
+	gatewayNN := types.NamespacedName{
+		Namespace: r.GatewayNamespace,
+		Name:      gatewayName,
+	}
+	gateway := &gatewayv1.Gateway{}
+	if err := r.Get(ctx, gatewayNN, gateway); err != nil {
+		if !apierrors.IsNotFound(err) {
+			return nil, false, false, err
+		}
+		// Return a new Gateway object without creating it yet
+		initializer := &HTTPRouteReconciler{
+			GatewayNamespace: r.GatewayNamespace,
+			GatewayClassName: r.GatewayClassName,
+		}
+		gateway = initializer.createInitialGateway(gatewayName)
+		return gateway, true, false, nil
+	}
+
+	canManage, err := utils.CanUpdateResource(ctx, r.Client, gateway, gatewayNN)
+	if err != nil {
+		return nil, false, true, err
+	}
+	if !canManage {
+		return gateway, false, true, nil
+	}
+	return gateway, true, true, nil
 }
 
 func (r *IngressReconciler) shouldIncludeIngressForSynthesis(
@@ -438,208 +529,6 @@ func (r *IngressReconciler) resolveIngressPostProcessingMode(
 		return r.IngressPostProcessingMode
 	}
 }
-func (r *IngressReconciler) reconcileOneGatewayPerIngress(
-	ctx context.Context,
-	ingresses []networkingv1.Ingress,
-) (ctrl.Result, bool) {
-	logger := log.FromContext(ctx)
-	trans := r.getTranslator()
-	hadError := false
-
-	for _, ingress := range ingresses {
-		if !r.shouldIncludeIngressForSynthesis(&ingress, logger) {
-			continue
-		}
-		// Use translator to create Gateway and HTTPRoute
-		// Override gateway name to match ingress name for one-per-ingress mode
-		transConfig := trans.Config
-		transConfig.GatewayName = ingress.Name
-		singleTrans := translator.New(transConfig)
-
-		gateway, httpRoute, err := singleTrans.Translate(&ingress)
-		if err != nil {
-			logger.Error(err, "failed to translate Ingress", "namespace", ingress.Namespace, "name", ingress.Name)
-			r.logErrorRateLimited(err, "translate-ingress", "failed to translate ingress")
-			hadError = true
-			continue
-		}
-
-		if r.IngressPostProcessingMode != IngressPostProcessingModeRemove {
-			setGatewayOwnerReference(gateway, &ingress)
-		}
-		setHTTPRouteOwnerReference(httpRoute, &ingress)
-
-		r.applyHTTPRouteExtensionRefs(ctx, &ingress, httpRoute)
-
-		// Check if we can manage the Gateway resource
-		gatewayNN := types.NamespacedName{
-			Namespace: gateway.Namespace,
-			Name:      gateway.Name,
-		}
-		existingGateway := &gatewayv1.Gateway{}
-		canManageGateway, err := utils.CanUpdateResource(ctx, r.Client, existingGateway, gatewayNN)
-		if err != nil {
-			logger.Error(err, "error checking Gateway resource")
-			r.logErrorRateLimited(err, "check-gateway", "error checking Gateway resource")
-			hadError = true
-			continue
-		}
-
-		if canManageGateway {
-			logger.V(1).Info("Creating Gateway", "name", gateway.Name, "namespace", gateway.Namespace)
-			if err := r.applyGateway(ctx, gateway, existingGateway); err != nil {
-				logger.Error(err, "failed to apply Gateway")
-				r.logErrorRateLimited(err, "apply-gateway", "failed to apply Gateway")
-				hadError = true
-				continue
-			}
-			logger.V(1).Info("Gateway applied successfully", "namespace", gateway.Namespace, "name", gateway.Name)
-		}
-
-		// Resolve any named ports before applying
-		if err := r.HTTPRouteManager.ResolveNamedPorts(ctx, &ingress, httpRoute); err != nil {
-			logger.Error(err, "failed to resolve named ports")
-			// Continue anyway with fallback ports
-		}
-
-		// Split HTTPRoute if it exceeds the Gateway API limit
-		httpRoutes := r.HTTPRouteManager.SplitHTTPRouteIfNeeded(httpRoute)
-
-		// Apply all HTTPRoute(s) with proper cleanup of obsolete split routes
-		metricRecorder := func(operation, namespace, name string) {
-			metrics.HTTPRouteResourcesTotal.WithLabelValues(operation, namespace, name).Inc()
-		}
-		if err := r.HTTPRouteManager.ApplyHTTPRoutesAtomic(ctx, &ingress, httpRoutes, metricRecorder); err != nil {
-			logger.Error(err, "failed to apply HTTPRoutes")
-			r.logErrorRateLimited(err, "apply-httproutes", "failed to apply HTTPRoutes")
-			hadError = true
-			continue
-		}
-	}
-
-	if hadError {
-		return ctrl.Result{RequeueAfter: requeueAfterError}, false
-	}
-
-	return ctrl.Result{}, true
-}
-
-func (r *IngressReconciler) reconcileSharedGateways(
-	ctx context.Context,
-	ingresses []networkingv1.Ingress,
-) (ctrl.Result, bool) {
-	logger := log.FromContext(ctx)
-	hadError := false
-
-	// Group Ingresses by IngressClass
-	filteredIngresses := make([]networkingv1.Ingress, 0, len(ingresses))
-	for _, ingress := range ingresses {
-		if r.shouldIncludeIngressForSynthesis(&ingress, logger) {
-			filteredIngresses = append(filteredIngresses, ingress)
-		}
-	}
-	ingressesByClass := r.groupIngressesByClass(filteredIngresses)
-
-	// For each IngressClass, create a Gateway by merging listeners from all ingresses
-	for ingressClass, classIngresses := range ingressesByClass {
-		if ingressClass == DisabledIngressClassName {
-			logger.Info("Refusing to create disabled gateway",
-				"gatewayName", ingressClass,
-				"ingressCount", len(classIngresses))
-			continue
-		}
-		gatewayName := r.getGatewayNameForClass(ingressClass)
-
-		// Create a merged Gateway from all ingresses in this class using translator
-		trans := r.getTranslator()
-		gateway := trans.TranslateMultipleToSharedGateway(classIngresses, gatewayName)
-
-		// Check if we can manage the Gateway resource
-		gatewayNN := types.NamespacedName{
-			Namespace: gateway.Namespace,
-			Name:      gateway.Name,
-		}
-		existingGateway := &gatewayv1.Gateway{}
-		canManageGateway, err := utils.CanUpdateResource(ctx, r.Client, existingGateway, gatewayNN)
-		if err != nil {
-			logger.Error(err, "error checking Gateway resource")
-			r.logErrorRateLimited(err, "check-gateway", "error checking Gateway resource")
-			hadError = true
-			continue
-		}
-
-		if canManageGateway {
-			logger.V(1).Info("Reconciling Gateway", "name", gateway.Name, "namespace", gateway.Namespace)
-			if err := r.applyGateway(ctx, gateway, existingGateway); err != nil {
-				logger.Error(err, "failed to apply Gateway")
-				r.logErrorRateLimited(err, "apply-gateway", "failed to apply Gateway")
-				hadError = true
-				continue
-			}
-			logger.V(1).Info("Gateway applied successfully", "namespace", gateway.Namespace, "name", gateway.Name)
-		} else {
-			logger.V(1).Info("Skipping Gateway synthesis - resource exists and is not managed by us",
-				"namespace", gatewayNN.Namespace, "name", gatewayNN.Name)
-		}
-
-		// Create HTTPRoutes using translator for each Ingress in this class
-		for _, ingress := range classIngresses {
-			// Override gateway name for this class
-			transConfig := trans.Config
-			transConfig.GatewayName = gatewayName
-			classTrans := translator.New(transConfig)
-
-			httpRoute := classTrans.TranslateToHTTPRoute(&ingress)
-
-			setHTTPRouteOwnerReference(httpRoute, &ingress)
-
-			r.applyHTTPRouteExtensionRefs(ctx, &ingress, httpRoute)
-
-			// Resolve any named ports before applying
-			if err := r.HTTPRouteManager.ResolveNamedPorts(ctx, &ingress, httpRoute); err != nil {
-				logger.Error(err, "failed to resolve named ports")
-				// Continue anyway with fallback ports
-			}
-
-			// Split HTTPRoute if it exceeds the Gateway API limit
-			httpRoutes := r.HTTPRouteManager.SplitHTTPRouteIfNeeded(httpRoute)
-
-			// Apply all HTTPRoute(s) with proper cleanup of obsolete split routes
-			metricRecorder := func(operation, namespace, name string) {
-				metrics.HTTPRouteResourcesTotal.WithLabelValues(operation, namespace, name).Inc()
-			}
-			if err := r.HTTPRouteManager.ApplyHTTPRoutesAtomic(ctx, &ingress, httpRoutes, metricRecorder); err != nil {
-				logger.Error(err, "failed to apply HTTPRoutes")
-				r.logErrorRateLimited(err, "apply-httproutes", "failed to apply HTTPRoutes")
-				hadError = true
-				continue
-			}
-		}
-
-		// Create ReferenceGrants for cross-namespace secret access
-		// Only needed when Gateway is in different namespace than Ingress secrets
-		// Skip in ingress2gateway mode as it handles this itself
-		if !r.UseIngress2Gateway {
-			trans := r.getTranslator()
-			recordMetric := func(operation, namespace, name string) {
-				metrics.ReferenceGrantResourcesTotal.WithLabelValues(operation, namespace, name).Inc()
-			}
-			if err := utils.EnsureReferenceGrants(ctx, r.Client, r.Scheme, trans, classIngresses, recordMetric); err != nil {
-				logger.Error(err, "failed to ensure ReferenceGrants")
-				r.logErrorRateLimited(err, "referencegrant", "failed to ensure ReferenceGrants")
-				// Don't fail the reconciliation, just log the error
-				hadError = true
-			}
-		}
-	}
-
-	if hadError {
-		return ctrl.Result{RequeueAfter: requeueAfterError}, false
-	}
-
-	return ctrl.Result{}, true
-}
-
 func (r *IngressReconciler) applyHTTPRouteExtensionRefs(
 	ctx context.Context,
 	ingress *networkingv1.Ingress,
@@ -922,83 +811,6 @@ func (r *IngressReconciler) deleteManagedHTTPRoutes(
 		} else {
 			logger.V(1).Info("HTTPRoute exists but is not managed by us for this Ingress, skipping deletion",
 				"namespace", httpRoute.Namespace, "name", httpRoute.Name)
-		}
-	}
-	return nil
-}
-
-func (r *IngressReconciler) cleanupOneGatewayPerIngress(
-	ctx context.Context,
-	ingress *networkingv1.Ingress,
-	logger logr.Logger,
-) error {
-	gatewayName := ingress.Name
-	gateway := &gatewayv1.Gateway{}
-	err := r.Get(ctx, types.NamespacedName{
-		Namespace: r.GatewayNamespace,
-		Name:      gatewayName,
-	}, gateway)
-
-	if err == nil {
-		if utils.IsManagedByUsForIngress(gateway, ingress.Namespace, ingress.Name) {
-			logger.V(1).Info("Deleting managed Gateway", "namespace", gateway.Namespace, "name", gateway.Name)
-			if err := r.Delete(ctx, gateway); err != nil && !apierrors.IsNotFound(err) {
-				logger.Error(err, "failed to delete Gateway")
-				return err
-			}
-		} else {
-			logger.V(1).Info("Gateway exists but is not managed by us for this Ingress, skipping deletion",
-				"namespace", gateway.Namespace, "name", gateway.Name)
-		}
-	} else if !apierrors.IsNotFound(err) {
-		logger.Error(err, "error checking Gateway")
-		return err
-	}
-	return nil
-}
-
-func (r *IngressReconciler) cleanupSharedGateway(
-	ctx context.Context,
-	ingress *networkingv1.Ingress,
-	logger logr.Logger,
-) error {
-	trans := r.getTranslator()
-	ingressClass := trans.GetIngressClass(ingress)
-	gatewayName := r.getGatewayNameForClass(ingressClass)
-
-	gateway := &gatewayv1.Gateway{}
-	err := r.Get(ctx, types.NamespacedName{
-		Namespace: r.GatewayNamespace,
-		Name:      gatewayName,
-	}, gateway)
-
-	if err == nil && utils.IsManagedByUsWithIngress(gateway, ingress.Namespace, ingress.Name) {
-		translator.RemoveIngressListeners(gateway, ingress, trans)
-
-		if len(gateway.Spec.Listeners) == 0 {
-			logger.V(1).Info("Deleting Gateway with no remaining listeners",
-				"namespace", gateway.Namespace, "name", gateway.Name)
-			if err := r.Delete(ctx, gateway); err != nil && !apierrors.IsNotFound(err) {
-				logger.Error(err, "failed to delete Gateway")
-				return err
-			}
-		} else {
-			logger.V(1).Info("Removing listeners from shared Gateway",
-				"namespace", gateway.Namespace, "name", gateway.Name,
-				"remainingListeners", len(gateway.Spec.Listeners))
-			if err := r.Update(ctx, gateway); err != nil {
-				logger.Error(err, "failed to update Gateway")
-				return err
-			}
-		}
-	} else if err != nil && !apierrors.IsNotFound(err) {
-		logger.Error(err, "error checking Gateway")
-		return err
-	}
-
-	if !r.UseIngress2Gateway && len(ingress.Spec.TLS) > 0 && ingress.Namespace != r.GatewayNamespace {
-		if err := utils.CleanupReferenceGrantIfNeeded(ctx, r.Client, ingress.Namespace, ingress.Name); err != nil {
-			logger.Error(err, "failed to cleanup ReferenceGrant", "namespace", ingress.Namespace, "ingress", ingress.Name)
 		}
 	}
 	return nil
@@ -1343,22 +1155,6 @@ func (r *IngressReconciler) removeIngress(ctx context.Context, ingress *networki
 	return nil
 }
 
-func (r *IngressReconciler) groupIngressesByClass(ingresses []networkingv1.Ingress) map[string][]networkingv1.Ingress {
-	trans := r.getTranslator()
-	result := make(map[string][]networkingv1.Ingress)
-	for _, ingress := range ingresses {
-		class := trans.GetIngressClass(&ingress)
-		if class == DisabledIngressClassName {
-			log.Log.Info("Skipping disabled ingress class when grouping shared gateways",
-				"namespace", ingress.Namespace,
-				"name", ingress.Name)
-			continue
-		}
-		result[class] = append(result[class], ingress)
-	}
-	return result
-}
-
 func (r *IngressReconciler) getGatewayNameForClass(ingressClass string) string {
 	if ingressClass == "" || ingressClass == "default" {
 		return r.GatewayName
@@ -1421,66 +1217,6 @@ func matchIngressClassPatterns(patterns []string, ingressClass, label string) bo
 		}
 	}
 	return false
-}
-
-func (r *IngressReconciler) applyGateway(
-	ctx context.Context, desired *gatewayv1.Gateway, existing *gatewayv1.Gateway,
-) error {
-	logger := log.FromContext(ctx)
-
-	// Check if Gateway exists
-	err := r.Get(ctx, types.NamespacedName{
-		Namespace: desired.Namespace,
-		Name:      desired.Name,
-	}, existing)
-
-	if err != nil {
-		if apierrors.IsNotFound(err) {
-			// Create new Gateway
-			logger.V(1).Info("Creating Gateway", "namespace", desired.Namespace, "name", desired.Name)
-			if err := r.Create(ctx, desired); err != nil {
-				return fmt.Errorf("failed to create Gateway: %w", err)
-			}
-			// Record metric for Gateway creation
-			metrics.GatewayResourcesTotal.WithLabelValues("create", desired.Namespace, desired.Name).Inc()
-			return nil
-		}
-		return err
-	}
-
-	// Merge with existing Gateway instead of replacing
-	// This allows multiple operator instances watching different namespaces to share the same Gateway
-	for attempt := 0; attempt < 3; attempt++ {
-		translator.MergeGatewaySpec(existing, desired)
-		if len(desired.OwnerReferences) > 0 {
-			existing.OwnerReferences = desired.OwnerReferences
-		}
-
-		logger.V(1).Info("Updating Gateway", "namespace", existing.Namespace, "name", existing.Name)
-		if err := r.Update(ctx, existing); err != nil {
-			if apierrors.IsConflict(err) {
-				backoff := time.Duration(attempt+1) * 200 * time.Millisecond
-				logger.V(1).Info("Gateway update conflict, retrying",
-					"namespace", existing.Namespace,
-					"name", existing.Name,
-					"backoff", backoff.String())
-				time.Sleep(backoff)
-				if err := r.Get(ctx, types.NamespacedName{
-					Namespace: desired.Namespace,
-					Name:      desired.Name,
-				}, existing); err != nil {
-					return fmt.Errorf("failed to refresh Gateway after conflict: %w", err)
-				}
-				continue
-			}
-			return fmt.Errorf("failed to update Gateway: %w", err)
-		}
-		// Record metric for Gateway update
-		metrics.GatewayResourcesTotal.WithLabelValues("update", existing.Namespace, existing.Name).Inc()
-		return nil
-	}
-
-	return fmt.Errorf("failed to update Gateway after retries")
 }
 
 func (r *IngressReconciler) SetupWithManager(mgr ctrl.Manager) error {
@@ -1869,24 +1605,6 @@ func (r *IngressReconciler) logErrorRateLimited(err error, key, message string) 
 	r.errorLogMu.Unlock()
 
 	log.FromContext(context.Background()).Error(err, message)
-}
-
-func setGatewayOwnerReference(gateway *gatewayv1.Gateway, ingress *networkingv1.Ingress) {
-	if gateway == nil || ingress == nil {
-		return
-	}
-	controller := true
-	blockOwnerDeletion := false
-	gateway.OwnerReferences = []metav1.OwnerReference{
-		{
-			APIVersion:         ingress.APIVersion,
-			Kind:               ingress.Kind,
-			Name:               ingress.Name,
-			UID:                ingress.UID,
-			Controller:         &controller,
-			BlockOwnerDeletion: &blockOwnerDeletion,
-		},
-	}
 }
 
 func setHTTPRouteOwnerReference(httpRoute *gatewayv1.HTTPRoute, ingress *networkingv1.Ingress) {

@@ -18,14 +18,21 @@ option is `--ingress-postprocessing disable-external-dns` to just "move" DNS rec
 In case anything goes wrong you can stop the operator and use [reenabler](#re-enabling-disabled-ingresses)
 CLI tool to get old state back with `--restore-external-dns` flag.
 Note that this last option depends on fairly recent version of `external-dns` that understands
-`external-dns.alpha.kubernetes.io/gateway-hostname-source` annotation. Else you will still have to remote `Httproute`.
+`external-dns.alpha.kubernetes.io/gateway-hostname-source` annotation. Else you will still have to remove `Httproute`
+for proper DNS changes.
 
 Very important:
 `kubectl delete --cascade=orphan` should be used when removing ingresses as there is an `ownerReference` on
-automatically generated objects.
+automatically generated objects. Thus if you just remove `Ingres` it will also delete `HttpRoute`
 
 !!! Nginx ingress controller is [deprecated](https://kubernetes.io/blog/2025/11/11/ingress-nginx-retirement/) and
 will not get security updates after March 2026 !!!
+
+If you want to prevent an Ingress to be converted use
+```
+ingress-doperator.fiction.si/ignore-ingress: "true"
+```
+annotation on it.
 
 ## Related tools
 
@@ -740,7 +747,7 @@ go build -o bin/reenabler ./cmd/reenabler
 Limit to a namespace:
 
 ```bash
-./bin/reenabler --namespace=staging-qa
+./bin/reenabler --namespace=testing
 ```
 
 Remove managed HTTPRoutes and automatic SnippetsFilters:

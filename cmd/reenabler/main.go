@@ -89,6 +89,7 @@ func main() {
 	var markIgnoreIngress bool
 	var ingressNamePattern string
 
+	flag.CommandLine.SetOutput(os.Stderr)
 	flag.StringVar(&namespace, "namespace", "", "If set, only process Ingresses in this namespace")
 	flag.StringVar(&ingressNamePattern, "ingress-name", "",
 		"If set, only process Ingresses whose name matches any of the glob patterns (comma-separated, e.g., 'api-*,web-?')")
@@ -123,11 +124,15 @@ func main() {
 
 	if dangerouslyDeleteIngresses {
 		if restoreClass.set || restoreExternalDNS.set {
+			_, _ = fmt.Fprintln(os.Stderr,
+				"Invalid flag combination: --dangerously-delete-ingresses cannot be combined with restore flags")
 			setupLog.Error(fmt.Errorf("invalid flag combination"),
 				"--dangerously-delete-ingresses cannot be combined with restore flags")
 			os.Exit(1)
 		}
 		if removeDerivedResources {
+			_, _ = fmt.Fprintln(os.Stderr,
+				"Invalid flag combination: --dangerously-delete-ingresses cannot be combined with --remove-derived-resources")
 			setupLog.Error(fmt.Errorf("invalid flag combination"),
 				"--dangerously-delete-ingresses cannot be combined with --remove-derived-resources")
 			os.Exit(1)
@@ -136,6 +141,8 @@ func main() {
 	}
 
 	if removeDerivedResources && (restoreClass.set || restoreExternalDNS.set || restore.value) {
+		_, _ = fmt.Fprintln(os.Stderr,
+			"Invalid flag combination: --remove-derived-resources cannot be combined with restore flags")
 		setupLog.Error(fmt.Errorf("invalid flag combination"),
 			"--remove-derived-resources cannot be combined with restore flags")
 		os.Exit(1)
@@ -202,6 +209,8 @@ func runReenabler(
 	}
 
 	manager := utils.HTTPRouteManager{Client: cli}
+	var errCount int
+	var lastErr error
 
 	if opts.dangerouslyDeleteIngresses {
 		if err := preflightDelete(ctx, cli, &manager, ingresses); err != nil {
@@ -215,9 +224,14 @@ func runReenabler(
 			setupLog.Error(err, "failed to process ingress",
 				"namespace", ingress.Namespace,
 				"name", ingress.Name)
+			lastErr = err
+			errCount++
 		}
 	}
 
+	if errCount > 0 {
+		return fmt.Errorf("reenabler completed with %d errors (last: %w)", errCount, lastErr)
+	}
 	return nil
 }
 

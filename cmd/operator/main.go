@@ -78,7 +78,9 @@ func init() {
 func main() {
 	cfg, opts, err := parseOperatorConfig()
 	if err != nil {
-		setupLog.Error(err, "Invalid configuration")
+		_, _ = fmt.Fprintf(os.Stderr, "Invalid configuration: %v\n", err)
+		flag.CommandLine.SetOutput(os.Stderr)
+		flag.Usage()
 		os.Exit(1)
 	}
 
@@ -353,6 +355,7 @@ func parseOperatorConfig() (operatorConfig, zap.Options, error) {
 		Development: true,
 	}
 
+	flag.CommandLine.SetOutput(os.Stderr)
 	flag.StringVar(&cfg.GatewayNamespace, "gateway-namespace", "nginx-fabric",
 		"The namespace where the Gateway resource will be created")
 	flag.StringVar(&cfg.GatewayName, "gateway-name", "ingress-gateway",

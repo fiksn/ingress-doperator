@@ -22,6 +22,7 @@ import (
 	"reflect"
 	"sort"
 	"strings"
+	"time"
 
 	"github.com/go-logr/logr"
 	networkingv1 "k8s.io/api/networking/v1"
@@ -36,6 +37,7 @@ import (
 	gatewayv1 "sigs.k8s.io/gateway-api/apis/v1"
 	gatewayv1beta1 "sigs.k8s.io/gateway-api/apis/v1beta1"
 
+	"github.com/fiksn/ingress-doperator/internal/metrics"
 	"github.com/fiksn/ingress-doperator/internal/translator"
 	"github.com/fiksn/ingress-doperator/internal/utils"
 )
@@ -52,7 +54,8 @@ type HTTPRouteReconciler struct {
 }
 
 const (
-	HTTPRouteFinalizerName = "ingress-doperator.fiction.si/httproute-finalizer"
+	HTTPRouteFinalizerName    = "ingress-doperator.fiction.si/httproute-finalizer"
+	labelSelectorNamespaceKey = "kubernetes.io/metadata.name"
 )
 
 // Reconcile manages Gateway listeners based on HTTPRoute changes
@@ -85,8 +88,7 @@ func (r *HTTPRouteReconciler) Reconcile(ctx context.Context, req ctrl.Request) (
 			// Our finalizer is present - do cleanup
 			logger.Info("HTTPRoute being deleted, cleaning up Gateway listeners", "namespace", req.Namespace, "name", req.Name)
 			if err := r.handleHTTPRouteDelete(ctx, httpRoute); err != nil {
-				logger.Error(err, "failed to cleanup Gateway for deleted HTTPRoute")
-				return ctrl.Result{}, err
+				logger.Error(err, "failed to cleanup Gateway for deleted HTTPRoute, removing finalizer anyway")
 			}
 
 			// Remove our finalizer
@@ -134,31 +136,27 @@ func (r *HTTPRouteReconciler) handleHTTPRouteCreateOrUpdate(ctx context.Context,
 		return ctrl.Result{}, nil
 	}
 
+	ingress, sourceKey, err := r.resolveIngressForHTTPRoute(ctx, httpRoute)
+	if err != nil {
+		logger.Error(err, "Invalid or missing source Ingress for HTTPRoute, skipping Gateway update",
+			"namespace", httpRoute.Namespace,
+			"name", httpRoute.Name,
+			"source", sourceKey)
+		return ctrl.Result{}, nil
+	}
+
 	// Ensure the Gateway exists (create if not exists, fetch if exists)
 	gatewayNN := types.NamespacedName{
 		Namespace: r.GatewayNamespace,
 		Name:      gatewayName,
 	}
 	gateway := &gatewayv1.Gateway{}
-	err := r.Get(ctx, gatewayNN, gateway)
-
+	err = r.Get(ctx, gatewayNN, gateway)
 	gatewayExists := true
 	if err != nil {
 		if apierrors.IsNotFound(err) {
-			// Gateway doesn't exist - create it
 			gatewayExists = false
 			gateway = r.createInitialGateway(gatewayName)
-			logger.Info("Creating new Gateway", "gateway", gatewayNN)
-			if err := r.Create(ctx, gateway); err != nil {
-				if apierrors.IsAlreadyExists(err) {
-					// Race condition - another reconcile created it, retry
-					logger.V(1).Info("Gateway already exists (race), retrying")
-					return ctrl.Result{Requeue: true}, nil
-				}
-				logger.Error(err, "failed to create Gateway")
-				return ctrl.Result{}, err
-			}
-			// Gateway created, continue to add listeners
 		} else {
 			logger.Error(err, "unable to fetch Gateway")
 			return ctrl.Result{}, err
@@ -188,18 +186,28 @@ func (r *HTTPRouteReconciler) handleHTTPRouteCreateOrUpdate(ctx context.Context,
 	}
 
 	// Merge this HTTPRoute into existing Gateway listeners (no removals here)
-	updated, err := r.updateGatewayListeners(ctx, gateway, httpRoute)
-	if err != nil {
-		logger.Error(err, "failed to update Gateway listeners")
-		return ctrl.Result{}, err
-	}
+	updated := r.updateGatewayListeners(ctx, gateway, httpRoute, ingress)
 
-	if updated {
-		if err := r.Update(ctx, gateway); err != nil {
-			logger.Error(err, "failed to update Gateway")
+	if gatewayExists {
+		if updated {
+			if err := r.Update(ctx, gateway); err != nil {
+				logger.Error(err, "failed to update Gateway")
+				return ctrl.Result{}, err
+			}
+			metrics.GatewayResourcesTotal.WithLabelValues("update", gateway.Namespace, gateway.Name).Inc()
+			logger.Info("Updated Gateway listeners", "gateway", gatewayNN)
+		}
+	} else if updated && len(gateway.Spec.Listeners) > 0 {
+		logger.Info("Creating new Gateway", "gateway", gatewayNN)
+		if err := r.Create(ctx, gateway); err != nil {
+			if apierrors.IsAlreadyExists(err) {
+				logger.V(1).Info("Gateway already exists (race), retrying")
+				return ctrl.Result{Requeue: true}, nil
+			}
+			logger.Error(err, "failed to create Gateway")
 			return ctrl.Result{}, err
 		}
-		logger.Info("Updated Gateway listeners", "gateway", gatewayNN)
+		metrics.GatewayResourcesTotal.WithLabelValues("create", gateway.Namespace, gateway.Name).Inc()
 	}
 
 	return ctrl.Result{}, nil
@@ -234,6 +242,11 @@ func (r *HTTPRouteReconciler) handleHTTPRouteDelete(ctx context.Context, httpRou
 	if err := r.Get(ctx, gatewayNN, gateway); err != nil {
 		if apierrors.IsNotFound(err) {
 			logger.V(1).Info("Gateway not found, nothing to clean up", "gateway", gatewayNN)
+			return nil
+		}
+		// If the CRD doesn't exist (e.g., Gateway API was uninstalled), treat as success
+		if isNoMatchError(err) {
+			logger.V(1).Info("Gateway CRD not found (likely uninstalled), skipping cleanup", "gateway", gatewayNN)
 			return nil
 		}
 		return err
@@ -300,57 +313,70 @@ func (r *HTTPRouteReconciler) reconcileGatewayListeners(
 		Namespace: r.GatewayNamespace,
 		Name:      gatewayName,
 	}
-	gateway := &gatewayv1.Gateway{}
-	if err := r.Get(ctx, gatewayNN, gateway); err != nil {
-		if apierrors.IsNotFound(err) {
-			// Gateway doesn't exist, nothing to do
-			return false, nil
-		}
-		return false, err
-	}
-
-	// Check if we can manage this Gateway
-	canManage, err := utils.CanUpdateResource(ctx, r.Client, gateway, gatewayNN)
-	if err != nil {
-		return false, err
-	}
-	if !canManage {
-		logger.V(1).Info("Cannot manage Gateway, skipping reconciliation", "gateway", gatewayNN)
-		return false, nil
-	}
-
-	// Build desired state: which hostnames should have listeners with which namespaces
-	desiredState := r.calculateDesiredListenerState(routes)
-
-	// Update Gateway listeners to match desired state (incremental updates)
-	desiredTLS, certMismatches := r.buildDesiredListenerTLS(ctx, desiredState, routes)
-
-	updated := r.reconcileListenersToDesiredState(gateway, desiredState, desiredTLS, logger)
-
-	desiredMismatch := ""
-	if len(certMismatches) > 0 {
-		desiredMismatch = strings.Join(certMismatches, "; ")
-	}
-	if gateway.Annotations == nil {
-		gateway.Annotations = make(map[string]string)
-	}
-	if gateway.Annotations[translator.MismatchedCertAnnotation] != desiredMismatch {
-		updated = true
-		if desiredMismatch == "" {
-			delete(gateway.Annotations, translator.MismatchedCertAnnotation)
-		} else {
-			gateway.Annotations[translator.MismatchedCertAnnotation] = desiredMismatch
-		}
-	}
-
-	if updated {
-		if err := r.Update(ctx, gateway); err != nil {
+	for attempt := 0; attempt < 3; attempt++ {
+		gateway := &gatewayv1.Gateway{}
+		if err := r.Get(ctx, gatewayNN, gateway); err != nil {
+			if apierrors.IsNotFound(err) {
+				// Gateway doesn't exist, nothing to do
+				return false, nil
+			}
 			return false, err
 		}
-		logger.Info("Reconciled Gateway listeners", "gateway", gatewayNN, "listenerCount", len(gateway.Spec.Listeners))
+
+		// Check if we can manage this Gateway
+		canManage, err := utils.CanUpdateResource(ctx, r.Client, gateway, gatewayNN)
+		if err != nil {
+			return false, err
+		}
+		if !canManage {
+			logger.V(1).Info("Cannot manage Gateway, skipping reconciliation", "gateway", gatewayNN)
+			return false, nil
+		}
+
+		// Build desired state: which hostnames should have listeners with which namespaces
+		desiredState := r.calculateDesiredListenerState(routes)
+
+		// Update Gateway listeners to match desired state (incremental updates)
+		desiredTLS, certMismatches, tlsUnknown := r.buildDesiredListenerTLS(ctx, desiredState, routes)
+
+		updated := r.reconcileListenersToDesiredState(gateway, desiredState, desiredTLS, tlsUnknown, logger)
+
+		desiredMismatch := ""
+		if len(certMismatches) > 0 {
+			desiredMismatch = strings.Join(certMismatches, "; ")
+		}
+		if gateway.Annotations == nil {
+			gateway.Annotations = make(map[string]string)
+		}
+		if gateway.Annotations[translator.MismatchedCertAnnotation] != desiredMismatch {
+			updated = true
+			if desiredMismatch == "" {
+				delete(gateway.Annotations, translator.MismatchedCertAnnotation)
+			} else {
+				gateway.Annotations[translator.MismatchedCertAnnotation] = desiredMismatch
+			}
+		}
+
+		if updated {
+			if err := r.Update(ctx, gateway); err != nil {
+				if apierrors.IsConflict(err) {
+					backoff := time.Duration(attempt+1) * 200 * time.Millisecond
+					logger.V(1).Info("Gateway update conflict, retrying",
+						"namespace", gateway.Namespace,
+						"name", gateway.Name,
+						"backoff", backoff.String())
+					time.Sleep(backoff)
+					continue
+				}
+				return false, err
+			}
+			logger.Info("Reconciled Gateway listeners", "gateway", gatewayNN, "listenerCount", len(gateway.Spec.Listeners))
+		}
+
+		return updated, nil
 	}
 
-	return updated, nil
+	return false, fmt.Errorf("failed to update Gateway after retries")
 }
 
 // calculateDesiredListenerState computes which listeners should exist based on HTTPRoutes
@@ -377,6 +403,7 @@ func (r *HTTPRouteReconciler) reconcileListenersToDesiredState(
 	gateway *gatewayv1.Gateway,
 	desiredState map[string]map[string]bool,
 	desiredTLS map[string]*gatewayv1.ListenerTLSConfig,
+	tlsUnknown map[string]bool,
 	logger logr.Logger,
 ) bool {
 	updated := false
@@ -418,16 +445,20 @@ func (r *HTTPRouteReconciler) reconcileListenersToDesiredState(
 				logger.Info("Updated listener namespaces", "listener", gateway.Spec.Listeners[listenerIdx].Name, "namespaces", namespaceList)
 				updated = true
 			}
-			if r.updateListenerTLS(&gateway.Spec.Listeners[listenerIdx], desiredTLS[hostname]) {
-				logger.Info("Updated listener TLS", "listener", gateway.Spec.Listeners[listenerIdx].Name)
-				updated = true
+			if !tlsUnknown[hostname] {
+				if r.updateListenerTLS(&gateway.Spec.Listeners[listenerIdx], desiredTLS[hostname]) {
+					logger.Info("Updated listener TLS", "listener", gateway.Spec.Listeners[listenerIdx].Name)
+					updated = true
+				}
 			}
 		} else {
-			// Add new listener
-			listener := r.createListenerWithNamespaces(hostname, namespaceList, desiredTLS[hostname])
-			gateway.Spec.Listeners = append(gateway.Spec.Listeners, listener)
-			logger.Info("Added new listener", "listener", listener.Name, "hostname", hostname, "namespaces", namespaceList)
-			updated = true
+			// Add new listener only when TLS is known (safe)
+			if !tlsUnknown[hostname] {
+				listener := r.createListenerWithNamespaces(hostname, namespaceList, desiredTLS[hostname])
+				gateway.Spec.Listeners = append(gateway.Spec.Listeners, listener)
+				logger.Info("Added new listener", "listener", listener.Name, "hostname", hostname, "namespaces", namespaceList)
+				updated = true
+			}
 		}
 	}
 
@@ -439,11 +470,16 @@ func (r *HTTPRouteReconciler) updateGatewayListeners(
 	ctx context.Context,
 	gateway *gatewayv1.Gateway,
 	httpRoute *gatewayv1.HTTPRoute,
-) (bool, error) {
+	ingress *networkingv1.Ingress,
+) bool {
 	logger := log.FromContext(ctx)
 	updated := false
 
-	desiredTLS, certMismatches := r.buildTLSForRoute(ctx, httpRoute)
+	if ingress == nil {
+		return false
+	}
+
+	desiredTLS, certMismatches := r.buildTLSForRouteFromIngress(httpRoute, ingress)
 
 	for _, hostname := range httpRoute.Spec.Hostnames {
 		hostnameStr := string(hostname)
@@ -479,7 +515,7 @@ func (r *HTTPRouteReconciler) updateGatewayListeners(
 		}
 	}
 
-	return updated, nil
+	return updated
 }
 
 // findListenerByHostname finds a listener index by hostname, returns -1 if not found
@@ -503,13 +539,13 @@ func (r *HTTPRouteReconciler) updateListenerNamespaces(listener *gatewayv1.Liste
 	selector := listener.AllowedRoutes.Namespaces.Selector
 
 	if selector.MatchLabels != nil {
-		current, ok := selector.MatchLabels["kubernetes.io/metadata.name"]
+		current, ok := selector.MatchLabels[labelSelectorNamespaceKey]
 		if len(namespaces) == 1 {
 			if !ok || current != namespaces[0] {
 				if selector.MatchLabels == nil {
 					selector.MatchLabels = make(map[string]string)
 				}
-				selector.MatchLabels["kubernetes.io/metadata.name"] = namespaces[0]
+				selector.MatchLabels[labelSelectorNamespaceKey] = namespaces[0]
 				return true
 			}
 			return false
@@ -519,7 +555,7 @@ func (r *HTTPRouteReconciler) updateListenerNamespaces(listener *gatewayv1.Liste
 		selector.MatchLabels = nil
 		selector.MatchExpressions = []metav1.LabelSelectorRequirement{
 			{
-				Key:      "kubernetes.io/metadata.name",
+				Key:      labelSelectorNamespaceKey,
 				Operator: metav1.LabelSelectorOpIn,
 				Values:   namespaces,
 			},
@@ -529,7 +565,7 @@ func (r *HTTPRouteReconciler) updateListenerNamespaces(listener *gatewayv1.Liste
 
 	for i := range listener.AllowedRoutes.Namespaces.Selector.MatchExpressions {
 		expr := &listener.AllowedRoutes.Namespaces.Selector.MatchExpressions[i]
-		if expr.Key == "kubernetes.io/metadata.name" && expr.Operator == metav1.LabelSelectorOpIn {
+		if expr.Key == labelSelectorNamespaceKey && expr.Operator == metav1.LabelSelectorOpIn {
 			// Check if namespaces changed
 			if !stringSlicesEqual(expr.Values, namespaces) {
 				expr.Values = namespaces
@@ -582,7 +618,7 @@ func (r *HTTPRouteReconciler) createListenerWithNamespaces(
 				Selector: &metav1.LabelSelector{
 					MatchExpressions: []metav1.LabelSelectorRequirement{
 						{
-							Key:      "kubernetes.io/metadata.name",
+							Key:      labelSelectorNamespaceKey,
 							Operator: metav1.LabelSelectorOpIn,
 							Values:   namespaces,
 						},
@@ -603,7 +639,7 @@ func (r *HTTPRouteReconciler) addNamespaceToListener(listener *gatewayv1.Listene
 
 	for i := range listener.AllowedRoutes.Namespaces.Selector.MatchExpressions {
 		expr := &listener.AllowedRoutes.Namespaces.Selector.MatchExpressions[i]
-		if expr.Key == "kubernetes.io/metadata.name" && expr.Operator == metav1.LabelSelectorOpIn {
+		if expr.Key == labelSelectorNamespaceKey && expr.Operator == metav1.LabelSelectorOpIn {
 			// Check if namespace already exists
 			for _, ns := range expr.Values {
 				if ns == namespace {
@@ -618,55 +654,6 @@ func (r *HTTPRouteReconciler) addNamespaceToListener(listener *gatewayv1.Listene
 	}
 
 	return false
-}
-
-// removeNamespaceFromListener removes a namespace from the listener's allowed routes
-func (r *HTTPRouteReconciler) removeNamespaceFromListener(listener *gatewayv1.Listener, namespace string) bool {
-	if listener.AllowedRoutes == nil ||
-		listener.AllowedRoutes.Namespaces == nil ||
-		listener.AllowedRoutes.Namespaces.Selector == nil {
-		return false
-	}
-
-	for i := range listener.AllowedRoutes.Namespaces.Selector.MatchExpressions {
-		expr := &listener.AllowedRoutes.Namespaces.Selector.MatchExpressions[i]
-		if expr.Key == "kubernetes.io/metadata.name" && expr.Operator == metav1.LabelSelectorOpIn {
-			// Find and remove namespace
-			newValues := make([]string, 0, len(expr.Values))
-			found := false
-			for _, ns := range expr.Values {
-				if ns != namespace {
-					newValues = append(newValues, ns)
-				} else {
-					found = true
-				}
-			}
-			if found {
-				expr.Values = newValues
-				return true
-			}
-			return false
-		}
-	}
-
-	return false
-}
-
-// hasNoAllowedNamespaces checks if a listener has no allowed namespaces
-func (r *HTTPRouteReconciler) hasNoAllowedNamespaces(listener *gatewayv1.Listener) bool {
-	if listener.AllowedRoutes == nil ||
-		listener.AllowedRoutes.Namespaces == nil ||
-		listener.AllowedRoutes.Namespaces.Selector == nil {
-		return true
-	}
-
-	for _, expr := range listener.AllowedRoutes.Namespaces.Selector.MatchExpressions {
-		if expr.Key == "kubernetes.io/metadata.name" && expr.Operator == metav1.LabelSelectorOpIn {
-			return len(expr.Values) == 0
-		}
-	}
-
-	return true
 }
 
 // getGatewayNameFromHTTPRoute extracts the Gateway name from HTTPRoute parent refs
@@ -785,6 +772,11 @@ func (r *HTTPRouteReconciler) cleanupReferenceGrant(ctx context.Context, namespa
 			// Already deleted, nothing to do
 			return nil
 		}
+		// If the CRD doesn't exist (e.g., Gateway API was uninstalled), treat as success
+		if isNoMatchError(err) {
+			logger.V(1).Info("ReferenceGrant CRD not found (likely uninstalled), skipping cleanup", "namespace", namespace)
+			return nil
+		}
 		return err
 	}
 
@@ -837,6 +829,15 @@ func getSourcesFromAnnotation(annotation string) []string {
 	return result
 }
 
+// isNoMatchError checks if an error is a NoMatchError (CRD doesn't exist)
+func isNoMatchError(err error) bool {
+	if err == nil {
+		return false
+	}
+	// Check if it's a NoKindMatchError or NoResourceMatchError
+	return apierrors.IsNotFound(err) || strings.Contains(err.Error(), "no matches for kind")
+}
+
 func (r *HTTPRouteReconciler) listHTTPRoutesForGateway(
 	ctx context.Context,
 	gatewayName string,
@@ -876,9 +877,10 @@ func (r *HTTPRouteReconciler) buildDesiredListenerTLS(
 	ctx context.Context,
 	desiredState map[string]map[string]bool,
 	routes []gatewayv1.HTTPRoute,
-) (map[string]*gatewayv1.ListenerTLSConfig, []string) {
+) (map[string]*gatewayv1.ListenerTLSConfig, []string, map[string]bool) {
 	desiredTLS := make(map[string]*gatewayv1.ListenerTLSConfig, len(desiredState))
 	certMismatches := make([]string, 0)
+	tlsUnknown := make(map[string]bool)
 
 	trans := translator.New(translator.Config{
 		GatewayNamespace:    r.GatewayNamespace,
@@ -894,24 +896,14 @@ func (r *HTTPRouteReconciler) buildDesiredListenerTLS(
 			continue
 		}
 
-		source := ""
-		if route.Annotations != nil {
-			source = route.Annotations[translator.SourceAnnotation]
-		}
-		if source == "" {
+		ingress, _, err := r.resolveIngressForHTTPRoute(ctx, route)
+		if err != nil {
+			for _, host := range route.Spec.Hostnames {
+				tlsUnknown[string(host)] = true
+			}
 			continue
 		}
-
-		parts := strings.SplitN(source, "/", 2)
-		if len(parts) != 2 {
-			continue
-		}
-		ingressNamespace, ingressName := parts[0], parts[1]
-
-		ingress := &networkingv1.Ingress{}
-		if err := r.Get(ctx, types.NamespacedName{Namespace: ingressNamespace, Name: ingressName}, ingress); err != nil {
-			continue
-		}
+		ingressNamespace, ingressName := ingress.Namespace, ingress.Name
 
 		routeHosts := make(map[string]bool)
 		for _, host := range route.Spec.Hostnames {
@@ -949,7 +941,7 @@ func (r *HTTPRouteReconciler) buildDesiredListenerTLS(
 
 	for hostname := range desiredState {
 		candidate, ok := bestCandidates[hostname]
-		if !ok {
+		if !ok || tlsUnknown[hostname] {
 			desiredTLS[hostname] = nil
 			continue
 		}
@@ -982,7 +974,7 @@ func (r *HTTPRouteReconciler) buildDesiredListenerTLS(
 	}
 
 	sort.Strings(certMismatches)
-	return desiredTLS, certMismatches
+	return desiredTLS, certMismatches, tlsUnknown
 }
 
 func findTLSConfigForHost(ingress *networkingv1.Ingress, host string) *networkingv1.IngressTLS {
@@ -1022,35 +1014,18 @@ func generateSafeSecretName(namespace, hostname string) string {
 	return safeName
 }
 
-func (r *HTTPRouteReconciler) buildTLSForRoute(
-	ctx context.Context,
+func (r *HTTPRouteReconciler) buildTLSForRouteFromIngress(
 	httpRoute *gatewayv1.HTTPRoute,
+	ingress *networkingv1.Ingress,
 ) (map[string]*gatewayv1.ListenerTLSConfig, []string) {
 	desiredTLS := make(map[string]*gatewayv1.ListenerTLSConfig)
 	certMismatches := make([]string, 0)
 
-	if !r.isManagedByUs(httpRoute) {
+	if !r.isManagedByUs(httpRoute) || ingress == nil {
 		return desiredTLS, certMismatches
 	}
 
-	source := ""
-	if httpRoute.Annotations != nil {
-		source = httpRoute.Annotations[translator.SourceAnnotation]
-	}
-	if source == "" {
-		return desiredTLS, certMismatches
-	}
-
-	parts := strings.SplitN(source, "/", 2)
-	if len(parts) != 2 {
-		return desiredTLS, certMismatches
-	}
-	ingressNamespace, ingressName := parts[0], parts[1]
-
-	ingress := &networkingv1.Ingress{}
-	if err := r.Get(ctx, types.NamespacedName{Namespace: ingressNamespace, Name: ingressName}, ingress); err != nil {
-		return desiredTLS, certMismatches
-	}
+	ingressNamespace := ingress.Namespace
 
 	trans := translator.New(translator.Config{
 		GatewayNamespace:    r.GatewayNamespace,
@@ -1106,6 +1081,87 @@ func (r *HTTPRouteReconciler) buildTLSForRoute(
 
 	sort.Strings(certMismatches)
 	return desiredTLS, certMismatches
+}
+
+func (r *HTTPRouteReconciler) resolveIngressForHTTPRoute(
+	ctx context.Context,
+	httpRoute *gatewayv1.HTTPRoute,
+) (*networkingv1.Ingress, string, error) {
+	if httpRoute == nil {
+		return nil, "", fmt.Errorf("HTTPRoute is nil")
+	}
+
+	// Prefer ownerReference when present
+	for _, ownerRef := range httpRoute.OwnerReferences {
+		if ownerRef.Kind != "Ingress" {
+			continue
+		}
+		if !strings.HasPrefix(ownerRef.APIVersion, "networking.k8s.io/") {
+			continue
+		}
+		ingressNN := types.NamespacedName{
+			Namespace: httpRoute.Namespace,
+			Name:      ownerRef.Name,
+		}
+		ingress := &networkingv1.Ingress{}
+		if err := r.Get(ctx, ingressNN, ingress); err != nil {
+			if apierrors.IsNotFound(err) {
+				return nil, fmt.Sprintf("%s/%s", ingressNN.Namespace, ingressNN.Name),
+					fmt.Errorf("source Ingress %s/%s not found", ingressNN.Namespace, ingressNN.Name)
+			}
+			return nil, fmt.Sprintf("%s/%s", ingressNN.Namespace, ingressNN.Name), err
+		}
+		if err := r.validateIngressForHTTPRoute(ingress); err != nil {
+			return nil, fmt.Sprintf("%s/%s", ingressNN.Namespace, ingressNN.Name), err
+		}
+		return ingress, fmt.Sprintf("%s/%s", ingressNN.Namespace, ingressNN.Name), nil
+	}
+
+	// Fallback to annotation
+	source := ""
+	if httpRoute.Annotations != nil {
+		source = httpRoute.Annotations[translator.SourceAnnotation]
+	}
+	if source == "" {
+		return nil, "", fmt.Errorf("missing Ingress ownerReference and source annotation")
+	}
+	parts := strings.SplitN(source, "/", 2)
+	if len(parts) != 2 || parts[0] == "" || parts[1] == "" {
+		return nil, source, fmt.Errorf("invalid source annotation %q", source)
+	}
+	ingressNN := types.NamespacedName{Namespace: parts[0], Name: parts[1]}
+	ingress := &networkingv1.Ingress{}
+	if err := r.Get(ctx, ingressNN, ingress); err != nil {
+		if apierrors.IsNotFound(err) {
+			return nil, source, fmt.Errorf("source Ingress %s not found", source)
+		}
+		return nil, source, err
+	}
+	if err := r.validateIngressForHTTPRoute(ingress); err != nil {
+		return nil, source, err
+	}
+	return ingress, source, nil
+}
+
+func (r *HTTPRouteReconciler) validateIngressForHTTPRoute(ingress *networkingv1.Ingress) error {
+	if ingress == nil {
+		return fmt.Errorf("source Ingress is nil")
+	}
+	if ingress.Annotations != nil {
+		if ingress.Annotations[IgnoreIngressAnnotation] == fmt.Sprintf("%t", true) {
+			return fmt.Errorf("source Ingress %s/%s is ignored", ingress.Namespace, ingress.Name)
+		}
+		if ingress.Annotations[IngressRemovedAnnotation] == fmt.Sprintf("%t", true) {
+			return fmt.Errorf("source Ingress %s/%s is removed", ingress.Namespace, ingress.Name)
+		}
+	}
+	if ingress.Spec.IngressClassName != nil && *ingress.Spec.IngressClassName == DisabledIngressClassName {
+		return fmt.Errorf("source Ingress %s/%s is disabled", ingress.Namespace, ingress.Name)
+	}
+	if ingress.Annotations != nil && ingress.Annotations[IngressClassAnnotation] == DisabledIngressClassName {
+		return fmt.Errorf("source Ingress %s/%s is disabled", ingress.Namespace, ingress.Name)
+	}
+	return nil
 }
 
 // createInitialGateway creates a minimal Gateway resource
