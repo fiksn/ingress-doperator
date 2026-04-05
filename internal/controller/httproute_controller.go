@@ -22,6 +22,7 @@ import (
 	"reflect"
 	"sort"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/go-logr/logr"
@@ -45,18 +46,132 @@ import (
 // HTTPRouteReconciler reconciles HTTPRoute resources and manages Gateway listeners
 type HTTPRouteReconciler struct {
 	client.Client
-	Scheme              *runtime.Scheme
-	GatewayNamespace    string
-	GatewayName         string
-	GatewayClassName    string
-	HostnameRewriteFrom string
-	HostnameRewriteTo   string
+	Scheme                    *runtime.Scheme
+	GatewayNamespace          string
+	GatewayName               string
+	GatewayClassName          string
+	HostnameRewriteFrom       string
+	HostnameRewriteTo         string
+	IngressPostProcessingMode IngressPostProcessingMode
+
+	// Debouncing state
+	gatewayUpdateDebouncer *gatewayUpdateDebouncer
 }
 
 const (
-	HTTPRouteFinalizerName    = "ingress-doperator.fiction.si/httproute-finalizer"
-	labelSelectorNamespaceKey = "kubernetes.io/metadata.name"
+	HTTPRouteFinalizerName     = "ingress-doperator.fiction.si/httproute-finalizer"
+	labelSelectorNamespaceKey  = "kubernetes.io/metadata.name"
+	gatewayUpdateDebounceDelay = 2 * time.Second
 )
+
+// gatewayUpdateDebouncer batches rapid Gateway update requests
+type gatewayUpdateDebouncer struct {
+	mu             sync.Mutex
+	pendingUpdates map[string]*time.Timer // gateway name -> timer
+	reconciler     *HTTPRouteReconciler
+}
+
+func newGatewayUpdateDebouncer(r *HTTPRouteReconciler) *gatewayUpdateDebouncer {
+	return &gatewayUpdateDebouncer{
+		pendingUpdates: make(map[string]*time.Timer),
+		reconciler:     r,
+	}
+}
+
+// scheduleGatewayUpdate debounces Gateway updates by delaying execution
+func (d *gatewayUpdateDebouncer) scheduleGatewayUpdate(ctx context.Context, gatewayName string) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+
+	logger := log.FromContext(ctx)
+
+	// Cancel existing timer if present
+	if timer, exists := d.pendingUpdates[gatewayName]; exists {
+		timer.Stop()
+		logger.V(1).Info("Debouncing Gateway update (extending delay)", "gateway", gatewayName)
+	}
+
+	// Schedule new update after debounce delay
+	d.pendingUpdates[gatewayName] = time.AfterFunc(gatewayUpdateDebounceDelay, func() {
+		d.executeGatewayUpdate(ctx, gatewayName)
+	})
+}
+
+// executeGatewayUpdate performs the actual Gateway reconciliation
+func (d *gatewayUpdateDebouncer) executeGatewayUpdate(ctx context.Context, gatewayName string) {
+	d.mu.Lock()
+	delete(d.pendingUpdates, gatewayName)
+	d.mu.Unlock()
+
+	logger := log.FromContext(ctx).WithValues("gateway", gatewayName)
+	logger.Info("Executing debounced Gateway update")
+
+	// List all HTTPRoutes for this Gateway
+	routes, err := d.reconciler.listHTTPRoutesForGateway(ctx, gatewayName, "")
+	if err != nil {
+		logger.Error(err, "failed to list HTTPRoutes for debounced Gateway update")
+		return
+	}
+
+	// Reconcile Gateway listeners based on all routes
+	updated, err := d.reconciler.reconcileGatewayListeners(ctx, gatewayName, routes)
+	if err != nil {
+		logger.Error(err, "failed to reconcile Gateway listeners in debounced update")
+		return
+	}
+
+	// Gateway successfully updated - now safe to disable external-dns on source Ingresses
+	if updated && d.reconciler.IngressPostProcessingMode == IngressPostProcessingModeDisableExternalDNS {
+		// Track which Ingresses we've already processed to avoid duplicates
+		processedIngresses := make(map[string]bool)
+
+		for i := range routes {
+			route := &routes[i]
+			ingress, sourceKey, err := d.reconciler.resolveIngressForHTTPRoute(ctx, route)
+			if err != nil {
+				logger.V(1).Info("Skipping external-dns disable for HTTPRoute (no valid source Ingress)",
+					"httproute", fmt.Sprintf("%s/%s", route.Namespace, route.Name),
+					"source", sourceKey,
+					"error", err.Error())
+				continue
+			}
+
+			ingressKey := fmt.Sprintf("%s/%s", ingress.Namespace, ingress.Name)
+			if processedIngresses[ingressKey] {
+				continue
+			}
+			processedIngresses[ingressKey] = true
+
+			if err := disableExternalDNS(ctx, d.reconciler.Client, ingress); err != nil {
+				logger.Error(err, "failed to disable external-dns on source Ingress after Gateway update",
+					"ingress", ingressKey)
+				// Don't fail - continue with other Ingresses
+			}
+		}
+	}
+
+	// Check if Gateway should be deleted (no listeners remain)
+	if updated {
+		gatewayNN := types.NamespacedName{
+			Namespace: d.reconciler.GatewayNamespace,
+			Name:      gatewayName,
+		}
+		gateway := &gatewayv1.Gateway{}
+		if err := d.reconciler.Get(ctx, gatewayNN, gateway); err != nil {
+			if !apierrors.IsNotFound(err) {
+				logger.Error(err, "failed to fetch Gateway for deletion check")
+			}
+			return
+		}
+
+		if len(gateway.Spec.Listeners) == 0 {
+			logger.Info("Deleting empty Gateway (no listeners remain)")
+			if err := d.reconciler.Delete(ctx, gateway); err != nil && !apierrors.IsNotFound(err) {
+				logger.Error(err, "failed to delete empty Gateway")
+			}
+		}
+	}
+}
 
 // Reconcile manages Gateway listeners based on HTTPRoute changes
 func (r *HTTPRouteReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
@@ -190,14 +305,12 @@ func (r *HTTPRouteReconciler) handleHTTPRouteCreateOrUpdate(ctx context.Context,
 
 	if gatewayExists {
 		if updated {
-			if err := r.Update(ctx, gateway); err != nil {
-				logger.Error(err, "failed to update Gateway")
-				return ctrl.Result{}, err
-			}
-			metrics.GatewayResourcesTotal.WithLabelValues("update", gateway.Namespace, gateway.Name).Inc()
-			logger.Info("Updated Gateway listeners", "gateway", gatewayNN)
+			// Use debounced update to batch rapid concurrent changes
+			logger.V(1).Info("Scheduling debounced Gateway update", "gateway", gatewayName)
+			r.gatewayUpdateDebouncer.scheduleGatewayUpdate(ctx, gatewayName)
 		}
 	} else if updated && len(gateway.Spec.Listeners) > 0 {
+		// For Gateway creation, don't debounce - create immediately
 		logger.Info("Creating new Gateway", "gateway", gatewayNN)
 		if err := r.Create(ctx, gateway); err != nil {
 			if apierrors.IsAlreadyExists(err) {
@@ -208,6 +321,14 @@ func (r *HTTPRouteReconciler) handleHTTPRouteCreateOrUpdate(ctx context.Context,
 			return ctrl.Result{}, err
 		}
 		metrics.GatewayResourcesTotal.WithLabelValues("create", gateway.Namespace, gateway.Name).Inc()
+
+		// Gateway created successfully - now safe to disable external-dns on source Ingress
+		if r.IngressPostProcessingMode == IngressPostProcessingModeDisableExternalDNS {
+			if err := disableExternalDNS(ctx, r.Client, ingress); err != nil {
+				logger.Error(err, "failed to disable external-dns on source Ingress after Gateway creation")
+				// Don't fail the reconcile - Gateway is already created
+			}
+		}
 	}
 
 	return ctrl.Result{}, nil
@@ -262,40 +383,10 @@ func (r *HTTPRouteReconciler) handleHTTPRouteDelete(ctx context.Context, httpRou
 		return nil
 	}
 
-	// Reconcile Gateway listeners based on remaining HTTPRoutes (exclude this one)
-	routes, err := r.listHTTPRoutesForGateway(ctx, gatewayName, fmt.Sprintf("%s/%s", httpRoute.Namespace, httpRoute.Name))
-	if err != nil {
-		return err
-	}
-	updated, err := r.reconcileGatewayListeners(ctx, gatewayName, routes)
-	if err != nil {
-		return err
-	}
-
-	// Reload Gateway to check current listeners after reconciliation
-	if err := r.Get(ctx, gatewayNN, gateway); err != nil {
-		if apierrors.IsNotFound(err) {
-			return nil
-		}
-		return err
-	}
-
-	// Check if Gateway has no listeners left - delete it if empty
-	if len(gateway.Spec.Listeners) == 0 {
-		// Gateway is empty, delete it
-		logger.Info("Deleting Gateway (no listeners remain)", "gateway", gatewayNN)
-		if err := r.Delete(ctx, gateway); err != nil {
-			if !apierrors.IsNotFound(err) {
-				return err
-			}
-		}
-		return nil
-	}
-
-	// Update Gateway if we made changes
-	if updated {
-		logger.Info("Updated Gateway after HTTPRoute deletion", "gateway", gatewayNN)
-	}
+	// Schedule debounced Gateway update to handle listener cleanup
+	// This batches rapid delete operations (e.g., helm uninstall deleting multiple HTTPRoutes)
+	logger.V(1).Info("Scheduling debounced Gateway cleanup", "gateway", gatewayName)
+	r.gatewayUpdateDebouncer.scheduleGatewayUpdate(ctx, gatewayName)
 
 	return nil
 }
@@ -1147,20 +1238,10 @@ func (r *HTTPRouteReconciler) validateIngressForHTTPRoute(ingress *networkingv1.
 	if ingress == nil {
 		return fmt.Errorf("source Ingress is nil")
 	}
-	if ingress.Annotations != nil {
-		if ingress.Annotations[IgnoreIngressAnnotation] == fmt.Sprintf("%t", true) {
-			return fmt.Errorf("source Ingress %s/%s is ignored", ingress.Namespace, ingress.Name)
-		}
-		if ingress.Annotations[IngressRemovedAnnotation] == fmt.Sprintf("%t", true) {
-			return fmt.Errorf("source Ingress %s/%s is removed", ingress.Namespace, ingress.Name)
-		}
-	}
-	if ingress.Spec.IngressClassName != nil && *ingress.Spec.IngressClassName == DisabledIngressClassName {
-		return fmt.Errorf("source Ingress %s/%s is disabled", ingress.Namespace, ingress.Name)
-	}
-	if ingress.Annotations != nil && ingress.Annotations[IngressClassAnnotation] == DisabledIngressClassName {
-		return fmt.Errorf("source Ingress %s/%s is disabled", ingress.Namespace, ingress.Name)
-	}
+	// Allow ignored/disabled/removed Ingresses - HTTPRoute should continue functioning
+	// even if source Ingress is later marked as ignored. The Ingress object is still
+	// readable and provides TLS configuration. The IngressController prevents creating
+	// NEW resources from ignored Ingresses, but existing HTTPRoutes remain valid.
 	return nil
 }
 
@@ -1188,6 +1269,9 @@ func (r *HTTPRouteReconciler) createInitialGateway(gatewayName string) *gatewayv
 
 // SetupWithManager sets up the controller with the Manager.
 func (r *HTTPRouteReconciler) SetupWithManager(mgr ctrl.Manager) error {
+	// Initialize the debouncer
+	r.gatewayUpdateDebouncer = newGatewayUpdateDebouncer(r)
+
 	return ctrl.NewControllerManagedBy(mgr).
 		For(&gatewayv1.HTTPRoute{}).
 		WithEventFilter(ManagedByIngressDoperatorPredicate()).

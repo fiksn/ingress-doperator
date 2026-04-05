@@ -40,6 +40,7 @@ type HTTPRouteManager struct {
 }
 
 // GetHTTPRoutesWithPrefix returns all HTTPRoutes with a given name prefix
+// that are managed by us for the specified Ingress
 func (m *HTTPRouteManager) GetHTTPRoutesWithPrefix(
 	ctx context.Context,
 	namespace string,
@@ -53,7 +54,7 @@ func (m *HTTPRouteManager) GetHTTPRoutesWithPrefix(
 
 	var result []gatewayv1.HTTPRoute
 	for _, r := range routeList.Items {
-		if strings.HasPrefix(r.Name, prefix) {
+		if strings.HasPrefix(r.Name, prefix) && IsManagedByUsForIngress(&r, namespace, prefix) {
 			result = append(result, r)
 		}
 	}

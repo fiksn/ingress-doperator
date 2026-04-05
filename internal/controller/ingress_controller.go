@@ -285,6 +285,16 @@ func (r *IngressReconciler) reconcileIngressToHTTPRoute(
 		return ctrl.Result{}, nil
 	}
 
+	// Skip Ingresses with no hostnames - Gateway API requires explicit hostnames
+	if !hasHostnames(ingress) {
+		logger.Info("Skipping Ingress with no hostnames - Gateway API requires explicit host rules",
+			"namespace", ingress.Namespace, "name", ingress.Name)
+		r.recordWarning(ingress, "NoHostnames",
+			"Ingress has no hostname rules and cannot be translated to Gateway API. Add spec.rules[].host fields.")
+		metrics.IngressReconcileSkipsTotal.WithLabelValues("no-hostnames", ingress.Namespace, ingress.Name).Inc()
+		return ctrl.Result{}, nil
+	}
+
 	// Handle source Ingress post-processing mode
 	effectiveMode := r.resolveIngressPostProcessingMode(ingress)
 
@@ -409,11 +419,9 @@ func (r *IngressReconciler) reconcileIngressToHTTPRoute(
 		}
 		logger.Info("Disabled source Ingress", "namespace", ingress.Namespace, "name", ingress.Name)
 	case IngressPostProcessingModeDisableExternalDNS:
-		if err := r.disableExternalDNS(ctx, ingress); err != nil {
-			logger.Error(err, "failed to disable external-dns for source Ingress")
-			return ctrl.Result{}, err
-		}
-		logger.Info("Disabled external-dns on source Ingress", "namespace", ingress.Namespace, "name", ingress.Name)
+		// External-DNS disabling is now handled by HTTPRouteReconciler after Gateway is updated
+		// This ensures the Gateway has the listener ready before external-dns processing stops
+		logger.V(1).Info("External-DNS will be disabled by HTTPRouteReconciler after Gateway update")
 	case IngressPostProcessingModeNone:
 		// Do nothing
 	}
@@ -697,6 +705,10 @@ func (r *IngressReconciler) applySnippetsFilters(
 		}
 		if ok {
 			utils.AddExtensionRefFilterAfterExistingKind(httpRoute, utils.NginxGatewayGroup, utils.SnippetsFilterKind, name)
+		} else {
+			logger.Info("SnippetsFilter not found, skipping", "name", name, "sourceNamespace", r.GatewayNamespace)
+			r.recordWarning(ingress, "SnippetsFilterNotFound",
+				fmt.Sprintf("SnippetsFilter %s not found in namespace %s", name, r.GatewayNamespace))
 		}
 	}
 
@@ -1000,46 +1012,71 @@ func (r *IngressReconciler) disableIngress(ctx context.Context, ingress *network
 	return nil
 }
 
-func (r *IngressReconciler) disableExternalDNS(ctx context.Context, ingress *networkingv1.Ingress) error {
+// disableExternalDNS is a package-level function that disables external-dns processing on an Ingress
+// It can be called by both IngressReconciler and HTTPRouteReconciler
+func disableExternalDNS(ctx context.Context, cli client.Client, ingress *networkingv1.Ingress) error {
+	if ingress == nil {
+		return nil
+	}
+
 	logger := log.FromContext(ctx)
 
-	if ingress.Annotations == nil {
-		ingress.Annotations = make(map[string]string)
+	// Fetch latest version to avoid conflicts
+	ingressNN := types.NamespacedName{
+		Namespace: ingress.Namespace,
+		Name:      ingress.Name,
+	}
+	latestIngress := &networkingv1.Ingress{}
+	if err := cli.Get(ctx, ingressNN, latestIngress); err != nil {
+		if apierrors.IsNotFound(err) {
+			logger.V(1).Info("Ingress not found, skipping external-dns disable", "namespace", ingress.Namespace, "name", ingress.Name)
+			return nil
+		}
+		return fmt.Errorf("failed to fetch Ingress: %w", err)
+	}
+
+	if latestIngress.Annotations == nil {
+		latestIngress.Annotations = make(map[string]string)
 	}
 
 	modified := false
 
-	if hostname, exists := ingress.Annotations[ExternalDNSHostnameAnnotation]; exists && hostname != "" {
-		if _, saved := ingress.Annotations[OriginalExternalDNSHostname]; !saved {
-			ingress.Annotations[OriginalExternalDNSHostname] = hostname
+	if hostname, exists := latestIngress.Annotations[ExternalDNSHostnameAnnotation]; exists && hostname != "" {
+		if _, saved := latestIngress.Annotations[OriginalExternalDNSHostname]; !saved {
+			latestIngress.Annotations[OriginalExternalDNSHostname] = hostname
 			modified = true
 			logger.Info("Found external-dns hostname annotation; storing original value",
+				"namespace", ingress.Namespace,
+				"name", ingress.Name,
 				"value", hostname)
-			r.recordWarning(ingress, "ExternalDNSHostnameAnnotationPresent",
-				fmt.Sprintf("external-dns hostname annotation present (%s); stored in %s",
-					hostname, OriginalExternalDNSHostname))
 		}
 	}
 
-	if source, exists := ingress.Annotations[ExternalDNSIngressHostnameSource]; exists {
-		if _, saved := ingress.Annotations[OriginalExternalDNSIngressHostnameSource]; !saved {
-			ingress.Annotations[OriginalExternalDNSIngressHostnameSource] = source
-			modified = true
-			logger.Info("Found external-dns ingress hostname source annotation; storing original value",
-				"value", source)
+	if source, exists := latestIngress.Annotations[ExternalDNSIngressHostnameSource]; exists {
+		if _, saved := latestIngress.Annotations[OriginalExternalDNSIngressHostnameSource]; !saved {
+			if source != ExternalDNSHostnameSourceAnnotationOnly {
+				latestIngress.Annotations[OriginalExternalDNSIngressHostnameSource] = source
+				modified = true
+				logger.Info("Found external-dns ingress hostname source annotation; storing original value",
+					"namespace", ingress.Namespace,
+					"name", ingress.Name,
+					"value", source)
+			}
 		}
 	}
 
-	if ingress.Annotations[IngressDisabledAnnotation] != IngressDisabledReasonNormal &&
-		ingress.Annotations[IngressDisabledAnnotation] != IngressDisabledReasonExternalDNS {
-		ingress.Annotations[IngressDisabledAnnotation] = IngressDisabledReasonExternalDNS
+	if latestIngress.Annotations[IngressDisabledAnnotation] != IngressDisabledReasonNormal &&
+		latestIngress.Annotations[IngressDisabledAnnotation] != IngressDisabledReasonExternalDNS {
+		latestIngress.Annotations[IngressDisabledAnnotation] = IngressDisabledReasonExternalDNS
 		modified = true
 	}
 
-	if ingress.Annotations[ExternalDNSIngressHostnameSource] != ExternalDNSHostnameSourceAnnotationOnly {
-		ingress.Annotations[ExternalDNSIngressHostnameSource] = ExternalDNSHostnameSourceAnnotationOnly
+	if latestIngress.Annotations[ExternalDNSIngressHostnameSource] != ExternalDNSHostnameSourceAnnotationOnly {
+		latestIngress.Annotations[ExternalDNSIngressHostnameSource] = ExternalDNSHostnameSourceAnnotationOnly
 		modified = true
 		logger.Info("Set external-dns ingress hostname source to annotation-only",
+			"namespace", ingress.Namespace,
+			"name", ingress.Name,
 			"value", ExternalDNSHostnameSourceAnnotationOnly)
 	}
 
@@ -1047,11 +1084,11 @@ func (r *IngressReconciler) disableExternalDNS(ctx context.Context, ingress *net
 		return nil
 	}
 
-	if err := r.Update(ctx, ingress); err != nil {
+	if err := cli.Update(ctx, latestIngress); err != nil {
 		return fmt.Errorf("failed to update Ingress to disable external-dns: %w", err)
 	}
 
-	logger.Info("Successfully updated Ingress to disable external-dns processing",
+	logger.Info("Successfully disabled external-dns on Ingress",
 		"namespace", ingress.Namespace, "name", ingress.Name)
 	return nil
 }
@@ -1623,4 +1660,16 @@ func setHTTPRouteOwnerReference(httpRoute *gatewayv1.HTTPRoute, ingress *network
 			BlockOwnerDeletion: &blockOwnerDeletion,
 		},
 	}
+}
+
+func hasHostnames(ingress *networkingv1.Ingress) bool {
+	if ingress == nil || ingress.Spec.Rules == nil {
+		return false
+	}
+	for _, rule := range ingress.Spec.Rules {
+		if rule.Host != "" {
+			return true
+		}
+	}
+	return false
 }
