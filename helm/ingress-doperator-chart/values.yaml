@@ -5,7 +5,7 @@ replicaCount: 1
 image:
   repository: fiksn/ingress-doperator
   pullPolicy: IfNotPresent
-  tag: v0.0.2
+  tag: v0.0.3
 
 imagePullSecrets: []
 nameOverride: ""
