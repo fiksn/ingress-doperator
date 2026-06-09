@@ -19,7 +19,9 @@ package utils
 import (
 	"context"
 	"fmt"
+	"net/url"
 	"path/filepath"
+	"regexp"
 	"sort"
 	"strings"
 	"sync"
@@ -54,6 +56,7 @@ const (
 	nginxIngressAnnotationPrefix = "nginx.ingress.kubernetes.io/"
 	ingressAnnotationPrefix      = "ingress.kubernetes.io/"
 	maxK8sNameLength             = 253
+	schemeHTTPS                  = "https"
 )
 
 const (
@@ -80,7 +83,30 @@ const (
 	fromToWWWRedirectKey     = "from-to-www-redirect"
 	rewriteTargetKey         = "rewrite-target"
 	useRegexKey              = "use-regex"
+
+	authURLKey                 = "auth-url"
+	authSigninKey              = "auth-signin"
+	authSigninRedirectParamKey = "auth-signin-redirect-param"
+	authMethodKey              = "auth-method"
+	authResponseHeadersKey     = "auth-response-headers"
+	authRequestRedirectKey     = "auth-request-redirect"
+	authCacheKeyKey            = "auth-cache-key"
+	authCacheDurationKey       = "auth-cache-duration"
+	authKeepaliveKey           = "auth-keepalive"
+	authProxySetHeadersKey     = "auth-proxy-set-headers"
 )
+
+// AuthInputs carries resolved inputs for external-auth (auth_request) emulation
+// that cannot be derived from annotation values alone.
+type AuthInputs struct {
+	// Identifier is a unique, nginx-safe token per Ingress used to name the
+	// generated internal auth location, signin location, upstream and cache zone
+	// so that multiple Ingresses sharing a server block never collide.
+	Identifier string
+	// ProxySetHeaders holds headers resolved from the auth-proxy-set-headers
+	// ConfigMap, forwarded to the external auth service on the subrequest.
+	ProxySetHeaders map[string]string
+}
 
 var nginxIngressDirectiveWhitelist = map[string]struct{}{
 	"client-body-buffer-size":     {},
@@ -385,8 +411,10 @@ func ParseCommaSeparatedAnnotation(annotations map[string]string, key string) []
 }
 
 // BuildNginxIngressSnippets builds SnippetsFilter entries from NGINX Ingress annotations.
+// auth carries inputs for external-auth emulation that cannot be derived from
+// annotation values alone (a stable identifier and resolved proxy-set-headers).
 // nolint:gocyclo
-func BuildNginxIngressSnippets(annotations map[string]string) ([]map[string]interface{}, []string, bool) {
+func BuildNginxIngressSnippets(annotations map[string]string, auth AuthInputs) ([]map[string]interface{}, []string, bool) {
 	if annotations == nil {
 		return nil, nil, false
 	}
@@ -424,7 +452,9 @@ func BuildNginxIngressSnippets(annotations map[string]string) ([]map[string]inte
 
 	state := ingestNginxIngressAnnotations(annotations, keys)
 	lines, warnings := buildNginxDirectiveLines(state)
-	snippets := buildNginxSnippetBlocks(lines, state)
+	authHTTP, authServer, authLocation, authWarnings := buildAuthRequestConfig(state.auth, auth)
+	warnings = append(warnings, authWarnings...)
+	snippets := buildNginxSnippetBlocks(lines, state, authHTTP, authServer, authLocation)
 
 	if len(snippets) == 0 {
 		return nil, warnings, false
@@ -453,7 +483,20 @@ type nginxIngressSnippetState struct {
 	customHTTPErrors      []string
 	rewriteTarget         string
 	useRegex              bool
+	auth                  authState
 	warnings              []string
+}
+
+type authState struct {
+	url                 string
+	signin              string
+	signinRedirectParam string
+	method              string
+	responseHeaders     []string
+	requestRedirect     string
+	cacheKey            string
+	cacheDuration       string
+	keepalive           string
 }
 
 func ingestNginxIngressAnnotations(annotations map[string]string, keys []ingressAnnotationKey) nginxIngressSnippetState {
@@ -494,6 +537,10 @@ func ingestNginxIngressAnnotations(annotations map[string]string, keys []ingress
 }
 
 func applyIngressAnnotationValue(state *nginxIngressSnippetState, suffix, value string) bool {
+	if applyAuthIngressAnnotationValue(state, suffix, value) {
+		return true
+	}
+
 	parsedRanges := func(raw string) []string {
 		return ParseCommaSeparatedAnnotation(map[string]string{"value": raw}, "value")
 	}
@@ -586,6 +633,37 @@ func applyIngressAnnotationValue(state *nginxIngressSnippetState, suffix, value 
 	}
 }
 
+// applyAuthIngressAnnotationValue records external-auth (auth_request) inputs.
+// Returns true when suffix is an auth-* annotation it consumes.
+func applyAuthIngressAnnotationValue(state *nginxIngressSnippetState, suffix, value string) bool {
+	switch suffix {
+	case authURLKey:
+		state.auth.url = value
+	case authSigninKey:
+		state.auth.signin = value
+	case authSigninRedirectParamKey:
+		state.auth.signinRedirectParam = value
+	case authMethodKey:
+		state.auth.method = value
+	case authResponseHeadersKey:
+		state.auth.responseHeaders = ParseCommaSeparatedAnnotation(map[string]string{"value": value}, "value")
+	case authRequestRedirectKey:
+		state.auth.requestRedirect = value
+	case authCacheKeyKey:
+		state.auth.cacheKey = value
+	case authCacheDurationKey:
+		state.auth.cacheDuration = value
+	case authKeepaliveKey:
+		state.auth.keepalive = value
+	case authProxySetHeadersKey:
+		// Resolved by the controller into AuthInputs.ProxySetHeaders; the raw
+		// ConfigMap reference value is consumed here only to mark it handled.
+	default:
+		return false
+	}
+	return true
+}
+
 func applyLegacyIngressAnnotationValue(state *nginxIngressSnippetState, suffix, value string) bool {
 	switch suffix {
 	case browserXssFilterKey:
@@ -661,12 +739,22 @@ func buildNginxDirectiveLines(state nginxIngressSnippetState) ([]string, []strin
 	return lines, warnings
 }
 
-func buildNginxSnippetBlocks(lines []string, state nginxIngressSnippetState) []map[string]interface{} {
-	snippets := make([]map[string]interface{}, 0, 2)
+func buildNginxSnippetBlocks(
+	lines []string,
+	state nginxIngressSnippetState,
+	authHTTP, authServer, authLocation []string,
+) []map[string]interface{} {
+	snippets := make([]map[string]interface{}, 0, 3)
+
+	httpLines := make([]string, 0, len(authHTTP)+1)
 	if state.sslRedirectOff {
+		httpLines = append(httpLines, "ssl_redirect off;")
+	}
+	httpLines = append(httpLines, authHTTP...)
+	if len(httpLines) > 0 {
 		snippets = append(snippets, map[string]interface{}{
 			"context": "http",
-			"value":   "ssl_redirect off;",
+			"value":   strings.Join(httpLines, "\n"),
 		})
 	}
 
@@ -712,6 +800,7 @@ func buildNginxSnippetBlocks(lines []string, state nginxIngressSnippetState) []m
 		)
 	}
 
+	serverLines = append(serverLines, authServer...)
 	if len(serverLines) > 0 {
 		snippets = append(snippets, map[string]interface{}{
 			"context": "http.server",
@@ -737,6 +826,7 @@ func buildNginxSnippetBlocks(lines []string, state nginxIngressSnippetState) []m
 	if len(state.whitelistSourceRanges) > 0 {
 		locationLines = append(locationLines, "deny all;")
 	}
+	locationLines = append(locationLines, authLocation...)
 	if len(locationLines) > 0 {
 		snippets = append(snippets, map[string]interface{}{
 			"context": "http.server.location",
@@ -815,6 +905,287 @@ func filterSafeSnippetValues(state *nginxIngressSnippetState, key string, values
 		out = append(out, value)
 	}
 	return out
+}
+
+var (
+	authHeaderNameRe = regexp.MustCompile(`^[A-Za-z0-9-]+$`)
+	authTokenRe      = regexp.MustCompile(`^[A-Za-z0-9_-]+$`)
+	authNumberRe     = regexp.MustCompile(`^[0-9]+$`)
+	authCacheValidRe = regexp.MustCompile(`^[0-9smhd ]+$`)
+	authHTTPMethods  = map[string]struct{}{
+		"GET": {}, "HEAD": {}, "POST": {}, "PUT": {},
+		"DELETE": {}, "PATCH": {}, "OPTIONS": {},
+	}
+)
+
+// AuthIdentifier returns the stable per-Ingress token used to seed AuthInputs.Identifier.
+// The webhook and controller MUST agree on this value so they generate identical
+// NGINX object names and never overwrite each other's SnippetsFilter.
+func AuthIdentifier(namespace, name string) string {
+	return fmt.Sprintf("%s-%s", namespace, name)
+}
+
+// buildAuthRequestConfig emulates the ingress-nginx external-auth (auth_request)
+// flow as NGINX directives, partitioned by SnippetsFilter context. It returns
+// http-, server- and location-context line groups plus warnings for invalid input.
+func buildAuthRequestConfig(auth authState, inputs AuthInputs) (httpLines, serverLines, locationLines, warnings []string) {
+	rawURL := strings.TrimSpace(auth.url)
+	if rawURL == "" {
+		return nil, nil, nil, nil
+	}
+	parsed, ok := validateAuthURL(rawURL)
+	if !ok {
+		return nil, nil, nil, []string{
+			fmt.Sprintf("auth-url %q is not a valid http(s) URL; ignoring external auth", rawURL),
+		}
+	}
+
+	id := sanitizeNginxIdentifier(inputs.Identifier)
+	locationLines = append(locationLines, fmt.Sprintf("auth_request /_doperator_auth_%s;", id))
+
+	respLines, respWarnings := buildAuthResponseHeaderLines(auth.responseHeaders)
+	locationLines = append(locationLines, respLines...)
+	warnings = append(warnings, respWarnings...)
+
+	signinLine, signinBlock, signinWarnings := buildAuthSignin(auth, id)
+	warnings = append(warnings, signinWarnings...)
+	if signinLine != "" {
+		locationLines = append(locationLines, signinLine)
+		serverLines = append(serverLines, signinBlock)
+	}
+
+	authBlock, blockHTTP, blockWarnings := buildAuthLocationBlock(auth, inputs, parsed, id)
+	warnings = append(warnings, blockWarnings...)
+	httpLines = append(httpLines, blockHTTP...)
+	serverLines = append([]string{authBlock}, serverLines...)
+
+	return httpLines, serverLines, locationLines, warnings
+}
+
+func buildAuthResponseHeaderLines(headers []string) (lines, warnings []string) {
+	for i, hdr := range headers {
+		if !authHeaderNameRe.MatchString(hdr) {
+			warnings = append(warnings,
+				fmt.Sprintf("auth-response-headers entry %q is not a valid header name; ignoring", hdr))
+			continue
+		}
+		varName := fmt.Sprintf("$doperator_auth_h%d", i)
+		upstreamVar := "$upstream_http_" + strings.ReplaceAll(strings.ToLower(hdr), "-", "_")
+		lines = append(lines,
+			fmt.Sprintf("auth_request_set %s %s;", varName, upstreamVar),
+			fmt.Sprintf("proxy_set_header %s %s;", hdr, varName),
+		)
+	}
+	return lines, warnings
+}
+
+func buildAuthSignin(auth authState, id string) (locationLine, serverBlock string, warnings []string) {
+	signin := strings.TrimSpace(auth.signin)
+	if signin == "" {
+		return "", "", nil
+	}
+	if _, ok := validateAuthURL(signin); !ok {
+		return "", "", []string{fmt.Sprintf("auth-signin %q is not a valid http(s) URL; ignoring", signin)}
+	}
+	signin = strings.ReplaceAll(signin, "$escaped_request_uri", "$request_uri")
+	if param := strings.TrimSpace(auth.signinRedirectParam); param != "" {
+		if authTokenRe.MatchString(param) {
+			if !strings.Contains(signin, "?") {
+				signin = fmt.Sprintf("%s?%s=$request_uri", signin, param)
+			}
+		} else {
+			warnings = append(warnings,
+				fmt.Sprintf("auth-signin-redirect-param %q is not a valid query parameter name; ignoring", param))
+		}
+	}
+	signinLoc := "@doperator_signin_" + id
+	locationLine = fmt.Sprintf("error_page 401 = %s;", signinLoc)
+	serverBlock = fmt.Sprintf("location %s {\n    internal;\n    return 302 %s;\n}", signinLoc, signin)
+	return locationLine, serverBlock, warnings
+}
+
+func buildAuthLocationBlock(
+	auth authState, inputs AuthInputs, parsed *url.URL, id string,
+) (block string, httpLines, warnings []string) {
+	lines := []string{
+		"internal;",
+		"proxy_pass_request_body off;",
+		"proxy_set_header Content-Length \"\";",
+		"proxy_set_header X-Original-URL $scheme://$http_host$request_uri;",
+		"proxy_set_header X-Original-URI $request_uri;",
+		"proxy_set_header X-Original-Method $request_method;",
+		"proxy_set_header X-Scheme $scheme;",
+		"proxy_set_header X-Sender-Host $host;",
+	}
+
+	requestRedirect := strings.TrimSpace(auth.requestRedirect)
+	if requestRedirect == "" {
+		requestRedirect = "$request_uri"
+	} else if containsUnsafeSnippetChars(requestRedirect) {
+		warnings = append(warnings, "auth-request-redirect contains unsafe characters; using $request_uri")
+		requestRedirect = "$request_uri"
+	}
+	lines = append(lines, fmt.Sprintf("proxy_set_header X-Auth-Request-Redirect %s;", requestRedirect))
+
+	if method := strings.ToUpper(strings.TrimSpace(auth.method)); method != "" {
+		if _, ok := authHTTPMethods[method]; ok {
+			lines = append(lines, fmt.Sprintf("proxy_method %s;", method))
+		} else {
+			warnings = append(warnings,
+				fmt.Sprintf("auth-method %q is not a recognized HTTP method; ignoring", method))
+		}
+	}
+
+	headerLines, headerWarnings := buildAuthProxySetHeaderLines(inputs.ProxySetHeaders)
+	lines = append(lines, headerLines...)
+	warnings = append(warnings, headerWarnings...)
+
+	lines = append(lines, fmt.Sprintf("proxy_set_header Host %s;", parsed.Host))
+	if parsed.Scheme == schemeHTTPS {
+		lines = append(lines, "proxy_ssl_server_name on;", fmt.Sprintf("proxy_ssl_name %s;", parsed.Hostname()))
+	}
+
+	proxyPass, keepaliveHTTP, keepaliveWarnings := buildAuthProxyPass(auth, parsed, id)
+	warnings = append(warnings, keepaliveWarnings...)
+	httpLines = append(httpLines, keepaliveHTTP...)
+	if len(keepaliveHTTP) > 0 {
+		lines = append(lines, "proxy_http_version 1.1;", "proxy_set_header Connection \"\";")
+	}
+
+	cacheLines, cacheHTTP, cacheWarnings := buildAuthCache(auth, id)
+	warnings = append(warnings, cacheWarnings...)
+	httpLines = append(httpLines, cacheHTTP...)
+	lines = append(lines, cacheLines...)
+
+	lines = append(lines, proxyPass)
+	block = fmt.Sprintf("location = /_doperator_auth_%s {\n%s\n}", id, indentNginxLines(lines))
+	return block, httpLines, warnings
+}
+
+func buildAuthProxySetHeaderLines(headers map[string]string) (lines, warnings []string) {
+	for _, name := range sortedMapKeys(headers) {
+		value := headers[name]
+		if !authHeaderNameRe.MatchString(name) {
+			warnings = append(warnings,
+				fmt.Sprintf("auth-proxy-set-headers key %q is not a valid header name; ignoring", name))
+			continue
+		}
+		if containsUnsafeSnippetChars(value) {
+			warnings = append(warnings,
+				fmt.Sprintf("auth-proxy-set-headers value for %q contains unsafe characters; ignoring", name))
+			continue
+		}
+		lines = append(lines, fmt.Sprintf("proxy_set_header %s \"%s\";", name, escapeHeaderValue(value)))
+	}
+	return lines, warnings
+}
+
+func buildAuthProxyPass(auth authState, parsed *url.URL, id string) (proxyPass string, httpLines, warnings []string) {
+	keepalive := strings.TrimSpace(auth.keepalive)
+	if keepalive == "" {
+		return fmt.Sprintf("proxy_pass %s;", strings.TrimSpace(auth.url)), nil, nil
+	}
+	if !authNumberRe.MatchString(keepalive) {
+		warnings = append(warnings,
+			fmt.Sprintf("auth-keepalive %q is not a positive integer; disabling keepalive", keepalive))
+		return fmt.Sprintf("proxy_pass %s;", strings.TrimSpace(auth.url)), nil, warnings
+	}
+	upstreamName := "doperator_auth_" + id
+	port := parsed.Port()
+	if port == "" {
+		if parsed.Scheme == schemeHTTPS {
+			port = "443"
+		} else {
+			port = "80"
+		}
+	}
+	httpLines = append(httpLines, fmt.Sprintf(
+		"upstream %s {\n    server %s:%s;\n    keepalive %s;\n}", upstreamName, parsed.Hostname(), port, keepalive))
+	proxyPass = fmt.Sprintf("proxy_pass %s://%s%s;", parsed.Scheme, upstreamName, parsed.RequestURI())
+	return proxyPass, httpLines, warnings
+}
+
+func buildAuthCache(auth authState, id string) (locationLines, httpLines, warnings []string) {
+	cacheKey := strings.TrimSpace(auth.cacheKey)
+	if cacheKey == "" {
+		return nil, nil, nil
+	}
+	if containsUnsafeSnippetChars(cacheKey) {
+		return nil, nil, []string{"auth-cache-key contains unsafe characters; disabling auth caching"}
+	}
+	zone := "doperator_auth_" + id
+	httpLines = append(httpLines, fmt.Sprintf(
+		"proxy_cache_path /var/cache/nginx/%s levels=1:2 keys_zone=%s:1m max_size=10m inactive=60m use_temp_path=off;",
+		zone, zone))
+	locationLines = append(locationLines,
+		fmt.Sprintf("proxy_cache %s;", zone),
+		fmt.Sprintf("proxy_cache_key \"%s\";", escapeHeaderValue(cacheKey)),
+	)
+	if duration := strings.TrimSpace(auth.cacheDuration); duration != "" {
+		if authCacheValidRe.MatchString(duration) {
+			locationLines = append(locationLines, fmt.Sprintf("proxy_cache_valid %s;", duration))
+		} else {
+			warnings = append(warnings,
+				fmt.Sprintf("auth-cache-duration %q is not a valid duration; ignoring", duration))
+		}
+	}
+	return locationLines, httpLines, warnings
+}
+
+// sanitizeNginxIdentifier reduces an arbitrary string to lowercase [a-z0-9_] so
+// it can safely name an NGINX location, upstream or cache zone.
+func sanitizeNginxIdentifier(raw string) string {
+	var b strings.Builder
+	for _, r := range strings.ToLower(raw) {
+		switch {
+		case r >= 'a' && r <= 'z', r >= '0' && r <= '9':
+			b.WriteRune(r)
+		default:
+			b.WriteByte('_')
+		}
+	}
+	out := strings.Trim(b.String(), "_")
+	if out == "" {
+		return "default"
+	}
+	return out
+}
+
+func indentNginxLines(lines []string) string {
+	indented := make([]string, len(lines))
+	for i, line := range lines {
+		indented[i] = "    " + line
+	}
+	return strings.Join(indented, "\n")
+}
+
+func validateAuthURL(raw string) (*url.URL, bool) {
+	if raw == "" || containsUnsafeSnippetChars(raw) {
+		return nil, false
+	}
+	parsed, err := url.Parse(raw)
+	if err != nil {
+		return nil, false
+	}
+	if parsed.Scheme != "http" && parsed.Scheme != schemeHTTPS {
+		return nil, false
+	}
+	if parsed.Host == "" {
+		return nil, false
+	}
+	return parsed, true
+}
+
+func sortedMapKeys(m map[string]string) []string {
+	if len(m) == 0 {
+		return nil
+	}
+	keys := make([]string, 0, len(m))
+	for k := range m {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	return keys
 }
 
 // NginxIngressSnippetWarningAnnotations returns full annotation keys that should emit warnings when ignored.

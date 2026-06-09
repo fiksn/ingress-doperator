@@ -351,6 +351,83 @@ spec:
 			cmd = exec.Command("kubectl", "delete", "gateway", "nginx", "-n", gatewayNamespace, "--ignore-not-found")
 			_, _ = utils.Run(cmd)
 		})
+
+		It("should emulate external-auth annotations via a SnippetsFilter", func() {
+			testNamespace := "test-auth-emulation"
+			ingressName := "auth-protected"
+			filterName := "automatic-" + ingressName + "-annotations"
+			gatewayNamespace := "default"
+
+			By("skipping if the NGINX Gateway Fabric SnippetsFilter CRD is not installed")
+			cmd := exec.Command("kubectl", "get", "crd", "snippetsfilters.gateway.nginx.org")
+			if _, err := utils.Run(cmd); err != nil {
+				Skip("SnippetsFilter CRD (gateway.nginx.org) not installed in test cluster")
+			}
+
+			By("ensuring test namespace exists")
+			cmd = exec.Command("kubectl", "create", "ns", testNamespace)
+			_, _ = utils.Run(cmd) // Ignore error if namespace already exists
+
+			By("creating an Ingress with external-auth annotations")
+			authIngress := `
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: ` + ingressName + `
+  namespace: ` + testNamespace + `
+  annotations:
+    nginx.ingress.kubernetes.io/auth-url: "https://auth.example.com/oauth2/auth"
+    nginx.ingress.kubernetes.io/auth-signin: "https://auth.example.com/oauth2/start?rd=$escaped_request_uri"
+    nginx.ingress.kubernetes.io/auth-response-headers: "X-Auth-Request-User, X-Auth-Request-Email"
+spec:
+  ingressClassName: nginx
+  rules:
+  - host: auth-app.example.com
+    http:
+      paths:
+      - path: /
+        pathType: Prefix
+        backend:
+          service:
+            name: auth-backend
+            port:
+              number: 80
+`
+			cmd = exec.Command("kubectl", "apply", "-f", "-")
+			cmd.Stdin = strings.NewReader(authIngress)
+			_, err := utils.Run(cmd)
+			Expect(err).NotTo(HaveOccurred(), "Failed to create auth Ingress")
+
+			By("verifying the SnippetsFilter contains the auth_request configuration")
+			Eventually(func(g Gomega) {
+				cmd := exec.Command("kubectl", "get", "snippetsfilter", filterName, "-n", testNamespace, "-o", "json")
+				output, err := utils.Run(cmd)
+				g.Expect(err).NotTo(HaveOccurred(), "SnippetsFilter should be created")
+				g.Expect(output).To(ContainSubstring("auth_request /_doperator_auth_"),
+					"location snippet should contain auth_request")
+				g.Expect(output).To(ContainSubstring("error_page 401 = @doperator_signin_"),
+					"location snippet should redirect 401 to the signin location")
+				g.Expect(output).To(ContainSubstring("return 302 https://auth.example.com/oauth2/start?rd=$request_uri"),
+					"signin should substitute $escaped_request_uri with $request_uri")
+				g.Expect(output).To(ContainSubstring("$upstream_http_x_auth_request_user"),
+					"response headers should be captured from the auth response")
+			}, 2*time.Minute, 5*time.Second).Should(Succeed())
+
+			By("verifying the HTTPRoute references the SnippetsFilter as an ExtensionRef")
+			Eventually(func(g Gomega) {
+				cmd := exec.Command("kubectl", "get", "httproute", ingressName, "-n", testNamespace, "-o", "json")
+				output, err := utils.Run(cmd)
+				g.Expect(err).NotTo(HaveOccurred(), "HTTPRoute should be created")
+				g.Expect(output).To(ContainSubstring("SnippetsFilter"), "HTTPRoute should have a SnippetsFilter filter")
+				g.Expect(output).To(ContainSubstring(filterName), "HTTPRoute should reference the auth SnippetsFilter")
+			}, 2*time.Minute, 5*time.Second).Should(Succeed())
+
+			By("cleaning up test resources")
+			cmd = exec.Command("kubectl", "delete", "ns", testNamespace, "--timeout=60s")
+			_, _ = utils.Run(cmd)
+			cmd = exec.Command("kubectl", "delete", "gateway", "nginx", "-n", gatewayNamespace, "--ignore-not-found")
+			_, _ = utils.Run(cmd)
+		})
 	})
 })
 

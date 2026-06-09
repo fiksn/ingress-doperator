@@ -509,7 +509,8 @@ func (m *IngressMutator) applyIngressAnnotationSnippetsFilter(
 		}
 	}
 
-	snippets, warnings, ok := utils.BuildNginxIngressSnippets(ingress.Annotations)
+	authInputs := utils.AuthInputs{Identifier: utils.AuthIdentifier(ingress.Namespace, ingress.Name)}
+	snippets, warnings, ok := utils.BuildNginxIngressSnippets(ingress.Annotations, authInputs)
 	if !ok {
 		return
 	}
@@ -546,7 +547,8 @@ func (m *IngressMutator) finalizeIngressAnnotationSnippetsFilter(ctx context.Con
 		return
 	}
 	logger := log.FromContext(ctx)
-	snippets, _, ok := utils.BuildNginxIngressSnippets(ingress.Annotations)
+	authInputs := utils.AuthInputs{Identifier: utils.AuthIdentifier(ingress.Namespace, ingress.Name)}
+	snippets, _, ok := utils.BuildNginxIngressSnippets(ingress.Annotations, authInputs)
 	if !ok {
 		return
 	}

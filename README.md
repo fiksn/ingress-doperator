@@ -328,6 +328,57 @@ The webhook supports two translation modes:
 - You want to leverage upstream ingress2gateway logic
 - You need provider-specific features (e.g., ingress-nginx canary, istio virtualservice)
 
+### External authentication (`auth_request`)
+
+ingress-nginx implements external/forward auth (e.g. oauth2-proxy) with the
+NGINX `ngx_http_auth_request_module`. NGINX Gateway Fabric has no native
+forward-auth filter, so ingress-doperator emulates the same flow by emitting an
+NGINX `auth_request` configuration into the automatically generated
+`SnippetsFilter` (the `automatic-<ingress>-annotations` filter referenced by the
+HTTPRoute). NGF ships the same NGINX modules, so the translated config behaves
+like ingress-nginx.
+
+Supported `nginx.ingress.kubernetes.io/*` annotations:
+
+| Annotation | Effect |
+|------------|--------|
+| `auth-url` | **Required.** External auth endpoint (`http`/`https`). Forms the internal `auth_request` subrequest location. |
+| `auth-signin` | Redirect target on `401`; emitted as `error_page 401` → a `return 302` location. |
+| `auth-signin-redirect-param` | Query param appended to `auth-signin` carrying the original URI (default behaviour matches ingress-nginx `rd`). |
+| `auth-method` | HTTP method for the auth subrequest (`proxy_method`). |
+| `auth-response-headers` | Comma-separated headers copied from the auth response onto the upstream request (`auth_request_set` + `proxy_set_header`). |
+| `auth-request-redirect` | Value of `X-Auth-Request-Redirect` (default `$request_uri`). |
+| `auth-cache-key` | Enables response caching of the auth subrequest (`proxy_cache_key`). |
+| `auth-cache-duration` | `proxy_cache_valid` value (e.g. `200 202 5m`). |
+| `auth-keepalive` | Keepalive connection count to the auth service; generates an `upstream` block. |
+| `auth-proxy-set-headers` | Name of a ConfigMap (in the Ingress namespace) whose data is forwarded to the auth service as request headers. |
+
+```yaml
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: protected-app
+  annotations:
+    nginx.ingress.kubernetes.io/auth-url: "https://auth.example.com/oauth2/auth"
+    nginx.ingress.kubernetes.io/auth-signin: "https://auth.example.com/oauth2/start?rd=$escaped_request_uri"
+    nginx.ingress.kubernetes.io/auth-response-headers: "X-Auth-Request-User, X-Auth-Request-Email"
+```
+
+Notes and limitations:
+
+- `$escaped_request_uri` (defined by ingress-nginx, not core NGINX) is rewritten
+  to the built-in `$request_uri`. The original query string is not re-escaped;
+  this matches the common oauth2-proxy `rd=` case.
+- Annotation values are sanitized: URLs must use `http`/`https`, header/method
+  names are validated, and values containing `;`, `{`, `}`, or newlines are
+  rejected with a logged warning (no partial/invalid NGINX config is emitted).
+- Caching writes to a path inside the NGF NGINX container; if that directory is
+  not writable NGF will reject the config. Caching is off unless `auth-cache-key`
+  is set.
+- `auth-proxy-set-headers` is resolved by the operator (the webhook fast-path
+  does not read the ConfigMap). Editing the referenced ConfigMap does not by
+  itself re-trigger reconciliation — touch the Ingress to apply header changes.
+
 ### Special Annotations
 
 The webhook recognizes these annotations on Ingress resources:

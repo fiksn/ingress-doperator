@@ -26,6 +26,7 @@ import (
 	"time"
 
 	"github.com/go-logr/logr"
+	corev1 "k8s.io/api/core/v1"
 	networkingv1 "k8s.io/api/networking/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -67,6 +68,7 @@ const (
 	HTTPRouteSnippetsFilterAnnotation        = "ingress-doperator.fiction.si/httproute-snippets-filter"
 	HTTPRouteAuthenticationAnnotation        = "ingress-doperator.fiction.si/httproute-authentication-filter"
 	HTTPRouteRequestHeaderAnnotation         = "ingress-doperator.fiction.si/httproute-request-header-modifier-filter"
+	AuthProxySetHeadersAnnotation            = "nginx.ingress.kubernetes.io/auth-proxy-set-headers"
 	DisabledIngressClassName                 = "ingress-doperator-disabled"
 	DisabledIngressClassController           = "dummy.io/no-controller"
 	IngressDisabledReasonNormal              = "normal"
@@ -99,6 +101,7 @@ const selfDeletedIngressTTL = 10 * time.Minute
 
 type IngressReconciler struct {
 	client.Client
+	APIReader                        client.Reader
 	Scheme                           *runtime.Scheme
 	Recorder                         events.EventRecorder
 	GatewayNamespace                 string
@@ -720,7 +723,8 @@ func (r *IngressReconciler) applySnippetsFilters(
 				"name", ingress.Name)
 		}
 	}
-	snippets, warnings, ok := utils.BuildNginxIngressSnippets(ingress.Annotations)
+	authInputs := r.buildAuthInputs(ctx, ingress)
+	snippets, warnings, ok := utils.BuildNginxIngressSnippets(ingress.Annotations, authInputs)
 	if !ok {
 		return
 	}
@@ -755,6 +759,53 @@ func (r *IngressReconciler) applySnippetsFilters(
 	if ready {
 		utils.AddExtensionRefFilterAfterExistingKind(httpRoute, utils.NginxGatewayGroup, utils.SnippetsFilterKind, filterName)
 	}
+}
+
+// reader returns an uncached reader for objects we deliberately do not cache
+// cluster-wide (e.g. ConfigMaps). Falls back to the cached client when unset.
+func (r *IngressReconciler) reader() client.Reader {
+	if r.APIReader != nil {
+		return r.APIReader
+	}
+	return r.Client
+}
+
+// buildAuthInputs assembles inputs for external-auth (auth_request) emulation:
+// a stable per-Ingress identifier for naming generated NGINX objects, and the
+// headers resolved from the auth-proxy-set-headers ConfigMap (if referenced).
+func (r *IngressReconciler) buildAuthInputs(
+	ctx context.Context,
+	ingress *networkingv1.Ingress,
+) utils.AuthInputs {
+	inputs := utils.AuthInputs{
+		Identifier: utils.AuthIdentifier(ingress.Namespace, ingress.Name),
+	}
+	if ingress.Annotations == nil {
+		return inputs
+	}
+	cmName := strings.TrimSpace(ingress.Annotations[AuthProxySetHeadersAnnotation])
+	if cmName == "" {
+		return inputs
+	}
+
+	logger := log.FromContext(ctx)
+	reader := r.reader()
+	configMap := &corev1.ConfigMap{}
+	key := types.NamespacedName{Namespace: ingress.Namespace, Name: cmName}
+	if err := reader.Get(ctx, key, configMap); err != nil {
+		if apierrors.IsNotFound(err) {
+			logger.Info("auth-proxy-set-headers ConfigMap not found, skipping",
+				"namespace", ingress.Namespace, "name", cmName)
+			r.recordWarning(ingress, "AuthProxyConfigMapNotFound",
+				fmt.Sprintf("auth-proxy-set-headers ConfigMap %s/%s not found", ingress.Namespace, cmName))
+		} else {
+			logger.Error(err, "failed to read auth-proxy-set-headers ConfigMap",
+				"namespace", ingress.Namespace, "name", cmName)
+		}
+		return inputs
+	}
+	inputs.ProxySetHeaders = configMap.Data
+	return inputs
 }
 
 func (r *IngressReconciler) handleDeletion(ctx context.Context, ingress *networkingv1.Ingress) (ctrl.Result, error) {
@@ -1266,6 +1317,9 @@ func (r *IngressReconciler) SetupWithManager(mgr ctrl.Manager) error {
 	}
 
 	apiReader := mgr.GetAPIReader()
+	if r.APIReader == nil {
+		r.APIReader = apiReader
+	}
 	ctx := context.Background()
 	if version, ok, err := utils.GetCRDVersion(ctx, apiReader, utils.SnippetsFilterCRDName); err == nil && ok {
 		snippetsGVK := schema.GroupVersionKind{
