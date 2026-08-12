@@ -247,12 +247,18 @@ func (m *HTTPRouteManager) applyHTTPRoute(
 }
 
 // ResolveNamedPorts resolves named ports in HTTPRoute by looking up the actual Services
+// ResolveNamedPorts replaces placeholder port 0 backendRefs with the numeric port
+// resolved from the Service. The primary Ingress is searched first for the port name;
+// any extra Ingresses (e.g. canary siblings folded into the same HTTPRoute) are searched
+// too so their backends resolve correctly.
 func (m *HTTPRouteManager) ResolveNamedPorts(
 	ctx context.Context,
 	ingress *networkingv1.Ingress,
 	httpRoute *gatewayv1.HTTPRoute,
+	extra ...*networkingv1.Ingress,
 ) error {
 	logger := log.FromContext(ctx)
+	sources := append([]*networkingv1.Ingress{ingress}, extra...)
 
 	for i := range httpRoute.Spec.Rules {
 		for j := range httpRoute.Spec.Rules[i].BackendRefs {
@@ -262,8 +268,8 @@ func (m *HTTPRouteManager) ResolveNamedPorts(
 			if backendRef.Port != nil && *backendRef.Port == 0 {
 				serviceName := string(backendRef.Name)
 
-				// Find the named port from the Ingress spec
-				portName := m.findPortNameInIngress(ingress, serviceName)
+				// Find the named port from the source Ingress specs
+				portName := findPortNameInIngresses(sources, serviceName)
 				if portName == "" {
 					logger.Info("Could not find port name in Ingress for service, using fallback port 80",
 						"service", serviceName,
@@ -299,10 +305,16 @@ func (m *HTTPRouteManager) ResolveNamedPorts(
 	return nil
 }
 
-// findPortNameInIngress finds the port name for a given service in the Ingress spec
-func (m *HTTPRouteManager) findPortNameInIngress(ingress *networkingv1.Ingress, serviceName string) string {
-	for _, rule := range ingress.Spec.Rules {
-		if rule.HTTP != nil {
+// findPortNameInIngresses finds the port name for a given service across the Ingress specs.
+func findPortNameInIngresses(ingresses []*networkingv1.Ingress, serviceName string) string {
+	for _, ingress := range ingresses {
+		if ingress == nil {
+			continue
+		}
+		for _, rule := range ingress.Spec.Rules {
+			if rule.HTTP == nil {
+				continue
+			}
 			for _, path := range rule.HTTP.Paths {
 				if path.Backend.Service != nil && path.Backend.Service.Name == serviceName {
 					return path.Backend.Service.Port.Name

@@ -315,20 +315,29 @@ func (r *IngressReconciler) reconcileIngressToHTTPRoute(
 		gatewayName = r.getGatewayNameForClass(ingressClass)
 	}
 
+	// Canary Ingresses do not produce their own HTTPRoute; their backend is folded
+	// into the primary Ingress's HTTPRoute. Reconcile the primary sibling instead.
+	if translator.IsCanary(ingress) {
+		return r.reconcileCanaryPrimaries(ctx, ingress)
+	}
+
 	// Override gateway name in translator config
 	transConfig := trans.Config
 	transConfig.GatewayName = gatewayName
 	singleTrans := translator.New(transConfig)
 
+	// Gather canary siblings sharing a path with this primary Ingress.
+	canaries := r.findCanarySiblings(ctx, ingress)
+
 	// Translate to HTTPRoute (we no longer create Gateway here)
-	httpRoute := singleTrans.TranslateToHTTPRoute(ingress)
+	httpRoute := singleTrans.TranslateToHTTPRouteWithCanaries(ingress, canaries)
 	setHTTPRouteOwnerReference(httpRoute, ingress)
 
 	// Apply extension refs (snippets, auth, headers)
 	r.applyHTTPRouteExtensionRefs(ctx, ingress, httpRoute)
 
-	// Resolve any named ports before applying
-	if err := r.HTTPRouteManager.ResolveNamedPorts(ctx, ingress, httpRoute); err != nil {
+	// Resolve any named ports before applying (search canary siblings too)
+	if err := r.HTTPRouteManager.ResolveNamedPorts(ctx, ingress, httpRoute, canaries...); err != nil {
 		logger.Error(err, "failed to resolve named ports")
 		// Continue anyway with fallback ports
 	}
@@ -431,6 +440,115 @@ func (r *IngressReconciler) reconcileIngressToHTTPRoute(
 
 	r.recordNormal(ingress, "ReconcileSuccess", "Ingress reconciled to HTTPRoute successfully")
 	return ctrl.Result{}, nil
+}
+
+// listSiblingIngresses returns the Ingresses in the same namespace as the given Ingress.
+func (r *IngressReconciler) listSiblingIngresses(
+	ctx context.Context,
+	namespace string,
+) ([]networkingv1.Ingress, error) {
+	list := &networkingv1.IngressList{}
+	if err := r.List(ctx, list, client.InNamespace(namespace)); err != nil {
+		return nil, err
+	}
+	return list.Items, nil
+}
+
+// findCanarySiblings returns active canary Ingresses that share a host+path with the
+// primary Ingress. Canaries being deleted are excluded so their backends are dropped.
+func (r *IngressReconciler) findCanarySiblings(
+	ctx context.Context,
+	primary *networkingv1.Ingress,
+) []*networkingv1.Ingress {
+	siblings, err := r.listSiblingIngresses(ctx, primary.Namespace)
+	if err != nil {
+		log.FromContext(ctx).Error(err, "failed to list Ingresses for canary lookup",
+			"namespace", primary.Namespace)
+		return nil
+	}
+	var canaries []*networkingv1.Ingress
+	for i := range siblings {
+		sibling := &siblings[i]
+		if sibling.Name == primary.Name || !translator.IsCanary(sibling) {
+			continue
+		}
+		if !sibling.DeletionTimestamp.IsZero() {
+			continue
+		}
+		if r.matchesIngressClassIgnoreFilter(sibling) || !r.matchesIngressClassFilter(sibling) {
+			continue
+		}
+		// ingress-nginx only merges a canary with a primary of the same ingress class.
+		if r.getIngressClass(sibling) != r.getIngressClass(primary) {
+			continue
+		}
+		if sharesHostPath(primary, sibling) {
+			canaries = append(canaries, sibling)
+		}
+	}
+	return canaries
+}
+
+// reconcileCanaryPrimaries reconciles the primary Ingresses that a canary contributes
+// to, so their HTTPRoutes are (re)built with the canary's backend folded in.
+func (r *IngressReconciler) reconcileCanaryPrimaries(
+	ctx context.Context,
+	canary *networkingv1.Ingress,
+) (ctrl.Result, error) {
+	logger := log.FromContext(ctx)
+	siblings, err := r.listSiblingIngresses(ctx, canary.Namespace)
+	if err != nil {
+		logger.Error(err, "failed to list Ingresses for canary primary lookup",
+			"namespace", canary.Namespace)
+		return ctrl.Result{RequeueAfter: requeueAfterError}, nil
+	}
+	for i := range siblings {
+		primary := &siblings[i]
+		if primary.Name == canary.Name || translator.IsCanary(primary) {
+			continue
+		}
+		if !primary.DeletionTimestamp.IsZero() {
+			continue
+		}
+		// Match ingress-nginx: canary and primary must share the same ingress class.
+		if r.getIngressClass(primary) != r.getIngressClass(canary) {
+			continue
+		}
+		if !sharesHostPath(primary, canary) {
+			continue
+		}
+		if _, err := r.reconcileIngressToHTTPRoute(ctx, primary); err != nil {
+			logger.Error(err, "failed to reconcile primary Ingress for canary",
+				"primary", primary.Name, "canary", canary.Name)
+			return ctrl.Result{}, err
+		}
+	}
+	return ctrl.Result{}, nil
+}
+
+// sharesHostPath reports whether two Ingresses serve at least one identical host+path,
+// which is how ingress-nginx associates a canary Ingress with its primary.
+func sharesHostPath(a, b *networkingv1.Ingress) bool {
+	paths := make(map[string]struct{})
+	for _, rule := range a.Spec.Rules {
+		if rule.HTTP == nil {
+			continue
+		}
+		for _, path := range rule.HTTP.Paths {
+			paths[rule.Host+"\x00"+path.Path] = struct{}{}
+		}
+	}
+	for _, rule := range b.Spec.Rules {
+		if rule.HTTP == nil {
+			continue
+		}
+		for _, path := range rule.HTTP.Paths {
+			if _, ok := paths[rule.Host+"\x00"+path.Path]; ok {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 func (r *IngressReconciler) ensureGatewayForListenerUpdate(
@@ -814,6 +932,15 @@ func (r *IngressReconciler) handleDeletion(ctx context.Context, ingress *network
 
 	if r.shouldSkipDeletionCleanup(ctx, ingress, logger) {
 		return ctrl.Result{}, nil
+	}
+
+	// A canary Ingress owns no HTTPRoute of its own; rebuild the primaries it fed so
+	// its backend is removed, then release the finalizer.
+	if translator.IsCanary(ingress) {
+		if _, err := r.reconcileCanaryPrimaries(ctx, ingress); err != nil {
+			return ctrl.Result{}, err
+		}
+		return r.finalizeDeletion(ctx, ingress)
 	}
 
 	if !r.EnableDeletion {

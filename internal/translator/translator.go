@@ -24,7 +24,10 @@ import (
 	"sort"
 	"strings"
 
+	"github.com/go-logr/logr"
 	"github.com/kubernetes-sigs/ingress2gateway/pkg/i2gw"
+	emittersutils "github.com/kubernetes-sigs/ingress2gateway/pkg/i2gw/emitters/utils"
+	"github.com/kubernetes-sigs/ingress2gateway/pkg/i2gw/notifications"
 	"github.com/kubernetes-sigs/ingress2gateway/pkg/i2gw/providers/ingressnginx"
 	corev1 "k8s.io/api/core/v1"
 	networkingv1 "k8s.io/api/networking/v1"
@@ -114,7 +117,8 @@ func (t *Translator) translateWithIngress2Gateway(
 	// Create a fake client with our Ingress and mock Services
 	// We need to create Service objects for the backends referenced by the Ingress
 	services := t.extractServicesFromIngress(ingress)
-	objects := []runtime.Object{ingress}
+	objects := make([]runtime.Object, 0, 1+len(services))
+	objects = append(objects, ingress)
 	for i := range services {
 		objects = append(objects, &services[i])
 	}
@@ -138,6 +142,7 @@ func (t *Translator) translateWithIngress2Gateway(
 		Client:                fakeClient,
 		Namespace:             ingress.Namespace,
 		ProviderSpecificFlags: providerFlags,
+		Report:                notifications.NewReport(true),
 	}
 
 	// Select the appropriate provider
@@ -161,7 +166,7 @@ func (t *Translator) translateWithIngress2Gateway(
 	}
 
 	// Convert IR to Gateway API resources
-	gwResources, errs := provider.ToGatewayResources(ir)
+	gwResources, errs := emittersutils.ToGatewayResources(ir)
 	if len(errs) > 0 {
 		logger.Info("ingress2gateway Gateway API conversion had errors", "errors", errs)
 	}
@@ -669,6 +674,16 @@ func (t *Translator) TranslateToGateway(ingress *networkingv1.Ingress) *gatewayv
 
 // TranslateToHTTPRoute converts an Ingress to an HTTPRoute resource
 func (t *Translator) TranslateToHTTPRoute(ingress *networkingv1.Ingress) *gatewayv1.HTTPRoute {
+	return t.TranslateToHTTPRouteWithCanaries(ingress, nil)
+}
+
+// TranslateToHTTPRouteWithCanaries converts a primary Ingress to an HTTPRoute, folding
+// in any ingress-nginx canary sibling Ingresses as weighted or header/cookie-matched
+// backends on the matching paths.
+func (t *Translator) TranslateToHTTPRouteWithCanaries(
+	ingress *networkingv1.Ingress,
+	canaries []*networkingv1.Ingress,
+) *gatewayv1.HTTPRoute {
 	logger := log.Log.WithName("translator")
 	httpRoute := &gatewayv1.HTTPRoute{}
 	httpRoute.Name = ingress.Name
@@ -705,81 +720,99 @@ func (t *Translator) TranslateToHTTPRoute(ingress *networkingv1.Ingress) *gatewa
 	httpRoute.Spec.ParentRefs = parentRefs
 
 	requestHeaderFilter, responseHeaderFilter := buildHeaderModifierFilters(ingress.Annotations)
+	filters := collectFilters(requestHeaderFilter, responseHeaderFilter)
+	canaryEntries := collectCanaryEntries(canaries, logger)
 
-	// Convert Ingress rules to HTTPRoute rules
-	var rules []gatewayv1.HTTPRouteRule
-	for _, rule := range ingress.Spec.Rules {
-		if rule.HTTP != nil {
-			for _, path := range rule.HTTP.Paths {
-				var backendRefs []gatewayv1.HTTPBackendRef
-
-				if path.Backend.Service != nil {
-					backendRef := gatewayv1.HTTPBackendRef{
-						BackendRef: gatewayv1.BackendRef{
-							BackendObjectReference: gatewayv1.BackendObjectReference{
-								Name: gatewayv1.ObjectName(path.Backend.Service.Name),
-							},
-						},
-					}
-
-					// Handle port - can be either number or name
-					if path.Backend.Service.Port.Number > 0 {
-						// Use numeric port
-						port := path.Backend.Service.Port.Number
-						backendRef.Port = &port
-					} else if path.Backend.Service.Port.Name != "" {
-						// Named port - store port name temporarily as 0
-						// Controller will resolve it by looking up the Service
-						port := int32(0)
-						backendRef.Port = &port
-					}
-
-					backendRefs = append(backendRefs, backendRef)
-				}
-
-				var matches []gatewayv1.HTTPRouteMatch
-				if path.Path != "" {
-					pathMatchType := gatewayv1.PathMatchPathPrefix
-					if path.PathType != nil {
-						switch *path.PathType {
-						case networkingv1.PathTypeExact:
-							pathMatchType = gatewayv1.PathMatchExact
-						case networkingv1.PathTypeImplementationSpecific:
-							logger.Info("Converting PathType ImplementationSpecific to PathPrefix",
-								"ingress", ingress.Name,
-								"namespace", ingress.Namespace,
-								"path", path.Path)
-							pathMatchType = gatewayv1.PathMatchPathPrefix
-						case networkingv1.PathTypePrefix:
-							pathMatchType = gatewayv1.PathMatchPathPrefix
-						}
-					}
-					match := gatewayv1.HTTPRouteMatch{
-						Path: &gatewayv1.HTTPPathMatch{
-							Type:  &pathMatchType,
-							Value: &path.Path,
-						},
-					}
-					matches = append(matches, match)
-				}
-
-				httpRouteRule := gatewayv1.HTTPRouteRule{
-					Matches:     matches,
-					BackendRefs: backendRefs,
-				}
-				if requestHeaderFilter != nil {
-					httpRouteRule.Filters = append(httpRouteRule.Filters, *requestHeaderFilter)
-				}
-				if responseHeaderFilter != nil {
-					httpRouteRule.Filters = append(httpRouteRule.Filters, *responseHeaderFilter)
-				}
-				rules = append(rules, httpRouteRule)
-			}
-		}
-	}
-	httpRoute.Spec.Rules = rules
+	httpRoute.Spec.Rules = t.buildHTTPRouteRules(ingress, canaryEntries, filters, logger)
 
 	return httpRoute
+}
+
+// buildHTTPRouteRules converts an Ingress's paths to HTTPRoute rules, splitting any
+// path that has a canary backend into the appropriate weighted/header/cookie rules.
+func (t *Translator) buildHTTPRouteRules(
+	ingress *networkingv1.Ingress,
+	canaryEntries map[string]canaryEntry,
+	filters []gatewayv1.HTTPRouteFilter,
+	logger logr.Logger,
+) []gatewayv1.HTTPRouteRule {
+	var rules []gatewayv1.HTTPRouteRule
+	for _, rule := range ingress.Spec.Rules {
+		if rule.HTTP == nil {
+			continue
+		}
+		for _, path := range rule.HTTP.Paths {
+			match, hasPath := buildPathMatch(path, ingress, logger)
+			primaryRef, hasBackend := backendRefFromPath(path)
+			if entry, hasCanary := canaryEntries[path.Path]; hasCanary && hasBackend {
+				rules = append(rules, buildCanaryRules(match, hasPath, primaryRef, entry, filters)...)
+				continue
+			}
+			rules = append(rules, plainRule(match, hasPath, primaryRef, hasBackend, filters))
+		}
+	}
+	return rules
+}
+
+// buildPathMatch builds the path match for an Ingress path. The second return value is
+// false when the path has no value (matches every request).
+func buildPathMatch(
+	path networkingv1.HTTPIngressPath,
+	ingress *networkingv1.Ingress,
+	logger logr.Logger,
+) (gatewayv1.HTTPRouteMatch, bool) {
+	if path.Path == "" {
+		return gatewayv1.HTTPRouteMatch{}, false
+	}
+	pathMatchType := gatewayv1.PathMatchPathPrefix
+	if path.PathType != nil {
+		switch *path.PathType {
+		case networkingv1.PathTypeExact:
+			pathMatchType = gatewayv1.PathMatchExact
+		case networkingv1.PathTypeImplementationSpecific:
+			logger.Info("Converting PathType ImplementationSpecific to PathPrefix",
+				"ingress", ingress.Name,
+				"namespace", ingress.Namespace,
+				"path", path.Path)
+			pathMatchType = gatewayv1.PathMatchPathPrefix
+		case networkingv1.PathTypePrefix:
+			pathMatchType = gatewayv1.PathMatchPathPrefix
+		}
+	}
+	value := path.Path
+	return gatewayv1.HTTPRouteMatch{
+		Path: &gatewayv1.HTTPPathMatch{Type: &pathMatchType, Value: &value},
+	}, true
+}
+
+// plainRule builds a single rule for a path without a canary backend.
+func plainRule(
+	match gatewayv1.HTTPRouteMatch,
+	hasPath bool,
+	ref gatewayv1.HTTPBackendRef,
+	hasBackend bool,
+	filters []gatewayv1.HTTPRouteFilter,
+) gatewayv1.HTTPRouteRule {
+	rule := gatewayv1.HTTPRouteRule{
+		Matches: baseMatches(match, hasPath),
+		Filters: filters,
+	}
+	if hasBackend {
+		rule.BackendRefs = []gatewayv1.HTTPBackendRef{ref}
+	}
+	return rule
+}
+
+// collectFilters flattens the optional request/response header modifier filters into a slice.
+func collectFilters(request, response *gatewayv1.HTTPRouteFilter) []gatewayv1.HTTPRouteFilter {
+	var filters []gatewayv1.HTTPRouteFilter
+	if request != nil {
+		filters = append(filters, *request)
+	}
+	if response != nil {
+		filters = append(filters, *response)
+	}
+	return filters
 }
 
 func buildHeaderModifierFilters(annotations map[string]string) (*gatewayv1.HTTPRouteFilter, *gatewayv1.HTTPRouteFilter) {

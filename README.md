@@ -326,7 +326,7 @@ The webhook supports two translation modes:
 - You want standardized, provider-specific translation
 - You don't need hostname rewriting
 - You want to leverage upstream ingress2gateway logic
-- You need provider-specific features (e.g., ingress-nginx canary, istio virtualservice)
+- You need provider-specific features not handled by the built-in translator (e.g., istio virtualservice)
 
 ### External authentication (`auth_request`)
 
@@ -378,6 +378,80 @@ Notes and limitations:
 - `auth-proxy-set-headers` is resolved by the operator (the webhook fast-path
   does not read the ConfigMap). Editing the referenced ConfigMap does not by
   itself re-trigger reconciliation — touch the Ingress to apply header changes.
+
+### Canary traffic splitting
+
+ingress-nginx implements canary deployments as a **second Ingress** that shares a
+host+path with a primary Ingress and carries
+`nginx.ingress.kubernetes.io/canary: "true"`. ingress-doperator's built-in
+translator folds that canary backend into the primary Ingress's HTTPRoute, using
+native Gateway API features (NGINX Gateway Fabric implements all of them).
+
+Supported `nginx.ingress.kubernetes.io/*` annotations on the canary Ingress:
+
+| Annotation | Effect in the generated HTTPRoute |
+|------------|-----------------------------------|
+| `canary` | **Required** (`"true"`). Marks the Ingress as a canary; it produces no HTTPRoute of its own. |
+| `canary-weight` | Weight-based split: the primary path becomes a rule with two `backendRefs` weighted `total-weight` / `weight`. |
+| `canary-weight-total` | Denominator for the weight (default `100`). |
+| `canary-by-header` | Adds a higher-priority rule matching that header `Exact "always"` → canary; `"never"` → primary. |
+| `canary-by-header-value` | Overrides the matched value (`Exact <value>` instead of `always`/`never`). |
+| `canary-by-header-pattern` | Matches the header as a `RegularExpression`. |
+| `canary-by-cookie` | Adds a rule matching the `Cookie` header `RegularExpression` for `<name>=always` → canary. |
+
+Precedence follows ingress-nginx (header > cookie > weight): header/cookie rules
+carry an extra header match, so they are more specific than the weight-split rule
+and win. The weight split is always emitted (default `0/100`, i.e. the canary
+receives no traffic until a weight or header/cookie rule matches).
+
+```yaml
+# Primary
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: prod
+spec:
+  rules:
+    - host: app.example.com
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend: { service: { name: prod, port: { number: 80 } } }
+---
+# Canary: 20% of traffic, or all traffic with header X-Canary: always
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: prod-canary
+  annotations:
+    nginx.ingress.kubernetes.io/canary: "true"
+    nginx.ingress.kubernetes.io/canary-weight: "20"
+    nginx.ingress.kubernetes.io/canary-by-header: "X-Canary"
+spec:
+  rules:
+    - host: app.example.com
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend: { service: { name: canary, port: { number: 80 } } }
+```
+
+Notes and limitations:
+
+- The canary is associated with its primary by shared **host+path** within the
+  same namespace, matching ingress-nginx.
+- Deleting the canary Ingress rebuilds the primary's HTTPRoute without the canary
+  backend. This requires `--enable-deletion` (so the finalizer observes the
+  delete); otherwise the split lingers until the primary is reconciled again.
+- Named ports on the canary Service are resolved from the canary Ingress as well
+  as the primary.
+- This runs in the built-in translation mode of the **operator**. The webhook
+  fast-path cannot merge across Ingresses (it only sees the object being
+  admitted), so it lets canary Ingresses through untouched for the operator to
+  fold in. The ingress2gateway library mode only handles weight-based canary and
+  is not wired for it here.
 
 ### Special Annotations
 

@@ -100,6 +100,16 @@ func (m *IngressMutator) Handle(ctx context.Context, req admission.Request) admi
 		return admission.Allowed("ingress class filtered")
 	}
 
+	// Canary Ingresses must be merged into their primary's HTTPRoute, which the
+	// admission fast-path cannot do (it sees only the object being admitted). Allow
+	// them through so the operator reconciler folds them in; translating here in
+	// isolation would emit a conflicting standalone route.
+	if translator.IsCanary(ingress) {
+		logger.Info("Ingress is an ingress-nginx canary, deferring to the operator for merging",
+			"namespace", ingress.Namespace, "name", ingress.Name)
+		return admission.Allowed("canary handled by operator")
+	}
+
 	// Check if this Ingress should be allowed to be created (for compatibility)
 	allowIngress := false
 	if ingress.Annotations != nil && ingress.Annotations[AllowIngressAnnotation] == fmt.Sprintf("%t", true) {
