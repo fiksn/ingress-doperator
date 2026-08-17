@@ -520,7 +520,9 @@ func (m *IngressMutator) applyIngressAnnotationSnippetsFilter(
 	}
 
 	authInputs := utils.AuthInputs{Identifier: utils.AuthIdentifier(ingress.Namespace, ingress.Name)}
-	snippets, warnings, ok := utils.BuildNginxIngressSnippets(ingress.Annotations, authInputs)
+	// Cross-Ingress server-directive conflicts are resolved by the controller reconcile,
+	// which has the sibling context; the admission path emits the Ingress's own snippets.
+	snippets, warnings, ok := utils.BuildNginxIngressSnippets(ingress.Annotations, authInputs, nil)
 	if !ok {
 		return
 	}
@@ -558,7 +560,7 @@ func (m *IngressMutator) finalizeIngressAnnotationSnippetsFilter(ctx context.Con
 	}
 	logger := log.FromContext(ctx)
 	authInputs := utils.AuthInputs{Identifier: utils.AuthIdentifier(ingress.Namespace, ingress.Name)}
-	snippets, _, ok := utils.BuildNginxIngressSnippets(ingress.Annotations, authInputs)
+	snippets, _, ok := utils.BuildNginxIngressSnippets(ingress.Annotations, authInputs, nil)
 	if !ok {
 		return
 	}

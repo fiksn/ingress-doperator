@@ -551,6 +551,166 @@ func sharesHostPath(a, b *networkingv1.Ingress) bool {
 	return false
 }
 
+// detectSnippetConflicts resolves cross-Ingress conflicts for the snippets generated from
+// nginx annotations. Multiple Ingresses can serve the same (transformed) hostname and thus
+// share a single nginx server block. Server-scoped directives (e.g. ssl_ciphers) would
+// duplicate in that block, so the oldest Ingress owning such a directive on a shared host
+// wins and the rest suppress it. Overlapping host+path pairs get a warning only, since
+// NGINX Gateway Fabric already applies older-route-wins resolution. Scope is same-namespace.
+func (r *IngressReconciler) detectSnippetConflicts(
+	ctx context.Context,
+	ingress *networkingv1.Ingress,
+) map[string]struct{} {
+	suppress := make(map[string]struct{})
+	if ingress == nil || len(ingress.Annotations) == 0 {
+		return suppress
+	}
+	siblings, err := r.listSiblingIngresses(ctx, ingress.Namespace)
+	if err != nil {
+		log.FromContext(ctx).Error(err, "failed to list Ingresses for snippet conflict detection",
+			"namespace", ingress.Namespace)
+		return suppress
+	}
+	trans := r.getTranslator()
+	myHosts := transformedHostSet(trans, ingress)
+	if len(myHosts) == 0 {
+		return suppress
+	}
+	myHostPaths := transformedHostPathSet(trans, ingress)
+
+	for i := range siblings {
+		sibling := &siblings[i]
+		if !r.isConflictCandidate(sibling, ingress) {
+			continue
+		}
+		if !sharesAnyHost(myHosts, trans, sibling) {
+			continue
+		}
+		r.suppressServerOnlyConflicts(ingress, sibling, suppress)
+		if overlap := firstSharedHostPath(myHostPaths, trans, sibling); overlap != "" {
+			r.recordWarning(ingress, "HostPathOverlap",
+				fmt.Sprintf("host+path %q is also served by older Ingress %s/%s; "+
+					"NGINX Gateway Fabric older-route-wins resolution applies",
+					overlap, sibling.Namespace, sibling.Name))
+		}
+	}
+	return suppress
+}
+
+// isConflictCandidate reports whether sibling is an older, active, in-scope Ingress that
+// can win a conflict against the given Ingress.
+func (r *IngressReconciler) isConflictCandidate(sibling, ingress *networkingv1.Ingress) bool {
+	if sibling.Name == ingress.Name || translator.IsCanary(sibling) {
+		return false
+	}
+	if !sibling.DeletionTimestamp.IsZero() {
+		return false
+	}
+	if r.matchesIngressClassIgnoreFilter(sibling) || !r.matchesIngressClassFilter(sibling) {
+		return false
+	}
+	return isOlderIngress(sibling, ingress)
+}
+
+// suppressServerOnlyConflicts records suppression + a warning for each server-scoped nginx
+// directive that both Ingresses declare, letting the older sibling own it.
+func (r *IngressReconciler) suppressServerOnlyConflicts(
+	ingress, sibling *networkingv1.Ingress,
+	suppress map[string]struct{},
+) {
+	for _, key := range utils.ServerOnlySnippetAnnotationKeys() {
+		if _, mine := ingress.Annotations[key]; !mine {
+			continue
+		}
+		if _, theirs := sibling.Annotations[key]; !theirs {
+			continue
+		}
+		suffix, ok := utils.ServerOnlySnippetSuffix(key)
+		if !ok {
+			continue
+		}
+		if _, already := suppress[suffix]; already {
+			continue
+		}
+		suppress[suffix] = struct{}{}
+		r.recordWarning(ingress, "SnippetsDirectiveOverridden",
+			fmt.Sprintf("nginx annotation %s on a shared host is owned by older Ingress %s/%s; "+
+				"ignoring here to avoid duplicate server directives", key, sibling.Namespace, sibling.Name))
+	}
+}
+
+// isOlderIngress reports whether a should win over b (older creationTimestamp, name tiebreak).
+func isOlderIngress(a, b *networkingv1.Ingress) bool {
+	at := a.CreationTimestamp.Time
+	bt := b.CreationTimestamp.Time
+	if at.Equal(bt) {
+		return a.Name < b.Name
+	}
+	return at.Before(bt)
+}
+
+// transformedHostSet returns the set of transformed hostnames served by the Ingress.
+func transformedHostSet(trans *translator.Translator, ingress *networkingv1.Ingress) map[string]struct{} {
+	hosts := make(map[string]struct{})
+	for _, rule := range ingress.Spec.Rules {
+		if rule.Host == "" {
+			continue
+		}
+		hosts[trans.TransformHostname(rule.Host)] = struct{}{}
+	}
+	return hosts
+}
+
+// transformedHostPathSet returns the set of transformed host+path pairs served by the Ingress,
+// keyed as "<transformedHost>\x00<path>".
+func transformedHostPathSet(trans *translator.Translator, ingress *networkingv1.Ingress) map[string]struct{} {
+	pairs := make(map[string]struct{})
+	for _, rule := range ingress.Spec.Rules {
+		if rule.Host == "" || rule.HTTP == nil {
+			continue
+		}
+		host := trans.TransformHostname(rule.Host)
+		for _, path := range rule.HTTP.Paths {
+			pairs[host+"\x00"+path.Path] = struct{}{}
+		}
+	}
+	return pairs
+}
+
+// sharesAnyHost reports whether the Ingress serves any transformed hostname in hosts.
+func sharesAnyHost(hosts map[string]struct{}, trans *translator.Translator, ingress *networkingv1.Ingress) bool {
+	for _, rule := range ingress.Spec.Rules {
+		if rule.Host == "" {
+			continue
+		}
+		if _, ok := hosts[trans.TransformHostname(rule.Host)]; ok {
+			return true
+		}
+	}
+	return false
+}
+
+// firstSharedHostPath returns a human-readable "host path" for the first transformed host+path
+// the Ingress shares with pairs, or "" if none overlap.
+func firstSharedHostPath(
+	pairs map[string]struct{},
+	trans *translator.Translator,
+	ingress *networkingv1.Ingress,
+) string {
+	for _, rule := range ingress.Spec.Rules {
+		if rule.Host == "" || rule.HTTP == nil {
+			continue
+		}
+		host := trans.TransformHostname(rule.Host)
+		for _, path := range rule.HTTP.Paths {
+			if _, ok := pairs[host+"\x00"+path.Path]; ok {
+				return host + " " + path.Path
+			}
+		}
+	}
+	return ""
+}
+
 func (r *IngressReconciler) ensureGatewayForListenerUpdate(
 	ctx context.Context,
 	gatewayName string,
@@ -842,7 +1002,8 @@ func (r *IngressReconciler) applySnippetsFilters(
 		}
 	}
 	authInputs := r.buildAuthInputs(ctx, ingress)
-	snippets, warnings, ok := utils.BuildNginxIngressSnippets(ingress.Annotations, authInputs)
+	suppress := r.detectSnippetConflicts(ctx, ingress)
+	snippets, warnings, ok := utils.BuildNginxIngressSnippets(ingress.Annotations, authInputs, suppress)
 	if !ok {
 		return
 	}

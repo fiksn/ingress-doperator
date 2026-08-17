@@ -141,6 +141,44 @@ func isWhitelistedNginxIngressDirective(suffix string) bool {
 	return ok
 }
 
+// nginxServerOnlyDirectives are whitelisted directives that are only valid in the
+// nginx server (not location) context. They must be emitted in the http.server
+// SnippetsFilter context and therefore collide when multiple Ingresses share a host.
+var nginxServerOnlyDirectives = map[string]struct{}{
+	"ssl-ciphers":               {},
+	"ssl-prefer-server-ciphers": {},
+}
+
+func isServerOnlyNginxIngressDirective(suffix string) bool {
+	_, ok := nginxServerOnlyDirectives[suffix]
+	return ok
+}
+
+// ServerOnlySnippetAnnotationKeys returns the full nginx.ingress.kubernetes.io/*
+// annotation keys whose directives are server-scoped and therefore cannot be
+// deduplicated per-location. Used by the controller to resolve cross-Ingress conflicts.
+func ServerOnlySnippetAnnotationKeys() []string {
+	keys := make([]string, 0, len(nginxServerOnlyDirectives))
+	for suffix := range nginxServerOnlyDirectives {
+		keys = append(keys, nginxIngressAnnotationPrefix+suffix)
+	}
+	sort.Strings(keys)
+	return keys
+}
+
+// ServerOnlySnippetSuffix returns the directive suffix for a full nginx ingress
+// annotation key if that key is server-scoped, plus whether it matched.
+func ServerOnlySnippetSuffix(annotationKey string) (string, bool) {
+	suffix := strings.TrimPrefix(annotationKey, nginxIngressAnnotationPrefix)
+	if suffix == annotationKey {
+		return "", false
+	}
+	if _, ok := nginxServerOnlyDirectives[suffix]; ok {
+		return suffix, true
+	}
+	return "", false
+}
+
 func collectSnippetWarnings(annotations map[string]string) []string {
 	if annotations == nil {
 		return nil
@@ -413,8 +451,15 @@ func ParseCommaSeparatedAnnotation(annotations map[string]string, key string) []
 // BuildNginxIngressSnippets builds SnippetsFilter entries from NGINX Ingress annotations.
 // auth carries inputs for external-auth emulation that cannot be derived from
 // annotation values alone (a stable identifier and resolved proxy-set-headers).
+// suppress holds server-only directive suffixes (e.g. "ssl-ciphers") that an older
+// Ingress on the same host already owns; they are dropped to avoid duplicate directives
+// in the shared nginx server block.
 // nolint:gocyclo
-func BuildNginxIngressSnippets(annotations map[string]string, auth AuthInputs) ([]map[string]interface{}, []string, bool) {
+func BuildNginxIngressSnippets(
+	annotations map[string]string,
+	auth AuthInputs,
+	suppress map[string]struct{},
+) ([]map[string]interface{}, []string, bool) {
 	if annotations == nil {
 		return nil, nil, false
 	}
@@ -450,11 +495,13 @@ func BuildNginxIngressSnippets(annotations map[string]string, auth AuthInputs) (
 		return keys[i].fullKey < keys[j].fullKey
 	})
 
-	state := ingestNginxIngressAnnotations(annotations, keys)
+	state := ingestNginxIngressAnnotations(annotations, keys, suppress)
 	lines, warnings := buildNginxDirectiveLines(state)
 	authHTTP, authServer, authLocation, authWarnings := buildAuthRequestConfig(state.auth, auth)
 	warnings = append(warnings, authWarnings...)
-	snippets := buildNginxSnippetBlocks(lines, state, authHTTP, authServer, authLocation)
+	id := sanitizeNginxIdentifier(auth.Identifier)
+	authLines := authSnippetLines{http: authHTTP, server: authServer, location: authLocation}
+	snippets := buildNginxSnippetBlocks(state, lines, authLines, id)
 
 	if len(snippets) == 0 {
 		return nil, warnings, false
@@ -463,11 +510,18 @@ func BuildNginxIngressSnippets(annotations map[string]string, auth AuthInputs) (
 	return snippets, warnings, true
 }
 
+// authSnippetLines groups the auth_request configuration lines by nginx context.
+type authSnippetLines struct {
+	http     []string
+	server   []string
+	location []string
+}
+
 type nginxIngressSnippetState struct {
 	lines                 []string
+	serverOnlyLines       []string
 	sslRedirectOff        bool
 	forceSSLRedirect      bool
-	preserveTrailingSlash bool
 	proxyBodySizeValue    string
 	clientMaxBodySize     string
 	proxyRedirectFrom     string
@@ -499,7 +553,11 @@ type authState struct {
 	keepalive           string
 }
 
-func ingestNginxIngressAnnotations(annotations map[string]string, keys []ingressAnnotationKey) nginxIngressSnippetState {
+func ingestNginxIngressAnnotations(
+	annotations map[string]string,
+	keys []ingressAnnotationKey,
+	suppress map[string]struct{},
+) nginxIngressSnippetState {
 	state := nginxIngressSnippetState{
 		lines: make([]string, 0, len(keys)),
 	}
@@ -521,10 +579,17 @@ func ingestNginxIngressAnnotations(annotations map[string]string, keys []ingress
 			if !isSafeSnippetValue(&state, entry.fullKey, value) {
 				continue
 			}
+			directive := strings.ReplaceAll(entry.suffix, "-", "_")
+			if isServerOnlyNginxIngressDirective(entry.suffix) {
+				if _, dropped := suppress[entry.suffix]; dropped {
+					continue
+				}
+				state.serverOnlyLines = append(state.serverOnlyLines, fmt.Sprintf("%s %s;", directive, value))
+				continue
+			}
 			if entry.suffix == "proxy-buffer-size" {
 				state.proxyBufferSize = value
 			}
-			directive := strings.ReplaceAll(entry.suffix, "-", "_")
 			state.lines = append(state.lines, fmt.Sprintf("%s %s;", directive, value))
 			continue
 		}
@@ -599,9 +664,7 @@ func applyIngressAnnotationValue(state *nginxIngressSnippetState, suffix, value 
 		}
 		return true
 	case preserveTrailingSlashKey:
-		if strings.EqualFold(value, "true") {
-			state.preserveTrailingSlash = true
-		}
+		// preserve-trailing-slash has no SnippetsFilter equivalent; recognized and ignored.
 		return true
 	case customHTTPErrorsKey:
 		codes, warnings := parseCustomHTTPErrors(value)
@@ -739,102 +802,119 @@ func buildNginxDirectiveLines(state nginxIngressSnippetState) ([]string, []strin
 	return lines, warnings
 }
 
+// buildNginxSnippetBlocks partitions the generated directives by nginx context.
+// Only genuinely server-scoped directives (ssl_ciphers, per-Ingress named error
+// locations, auth server blocks) go into http.server; everything else that is valid
+// in a location goes into http.server.location so multiple Ingresses sharing a host
+// never emit duplicate directives into the same server block.
 func buildNginxSnippetBlocks(
-	lines []string,
 	state nginxIngressSnippetState,
-	authHTTP, authServer, authLocation []string,
+	lines []string,
+	auth authSnippetLines,
+	id string,
 ) []map[string]interface{} {
 	snippets := make([]map[string]interface{}, 0, 3)
+	snippets = appendSnippet(snippets, "http", buildHTTPContextLines(state, auth.http))
+	snippets = appendSnippet(snippets, "http.server", buildServerContextLines(state, auth.server, id))
+	snippets = appendSnippet(snippets, "http.server.location",
+		buildLocationContextLines(state, lines, auth.location, id))
+	return snippets
+}
 
+func appendSnippet(snippets []map[string]interface{}, nginxContext string, lines []string) []map[string]interface{} {
+	if len(lines) == 0 {
+		return snippets
+	}
+	return append(snippets, map[string]interface{}{
+		"context": nginxContext,
+		"value":   strings.Join(lines, "\n"),
+	})
+}
+
+func buildHTTPContextLines(state nginxIngressSnippetState, authHTTP []string) []string {
 	httpLines := make([]string, 0, len(authHTTP)+1)
 	if state.sslRedirectOff {
 		httpLines = append(httpLines, "ssl_redirect off;")
 	}
-	httpLines = append(httpLines, authHTTP...)
-	if len(httpLines) > 0 {
-		snippets = append(snippets, map[string]interface{}{
-			"context": "http",
-			"value":   strings.Join(httpLines, "\n"),
-		})
-	}
+	return append(httpLines, authHTTP...)
+}
 
-	serverLines := append([]string{}, lines...)
+func buildServerContextLines(state nginxIngressSnippetState, authServer []string, id string) []string {
+	serverLines := append([]string{}, state.serverOnlyLines...)
 	if len(state.customHTTPErrors) > 0 {
 		serverLines = append(serverLines,
+			fmt.Sprintf("location @ingress_doperator_error_%s {\n    return %s;\n}", id, state.customHTTPErrors[0]))
+	}
+	return append(serverLines, authServer...)
+}
+
+func buildLocationContextLines(state nginxIngressSnippetState, lines, authLocation []string, id string) []string {
+	out := append([]string{}, lines...)
+	if len(state.customHTTPErrors) > 0 {
+		out = append(out,
 			"proxy_intercept_errors on;",
-			fmt.Sprintf("error_page %s = @ingress_doperator_custom_error;", strings.Join(state.customHTTPErrors, " ")),
-			fmt.Sprintf("location @ingress_doperator_custom_error {\n    return %s;\n}", state.customHTTPErrors[0]),
+			fmt.Sprintf("error_page %s = @ingress_doperator_error_%s;",
+				strings.Join(state.customHTTPErrors, " "), id),
 		)
 	}
+	out = appendSecurityHeaderLines(out, state)
+	out = appendForceSSLRedirectLines(out, state)
+	out = appendRewriteAndACLLines(out, state)
+	return append(out, authLocation...)
+}
+
+func appendSecurityHeaderLines(lines []string, state nginxIngressSnippetState) []string {
 	if state.browserXssFilter {
-		serverLines = append(serverLines, "add_header X-XSS-Protection \"1; mode=block\" always;")
+		lines = append(lines, "add_header X-XSS-Protection \"1; mode=block\" always;")
 	}
 	if state.contentTypeNosniff {
-		serverLines = append(serverLines, "add_header X-Content-Type-Options \"nosniff\" always;")
+		lines = append(lines, "add_header X-Content-Type-Options \"nosniff\" always;")
 	}
 	if strings.TrimSpace(state.referrerPolicy) != "" {
-		serverLines = append(serverLines,
+		lines = append(lines,
 			fmt.Sprintf("add_header Referrer-Policy %q always;", escapeHeaderValue(state.referrerPolicy)))
 	}
-	if state.forceSSLRedirect {
-		redirectTarget := "https://$server_name$request_uri"
-		if state.preserveTrailingSlash {
-			redirectTarget = "https://$server_name$request_uri"
-		}
-		serverLines = append(serverLines,
-			"set $ingress_doperator_needs_redirect 0;",
-			"if ($scheme != \"https\") { set $ingress_doperator_needs_redirect 1; }",
-		)
-		for _, header := range state.sslProxyHeaders {
-			serverLines = append(serverLines,
-				fmt.Sprintf(
-					"if ($http_%s = %q) { set $ingress_doperator_needs_redirect 0; }",
-					header.headerVar,
-					header.value,
-				),
-			)
-		}
-		serverLines = append(serverLines,
-			"add_header Strict-Transport-Security \"max-age=31536000\" always;",
-			fmt.Sprintf("if ($ingress_doperator_needs_redirect = 1) { return 308 %s; }", redirectTarget),
-		)
-	}
+	return lines
+}
 
-	serverLines = append(serverLines, authServer...)
-	if len(serverLines) > 0 {
-		snippets = append(snippets, map[string]interface{}{
-			"context": "http.server",
-			"value":   strings.Join(serverLines, "\n"),
-		})
+func appendForceSSLRedirectLines(lines []string, state nginxIngressSnippetState) []string {
+	if !state.forceSSLRedirect {
+		return lines
 	}
+	lines = append(lines,
+		"set $ingress_doperator_needs_redirect 0;",
+		"if ($scheme != \"https\") { set $ingress_doperator_needs_redirect 1; }",
+	)
+	for _, header := range state.sslProxyHeaders {
+		lines = append(lines, fmt.Sprintf(
+			"if ($http_%s = %q) { set $ingress_doperator_needs_redirect 0; }",
+			header.headerVar, header.value))
+	}
+	return append(lines,
+		"add_header Strict-Transport-Security \"max-age=31536000\" always;",
+		"if ($ingress_doperator_needs_redirect = 1) { return 308 https://$server_name$request_uri; }",
+	)
+}
 
-	locationLines := make([]string, 0)
+func appendRewriteAndACLLines(lines []string, state nginxIngressSnippetState) []string {
 	if strings.TrimSpace(state.rewriteTarget) != "" {
 		target := strings.TrimSpace(state.rewriteTarget)
 		pattern := "^"
 		if state.useRegex || strings.Contains(target, "$") {
 			pattern = "^(.*)$"
 		}
-		locationLines = append(locationLines, fmt.Sprintf("rewrite %s %s break;", pattern, target))
+		lines = append(lines, fmt.Sprintf("rewrite %s %s break;", pattern, target))
 	}
 	for _, cidr := range uniqueStrings(state.blacklistSourceRanges) {
-		locationLines = append(locationLines, fmt.Sprintf("deny %s;", cidr))
+		lines = append(lines, fmt.Sprintf("deny %s;", cidr))
 	}
 	for _, cidr := range uniqueStrings(state.whitelistSourceRanges) {
-		locationLines = append(locationLines, fmt.Sprintf("allow %s;", cidr))
+		lines = append(lines, fmt.Sprintf("allow %s;", cidr))
 	}
 	if len(state.whitelistSourceRanges) > 0 {
-		locationLines = append(locationLines, "deny all;")
+		lines = append(lines, "deny all;")
 	}
-	locationLines = append(locationLines, authLocation...)
-	if len(locationLines) > 0 {
-		snippets = append(snippets, map[string]interface{}{
-			"context": "http.server.location",
-			"value":   strings.Join(locationLines, "\n"),
-		})
-	}
-
-	return snippets
+	return lines
 }
 
 func uniqueStrings(values []string) []string {
