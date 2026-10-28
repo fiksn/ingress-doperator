@@ -21,6 +21,8 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/metrics"
 )
 
+var resourceLabels = []string{"operation", "namespace", "name"}
+
 var (
 	// GatewayResourcesTotal tracks the total number of Gateway resources created or updated
 	GatewayResourcesTotal = prometheus.NewCounterVec(
@@ -28,7 +30,7 @@ var (
 			Name: "ingress_operator_gateway_resources_total",
 			Help: "Total number of Gateway resources created or updated by the ingress operator",
 		},
-		[]string{"operation", "namespace", "name"},
+		resourceLabels,
 	)
 
 	// HTTPRouteResourcesTotal tracks the total number of HTTPRoute resources created or updated
@@ -37,7 +39,7 @@ var (
 			Name: "ingress_operator_httproute_resources_total",
 			Help: "Total number of HTTPRoute resources created or updated by the ingress operator",
 		},
-		[]string{"operation", "namespace", "name"},
+		resourceLabels,
 	)
 
 	// ReferenceGrantResourcesTotal tracks the total number of ReferenceGrant resources created or updated
@@ -46,7 +48,7 @@ var (
 			Name: "ingress_operator_referencegrant_resources_total",
 			Help: "Total number of ReferenceGrant resources created or updated by the ingress operator",
 		},
-		[]string{"operation", "namespace", "name"},
+		resourceLabels,
 	)
 
 	// IngressReconcileSkipsTotal tracks the number of reconciles skipped due to cache/disabled/etc.

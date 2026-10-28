@@ -180,7 +180,7 @@ func main() {
 		GatewayName:                      cfg.GatewayName,
 		GatewayClassName:                 cfg.GatewayClassName,
 		WatchNamespace:                   cfg.WatchNamespace,
-		OneGatewayPerIngress:             cfg.OneGatewayPerIngress,
+		OneGatewayPerIngress:             cfg.OneGatewayPerIngressPatterns,
 		EnableDeletion:                   cfg.EnableDeletion,
 		HostnameRewriteFrom:              cfg.HostnameRewriteFrom,
 		HostnameRewriteTo:                cfg.HostnameRewriteTo,
@@ -236,8 +236,9 @@ func main() {
 		setupLog.Info("Watching Ingresses in all namespaces")
 	}
 
-	if cfg.OneGatewayPerIngress {
-		setupLog.Info("Mode: One Gateway per Ingress")
+	if len(cfg.OneGatewayPerIngressPatterns) > 0 {
+		setupLog.Info("Dedicated Gateway for Ingresses matching patterns, shared Gateway for the rest",
+			"patterns", cfg.OneGatewayPerIngressPatterns, "sharedGatewayName", cfg.GatewayName)
 	} else {
 		setupLog.Info("Mode: Shared Gateway", "gatewayName", cfg.GatewayName)
 	}
@@ -312,7 +313,7 @@ type operatorConfig struct {
 	GatewayName                     string
 	GatewayClassName                string
 	WatchNamespace                  string
-	OneGatewayPerIngress            bool
+	OneGatewayPerIngress            string
 	GatewayAnnotationFilters        string
 	HTTPRouteAnnotationFilters      string
 	EnableDeletion                  bool
@@ -348,6 +349,7 @@ type operatorConfig struct {
 	InfrastructureAnnotationsByClass []translator.IngressClassAnnotationsRule
 	IngressClassFilters              []string
 	IngressClassIgnoreFilters        []string
+	OneGatewayPerIngressPatterns     []string
 }
 
 func parseOperatorConfig() (operatorConfig, zap.Options, error) {
@@ -360,7 +362,8 @@ func parseOperatorConfig() (operatorConfig, zap.Options, error) {
 	flag.StringVar(&cfg.GatewayNamespace, "gateway-namespace", "nginx-fabric",
 		"The namespace where the Gateway resource will be created")
 	flag.StringVar(&cfg.GatewayName, "gateway-name", "ingress-gateway",
-		"The name of the Gateway resource (only used when one-gateway-per-ingress is false)")
+		"The name of the shared Gateway for Ingresses without a class "+
+			"(not used for Ingresses selected by --one-gateway-per-ingress)")
 	flag.StringVar(&cfg.GatewayClassName, "gateway-class-name", "nginx",
 		"The GatewayClass to use for created Gateway resources")
 	flag.StringVar(&cfg.WatchNamespace, "watch-namespace", "",
@@ -373,10 +376,12 @@ func parseOperatorConfig() (operatorConfig, zap.Options, error) {
 			"If an ingress class matches this list, it is skipped even if it matches --ingress-class-filter.")
 	flag.StringVar(&cfg.IngressClassEmpty, "ingress-class-empty", "none",
 		"Value to use when an Ingress has no class set. This value is matched against class filters.")
-	flag.BoolVar(&cfg.OneGatewayPerIngress, "one-gateway-per-ingress", false,
-		"If true, create a separate Gateway for each Ingress with the same name")
+	flag.Var(&boolOrStringFlag{value: &cfg.OneGatewayPerIngress}, "one-gateway-per-ingress",
+		"Comma-separated namespace/name glob patterns (e.g. 'prod/api-*,*/public-*'). Matching Ingresses get "+
+			"a dedicated Gateway named <namespace>-<name>-<hash>; the rest share a Gateway per ingress class. "+
+			"Passing the flag without a value (or 'true') selects all Ingresses ('*/*').")
 	flag.BoolVar(&cfg.EnableDeletion, "enable-deletion", false,
-		"If true, delete HTTPRoute (and Gateway in one-gateway-per-ingress mode) when Ingress is deleted")
+		"If true, delete HTTPRoute when Ingress is deleted (a managed Gateway is deleted once no routes remain)")
 	flag.StringVar(&cfg.HostnameRewriteFrom, "hostname-rewrite-from", "",
 		"Comma-separated list of domain suffixes to match for rewriting (e.g., 'domain.cc,other.com'). "+
 			"Used with --hostname-rewrite-to.")
@@ -447,6 +452,10 @@ func parseOperatorConfig() (operatorConfig, zap.Options, error) {
 	flag.IntVar(&cfg.Verbosity, "v", 0, "Log verbosity (0 = info, higher = more verbose)")
 	opts.BindFlags(flag.CommandLine)
 	flag.Parse()
+	if flag.NArg() > 0 {
+		return cfg, opts, fmt.Errorf("unexpected arguments %q: flags that take a value need '=' "+
+			"(e.g. --one-gateway-per-ingress='prod/*')", flag.Args())
+	}
 
 	if cfg.Verbosity > 0 {
 		opts.Development = false
@@ -481,6 +490,10 @@ func parseOperatorConfig() (operatorConfig, zap.Options, error) {
 	cfg.HTTPRouteFilters = splitCSV(cfg.HTTPRouteAnnotationFilters)
 	cfg.IngressClassFilters = utils.ParseCommaSeparatedList(cfg.IngressClassFilter)
 	cfg.IngressClassIgnoreFilters = utils.ParseCommaSeparatedList(cfg.IngressClassIgnoreFilter)
+	cfg.OneGatewayPerIngressPatterns, err = controller.ParseOneGatewayPerIngress(cfg.OneGatewayPerIngress)
+	if err != nil {
+		return cfg, opts, fmt.Errorf("invalid one-gateway-per-ingress value: %w", err)
+	}
 	if cfg.IngressPostProcessingMode == controller.IngressPostProcessingModeDisableExternalDNS {
 		cfg.GatewayFilters = appendFilterIfMissing(cfg.GatewayFilters, controller.ExternalDNSIngressHostnameSource)
 		cfg.GatewayFilters = appendFilterIfMissing(cfg.GatewayFilters, controller.ExternalDNSHostnameAnnotation)
@@ -495,6 +508,28 @@ func parseOperatorConfig() (operatorConfig, zap.Options, error) {
 	}
 
 	return cfg, opts, nil
+}
+
+// boolOrStringFlag is a string flag that may also be given without a value, like a boolean flag;
+// a bare --flag sets the value to "true".
+type boolOrStringFlag struct {
+	value *string
+}
+
+func (f *boolOrStringFlag) String() string {
+	if f.value == nil {
+		return ""
+	}
+	return *f.value
+}
+
+func (f *boolOrStringFlag) Set(value string) error {
+	*f.value = value
+	return nil
+}
+
+func (f *boolOrStringFlag) IsBoolFlag() bool {
+	return true
 }
 
 func parseIngressPostProcessingMode(value string) (controller.IngressPostProcessingMode, error) {

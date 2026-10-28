@@ -18,7 +18,7 @@ Configuration:
 {{- if .Values.operator.ingressClassIgnoreFilter }}
 - Ingress Class Ignore Filter: {{ .Values.operator.ingressClassIgnoreFilter }}
 {{- end }}
-- One Gateway Per Ingress: {{ .Values.operator.oneGatewayPerIngress }}
+- One Gateway Per Ingress: {{ .Values.operator.oneGatewayPerIngress | default "none" }}
 - Enable Deletion: {{ .Values.operator.enableDeletion }}
 
 To check the operator status:

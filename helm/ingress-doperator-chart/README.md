@@ -100,7 +100,7 @@ The following table lists the configurable parameters of the ingress-doperator c
 | `operator.ingressClassFilter` | Comma-separated glob patterns to filter ingress classes | `"*"` |
 | `operator.ingressClassIgnoreFilter` | Comma-separated glob patterns for ingress classes to ignore | `""` |
 | `operator.ingressClassEmpty` | Value used when an Ingress has no class set | `"none"` |
-| `operator.oneGatewayPerIngress` | Create separate Gateway per Ingress | `false` |
+| `operator.oneGatewayPerIngress` | Comma-separated `namespace/name` globs of Ingresses that get a dedicated Gateway (`true` = all) | `""` |
 | `operator.enableDeletion` | Delete resources when Ingress is deleted | `false` |
 | `operator.hostnameRewriteFrom` | Comma-separated domain suffixes to match | `""` |
 | `operator.hostnameRewriteTo` | Comma-separated replacement domain suffixes | `""` |
@@ -162,10 +162,15 @@ helm install ingress-doperator ./helm/ingress-doperator \
 
 ### One Gateway Per Ingress
 
+Give selected Ingresses their own Gateway (named `<namespace>-<name>-<hash>`); the rest
+share a Gateway per ingress class. Commas must be escaped for `--set`:
+
 ```bash
 helm install ingress-doperator ./helm/ingress-doperator \
-  --set operator.oneGatewayPerIngress=true
+  --set 'operator.oneGatewayPerIngress=prod/api-*\,*/public-*'
 ```
+
+Use `--set operator.oneGatewayPerIngress=true` to give every Ingress its own Gateway.
 
 ## RBAC
 

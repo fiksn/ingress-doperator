@@ -43,6 +43,7 @@ import (
 	gatewayv1 "sigs.k8s.io/gateway-api/apis/v1"
 
 	"github.com/fiksn/ingress-doperator/internal/controller"
+	"github.com/fiksn/ingress-doperator/internal/translator"
 	"github.com/fiksn/ingress-doperator/internal/utils"
 )
 
@@ -756,6 +757,12 @@ func removeManagedGatewaysIfEmpty(ctx context.Context, cli client.Client, ingres
 		if parentCounts[key] > 0 {
 			continue
 		}
+		if hasForeignListeners(gateway) {
+			setupLog.Info("Keeping managed Gateway without HTTPRoutes: it has listeners not managed by ingress-doperator",
+				"namespace", gateway.Namespace,
+				"name", gateway.Name)
+			continue
+		}
 		if err := cli.Delete(ctx, gateway); err != nil {
 			return err
 		}
@@ -765,6 +772,17 @@ func removeManagedGatewaysIfEmpty(ctx context.Context, cli client.Client, ingres
 	}
 
 	return nil
+}
+
+// hasForeignListeners reports whether a Gateway has listeners someone else added (e.g. for a
+// TCPRoute), which would be lost if the Gateway were deleted.
+func hasForeignListeners(gateway *gatewayv1.Gateway) bool {
+	for _, listener := range gateway.Spec.Listeners {
+		if !translator.IsOperatorListener(listener) {
+			return true
+		}
+	}
+	return false
 }
 
 func hasManagedResources(

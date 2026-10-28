@@ -374,7 +374,7 @@ func ParseIngressAnnotationSnippetsRules(raw string) ([]IngressAnnotationSnippet
 		if key == "" || valuePattern == "" || filtersRaw == "" {
 			return nil, fmt.Errorf("invalid entry %q, key, value and filters must be non-empty", trimmed)
 		}
-		filters := ParseCommaSeparatedAnnotation(map[string]string{"value": filtersRaw}, "value")
+		filters := parseCommaSeparated(filtersRaw)
 		if len(filters) == 0 {
 			return nil, fmt.Errorf("invalid entry %q, filters list must be non-empty", trimmed)
 		}
@@ -427,6 +427,10 @@ func MatchIngressAnnotationSnippetsRules(
 }
 
 // ParseCommaSeparatedAnnotation splits a comma-separated annotation value into unique entries.
+func parseCommaSeparated(raw string) []string {
+	return ParseCommaSeparatedAnnotation(map[string]string{"value": raw}, "value")
+}
+
 func ParseCommaSeparatedAnnotation(annotations map[string]string, key string) []string {
 	if annotations == nil {
 		return nil
@@ -606,10 +610,6 @@ func applyIngressAnnotationValue(state *nginxIngressSnippetState, suffix, value 
 		return true
 	}
 
-	parsedRanges := func(raw string) []string {
-		return ParseCommaSeparatedAnnotation(map[string]string{"value": raw}, "value")
-	}
-
 	switch suffix {
 	case configurationSnippetKey, serverSnippetKey, authSnippetKey:
 		return true
@@ -620,12 +620,12 @@ func applyIngressAnnotationValue(state *nginxIngressSnippetState, suffix, value 
 		state.proxyBodySizeValue = value
 		return true
 	case allowlistSourceRangeKey, whitelistSourceRangeKey:
-		ranges := parsedRanges(value)
+		ranges := parseCommaSeparated(value)
 		ranges = filterSafeSnippetValues(state, suffix, ranges)
 		state.whitelistSourceRanges = append(state.whitelistSourceRanges, ranges...)
 		return true
 	case denylistSourceRangeKey, blacklistSourceRangeKey:
-		ranges := parsedRanges(value)
+		ranges := parseCommaSeparated(value)
 		ranges = filterSafeSnippetValues(state, suffix, ranges)
 		state.blacklistSourceRanges = append(state.blacklistSourceRanges, ranges...)
 		return true
@@ -709,7 +709,7 @@ func applyAuthIngressAnnotationValue(state *nginxIngressSnippetState, suffix, va
 	case authMethodKey:
 		state.auth.method = value
 	case authResponseHeadersKey:
-		state.auth.responseHeaders = ParseCommaSeparatedAnnotation(map[string]string{"value": value}, "value")
+		state.auth.responseHeaders = parseCommaSeparated(value)
 	case authRequestRedirectKey:
 		state.auth.requestRedirect = value
 	case authCacheKeyKey:

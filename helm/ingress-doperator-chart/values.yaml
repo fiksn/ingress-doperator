@@ -5,7 +5,7 @@ replicaCount: 1
 image:
   repository: fiksn/ingress-doperator
   pullPolicy: IfNotPresent
-  tag: v0.0.3
+  tag: v0.0.5
 
 imagePullSecrets: []
 nameOverride: ""
@@ -67,8 +67,10 @@ operator:
   # Ingress class empty value (used when no class set)
   ingressClassEmpty: "none"
 
-  # If true, create a separate Gateway for each Ingress
-  oneGatewayPerIngress: false
+  # Comma-separated namespace/name glob patterns of Ingresses that get a dedicated
+  # Gateway named <namespace>-<name>-<hash> (e.g. "prod/api-*,*/public-*"). true selects all
+  # Ingresses ("*/*"); empty or false keeps every Ingress on a shared Gateway.
+  oneGatewayPerIngress: ""
 
   # If true, delete HTTPRoute and Gateway when Ingress is deleted
   enableDeletion: false

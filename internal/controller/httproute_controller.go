@@ -149,28 +149,6 @@ func (d *gatewayUpdateDebouncer) executeGatewayUpdate(ctx context.Context, gatew
 			}
 		}
 	}
-
-	// Check if Gateway should be deleted (no listeners remain)
-	if updated {
-		gatewayNN := types.NamespacedName{
-			Namespace: d.reconciler.GatewayNamespace,
-			Name:      gatewayName,
-		}
-		gateway := &gatewayv1.Gateway{}
-		if err := d.reconciler.Get(ctx, gatewayNN, gateway); err != nil {
-			if !apierrors.IsNotFound(err) {
-				logger.Error(err, "failed to fetch Gateway for deletion check")
-			}
-			return
-		}
-
-		if len(gateway.Spec.Listeners) == 0 {
-			logger.Info("Deleting empty Gateway (no listeners remain)")
-			if err := d.reconciler.Delete(ctx, gateway); err != nil && !apierrors.IsNotFound(err) {
-				logger.Error(err, "failed to delete empty Gateway")
-			}
-		}
-	}
 }
 
 // Reconcile manages Gateway listeners based on HTTPRoute changes
@@ -315,7 +293,7 @@ func (r *HTTPRouteReconciler) handleHTTPRouteCreateOrUpdate(ctx context.Context,
 		if err := r.Create(ctx, gateway); err != nil {
 			if apierrors.IsAlreadyExists(err) {
 				logger.V(1).Info("Gateway already exists (race), retrying")
-				return ctrl.Result{Requeue: true}, nil
+				return ctrl.Result{RequeueAfter: time.Second}, nil
 			}
 			logger.Error(err, "failed to create Gateway")
 			return ctrl.Result{}, err
@@ -331,7 +309,78 @@ func (r *HTTPRouteReconciler) handleHTTPRouteCreateOrUpdate(ctx context.Context,
 		}
 	}
 
+	if err := r.releasePreviousGateway(ctx, httpRoute, gatewayName); err != nil {
+		logger.Error(err, "failed to release previous Gateway")
+		return ctrl.Result{}, err
+	}
+
 	return ctrl.Result{}, nil
+}
+
+// releasePreviousGateway cleans up the Gateway this HTTPRoute was attached to before its parentRef
+// changed (e.g. its Ingress moved between a shared and a dedicated Gateway), then records the
+// current Gateway in ListenerGatewayAnnotation. The annotation is only advanced after cleanup
+// succeeds, so a failed cleanup is retried on the next reconcile.
+func (r *HTTPRouteReconciler) releasePreviousGateway(
+	ctx context.Context,
+	httpRoute *gatewayv1.HTTPRoute,
+	gatewayName string,
+) error {
+	previous := httpRoute.Annotations[utils.ListenerGatewayAnnotation]
+	if previous == gatewayName {
+		return nil
+	}
+	if previous != "" {
+		log.FromContext(ctx).Info("HTTPRoute moved to another Gateway, cleaning up previous Gateway",
+			"previousGateway", previous, "gateway", gatewayName)
+		if err := r.pruneGateway(ctx, previous); err != nil {
+			return fmt.Errorf("failed to clean up previous Gateway %s/%s of HTTPRoute %s/%s: %w",
+				r.GatewayNamespace, previous, httpRoute.Namespace, httpRoute.Name, err)
+		}
+	}
+
+	patch := client.MergeFrom(httpRoute.DeepCopy())
+	httpRoute.Annotations[utils.ListenerGatewayAnnotation] = gatewayName
+	if err := r.Patch(ctx, httpRoute, patch); err != nil {
+		return fmt.Errorf("failed to record Gateway %s on HTTPRoute %s/%s: %w",
+			gatewayName, httpRoute.Namespace, httpRoute.Name, err)
+	}
+	return nil
+}
+
+// pruneGateway drops our listeners that no HTTPRoute references anymore; a managed Gateway left
+// without any listeners is deleted.
+func (r *HTTPRouteReconciler) pruneGateway(ctx context.Context, gatewayName string) error {
+	routes, err := r.listHTTPRoutesForGateway(ctx, gatewayName, "")
+	if err != nil {
+		return err
+	}
+	_, err = r.reconcileGatewayListeners(ctx, gatewayName, routes)
+	return err
+}
+
+// handleGatewayWithoutListeners deals with a Gateway whose desired state has no listeners at all
+// (neither ours nor ones added by others).
+// Gateway API requires at least one listener, so such a Gateway cannot be updated: it is
+// deleted when no HTTPRoutes are attached, otherwise left unchanged until a listener can be
+// built for its routes (e.g. once their TLS configuration resolves).
+func (r *HTTPRouteReconciler) handleGatewayWithoutListeners(
+	ctx context.Context,
+	gateway *gatewayv1.Gateway,
+	routeCount int,
+) (bool, error) {
+	logger := log.FromContext(ctx).WithValues("gateway", client.ObjectKeyFromObject(gateway))
+	if routeCount > 0 {
+		logger.Info("No listener can be built yet for Gateway with HTTPRoutes, leaving it unchanged",
+			"routes", routeCount)
+		return false, nil
+	}
+	logger.Info("Deleting Gateway with no remaining HTTPRoutes")
+	if err := r.Delete(ctx, gateway); err != nil {
+		return false, client.IgnoreNotFound(err)
+	}
+	metrics.GatewayResourcesTotal.WithLabelValues("delete", gateway.Namespace, gateway.Name).Inc()
+	return true, nil
 }
 
 // handleHTTPRouteDelete removes listeners/namespaces from Gateway when HTTPRoute is deleted
@@ -431,6 +480,9 @@ func (r *HTTPRouteReconciler) reconcileGatewayListeners(
 		desiredTLS, certMismatches, tlsUnknown := r.buildDesiredListenerTLS(ctx, desiredState, routes)
 
 		updated := r.reconcileListenersToDesiredState(gateway, desiredState, desiredTLS, tlsUnknown, logger)
+		if len(gateway.Spec.Listeners) == 0 {
+			return r.handleGatewayWithoutListeners(ctx, gateway, len(routes))
+		}
 
 		desiredMismatch := ""
 		if len(certMismatches) > 0 {
@@ -499,13 +551,14 @@ func (r *HTTPRouteReconciler) reconcileListenersToDesiredState(
 ) bool {
 	updated := false
 
-	// Step 1: Remove listeners that shouldn't exist
+	// Step 1: Remove our listeners that shouldn't exist; listeners added by others are kept as is
 	newListeners := make([]gatewayv1.Listener, 0, len(gateway.Spec.Listeners))
 	for _, listener := range gateway.Spec.Listeners {
-		hostname := ""
-		if listener.Hostname != nil {
-			hostname = string(*listener.Hostname)
+		if !translator.IsOperatorListener(listener) {
+			newListeners = append(newListeners, listener)
+			continue
 		}
+		hostname := string(*listener.Hostname)
 
 		// Keep listener if it's in desired state
 		if _, shouldExist := desiredState[hostname]; shouldExist {
@@ -520,8 +573,12 @@ func (r *HTTPRouteReconciler) reconcileListenersToDesiredState(
 
 	// Step 2: Update existing listeners and add new ones
 	for hostname, namespaces := range desiredState {
-		// Find existing listener
-		listenerIdx := r.findListenerByHostname(gateway, hostname)
+		listenerIdx, blocked := findListenerForHostname(gateway, hostname)
+		if blocked {
+			logger.Info("Hostname is served by a listener not managed by ingress-doperator, leaving it",
+				"hostname", hostname)
+			continue
+		}
 
 		// Convert namespace set to sorted slice
 		namespaceList := make([]string, 0, len(namespaces))
@@ -574,7 +631,12 @@ func (r *HTTPRouteReconciler) updateGatewayListeners(
 
 	for _, hostname := range httpRoute.Spec.Hostnames {
 		hostnameStr := string(hostname)
-		listenerIdx := r.findListenerByHostname(gateway, hostnameStr)
+		listenerIdx, blocked := findListenerForHostname(gateway, hostnameStr)
+		if blocked {
+			logger.Info("Hostname is served by a listener not managed by ingress-doperator, leaving it",
+				"hostname", hostnameStr)
+			continue
+		}
 
 		if listenerIdx >= 0 {
 			if r.addNamespaceToListener(&gateway.Spec.Listeners[listenerIdx], httpRoute.Namespace) {
@@ -610,13 +672,27 @@ func (r *HTTPRouteReconciler) updateGatewayListeners(
 }
 
 // findListenerByHostname finds a listener index by hostname, returns -1 if not found
-func (r *HTTPRouteReconciler) findListenerByHostname(gateway *gatewayv1.Gateway, hostname string) int {
+// findListenerForHostname returns the index of ingress-doperator's listener for hostname, or -1.
+// blocked reports that a listener not managed by ingress-doperator already uses the listener name
+// or the HTTPS/443/hostname combination ours would need; Gateway API requires both to be unique,
+// so in that case ours can neither be updated nor added.
+func findListenerForHostname(gateway *gatewayv1.Gateway, hostname string) (idx int, blocked bool) {
+	idx = -1
 	for i, listener := range gateway.Spec.Listeners {
-		if listener.Hostname != nil && string(*listener.Hostname) == hostname {
-			return i
+		if translator.IsOperatorListener(listener) {
+			if string(*listener.Hostname) == hostname {
+				idx = i
+			}
+			continue
+		}
+		sameName := string(listener.Name) == hostname
+		sameSlot := listener.Protocol == gatewayv1.HTTPSProtocolType && listener.Port == 443 &&
+			listener.Hostname != nil && string(*listener.Hostname) == hostname
+		if sameName || sameSlot {
+			blocked = true
 		}
 	}
-	return -1
+	return idx, blocked
 }
 
 // updateListenerNamespaces updates a listener's allowed namespaces, returns true if changed

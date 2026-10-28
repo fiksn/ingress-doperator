@@ -108,7 +108,7 @@ type IngressReconciler struct {
 	GatewayName                      string
 	GatewayClassName                 string
 	WatchNamespace                   string
-	OneGatewayPerIngress             bool
+	OneGatewayPerIngress             []string // namespace/name globs selecting dedicated Gateways
 	EnableDeletion                   bool
 	HostnameRewriteFrom              string
 	HostnameRewriteTo                string
@@ -304,16 +304,7 @@ func (r *IngressReconciler) reconcileIngressToHTTPRoute(
 	// Get translator
 	trans := r.getTranslator()
 
-	// Determine Gateway name based on mode
-	var gatewayName string
-	if r.OneGatewayPerIngress {
-		// One Gateway per Ingress mode - use ingress name
-		gatewayName = ingress.Name
-	} else {
-		// Shared Gateway mode - use ingress class
-		ingressClass := r.getIngressClass(ingress)
-		gatewayName = r.getGatewayNameForClass(ingressClass)
-	}
+	gatewayName := r.gatewayNameFor(ingress)
 
 	// Canary Ingresses do not produce their own HTTPRoute; their backend is folded
 	// into the primary Ingress's HTTPRoute. Reconcile the primary sibling instead.

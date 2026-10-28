@@ -31,6 +31,10 @@ const (
 	ManagedByAnnotation = "ingress-doperator.fiction.si/managed-by"
 	ManagedByValue      = "ingress-doperator"
 	SourceAnnotation    = "ingress-doperator.fiction.si/source"
+
+	// ListenerGatewayAnnotation records on an HTTPRoute the Gateway whose listeners were last set
+	// up for it, so that Gateway can be cleaned up when the HTTPRoute moves to another Gateway.
+	ListenerGatewayAnnotation = "ingress-doperator.fiction.si/listener-gateway"
 )
 
 // IsManagedByUs checks if a resource is managed by the ingress operator

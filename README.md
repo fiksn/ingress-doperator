@@ -45,7 +45,7 @@ annotation on it.
 
 However this tool is primarily meant for `ingress-nginx` audience and comes with a few opinionated (but sane) defaults.
 
-For instance operator enables a "shared mode" (unless you start it with
+For instance operator enables a "shared mode" (except for Ingresses you select with
 `--one-gateway-per-ingress`) which means you do not need a new `Gateway` for
 each `Ingress` but can aggregate multiple vhosts in one thereby save cluster
 resources. This way you just get one (or if you change the `NginxProxy` resource
@@ -173,7 +173,7 @@ spec:
     spec:
       containers:
       - name: webhook
-        image: fiksn/ingress-doperator-webhook:v0.0.3
+        image: fiksn/ingress-doperator-webhook:v0.0.5
         imagePullPolicy: Always
         command:
           - /webhook
@@ -611,9 +611,11 @@ The operator accepts the following command-line flags:
                                               (default: "")
 --ingress-class-empty string                  Value to use when an Ingress has no class set
                                               (default: "none")
---one-gateway-per-ingress                     Create a separate Gateway for each Ingress with the same name
-                                              (default: false)
---enable-deletion                             Delete HTTPRoute and Gateway when Ingress is deleted
+--one-gateway-per-ingress[=patterns]          Comma-separated namespace/name glob patterns of Ingresses that
+                                              get a dedicated Gateway named <namespace>-<name>-<hash>.
+                                              Without a value (or =true) all Ingresses match ('*/*').
+                                              (default: "" - all Ingresses use shared Gateways)
+--enable-deletion                             Delete HTTPRoute (and empty managed Gateways) when Ingress is deleted
                                               (default: false)
 --hostname-rewrite-from string                Domain suffix to match for rewriting (e.g., 'domain.cc')
 --hostname-rewrite-to string                  Replacement domain suffix (e.g., 'foo.domain.cc').
@@ -678,19 +680,72 @@ Multiple Ingresses share Gateways based on their `ingressClassName` (or annotati
 - If no IngressClass is specified, uses the `--gateway-name` value
 - Example: All Ingresses with `ingressClassName: nginx` → Gateway named `nginx`
 
-### Mode 2: One Gateway Per Ingress
+### Mode 2: Dedicated Gateways for Selected Ingresses
 
-Each Ingress gets its own dedicated Gateway:
+Ingresses matching `--one-gateway-per-ingress` get their own Gateway; all others
+keep using the shared Gateways from Mode 1:
 
 ```bash
+# Only these Ingresses get a dedicated Gateway
+./bin/operator --one-gateway-per-ingress='prod/payments,*/public-*'
+
+# Every Ingress gets a dedicated Gateway (same as '*/*')
 ./bin/operator --one-gateway-per-ingress
 ```
 
 **Behaviour:**
-- Each Ingress creates a Gateway with the same name
-- IngressClass is ignored
-- Gateway and HTTPRoute have the same name as the Ingress
+- Patterns are `namespace/name` globs (`*`, `?`, `[...]`); `*` does not match across the `/`
+- A matching Ingress gets a Gateway named `<namespace>-<name>-<hash>`, where `<hash>` is the
+  first 8 hex characters of the SHA-256 of `<namespace>/<name>`. The hash keeps names unique
+  (`a-b/c` and `a/b-c` differ); dots become `-` and the readable part is truncated so the
+  name fits in 63 characters. IngressClass is ignored for these Ingresses. The HTTPRoute's
+  `parentRefs` shows the exact name.
 - Gateway is created in `--gateway-namespace`, HTTPRoute in the Ingress namespace
+- The value must be attached with `=`; `--one-gateway-per-ingress prod/*` is rejected
+
+**Changing the selection:** when an Ingress moves between a shared and a dedicated
+Gateway, its HTTPRoute is re-parented and the listeners it used are removed from the
+previous Gateway. A managed Gateway left without any listeners is deleted. The Gateway an
+HTTPRoute's listeners live on is tracked in the
+`ingress-doperator.fiction.si/listener-gateway` annotation.
+
+### Adding Your Own Listeners (TCPRoute, UDPRoute, ...)
+
+The operator only manages the listeners it creates itself: HTTPS listeners on port 443
+named after their hostname. Any other listener on a managed Gateway is left untouched, so
+you can add, for example, a TCP listener and attach a `TCPRoute` to it:
+
+```bash
+kubectl -n nginx-fabric patch gateway <gateway> --type=json -p='[{"op":"add","path":"/spec/listeners/-","value":
+  {"name":"postgres","port":5432,"protocol":"TCP",
+   "allowedRoutes":{"namespaces":{"from":"All"},"kinds":[{"kind":"TCPRoute"}]}}}]'
+```
+
+```yaml
+apiVersion: gateway.networking.k8s.io/v1
+kind: TCPRoute
+metadata:
+  name: postgres
+  namespace: app
+spec:
+  parentRefs:
+    - name: <gateway>
+      namespace: nginx-fabric
+      sectionName: postgres
+  rules:
+    - backendRefs:
+        - name: postgres
+          port: 5432
+```
+
+**Behaviour:**
+- Your listeners are never removed or changed by the operator
+- A managed Gateway that still has your listeners is kept when its last HTTPRoute goes away
+  (also by the reenabler); delete it yourself when you no longer need it
+- If your listener uses a hostname's listener name or its HTTPS/443/hostname combination, the
+  operator does not add its own listener for that hostname (Gateway API requires both to be
+  unique); the HTTPRoute then attaches only if your listener allows it
+- Your Gateway controller must support the route kind (check its docs for `TCPRoute`)
 
 ### Namespace Filtering
 
@@ -793,9 +848,11 @@ prevent accidental deletion of resources that might be in use.
 
 When `--enable-deletion=true`:
 - **HTTPRoute Deletion**: Always deleted when the corresponding Ingress is deleted
-- **Gateway Deletion**:
-  - In `--one-gateway-per-ingress` mode: Gateway is deleted (since it's dedicated to that Ingress)
-  - In shared mode: Gateway is **NOT** deleted (other Ingresses may be using it)
+- **Gateway Deletion**: when the HTTPRoute is removed, its listeners are removed from
+  the Gateway, and a managed Gateway is deleted once no listeners remain. A dedicated
+  Gateway therefore goes away with its Ingress, unless you added your own listeners to it
+  (see [Adding Your Own Listeners](#adding-your-own-listeners-tcproute-udproute-)); a shared
+  Gateway stays as long as other Ingresses use it.
 - **Finalizers**: When deletion is enabled, a finalizer is added to Ingresses to ensure cleanup happens properly
 
 **Example:**
@@ -917,7 +974,7 @@ The operator:
 **Build and push your image to the location specified by `IMG`:**
 
 ```sh
-make docker-build docker-push IMG=fiksn/ingress-doperator:v0.0.3
+make docker-build docker-push IMG=fiksn/ingress-doperator:v0.0.5
 ```
 
 **NOTE:** This image ought to be published in the personal registry you specified.
@@ -976,7 +1033,7 @@ Following the options to release and provide this solution to the users.
 1. Build the installer for the image built and published in the registry:
 
 ```sh
-make build-installer IMG=fiksn/ingress-doperator:v0.0.3
+make build-installer IMG=fiksn/ingress-doperator:v0.0.5
 ```
 
 **NOTE:** The makefile target mentioned above generates an 'install.yaml'

@@ -23,6 +23,15 @@ import (
 	gatewayv1 "sigs.k8s.io/gateway-api/apis/v1"
 )
 
+// IsOperatorListener reports whether a Gateway listener was created by ingress-doperator, which
+// only creates HTTPS listeners named after their hostname. Any other listener, such as a TCP
+// listener added for a TCPRoute, belongs to someone else and must be left untouched.
+func IsOperatorListener(listener gatewayv1.Listener) bool {
+	return listener.Protocol == gatewayv1.HTTPSProtocolType &&
+		listener.Hostname != nil &&
+		string(listener.Name) == string(*listener.Hostname)
+}
+
 // MergeGatewaySpec merges the desired Gateway spec into the existing Gateway
 // Listeners are merged by hostname (unique by listener name)
 // Annotations are merged (desired overwrites existing on conflict, except for special cases)

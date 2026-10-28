@@ -43,8 +43,8 @@ spec:
             - --ingress-class-ignore={{ .Values.operator.ingressClassIgnoreFilter }}
             {{- end }}
             - --ingress-class-empty={{ .Values.operator.ingressClassEmpty }}
-            {{- if .Values.operator.oneGatewayPerIngress }}
-            - --one-gateway-per-ingress=true
+            {{- with .Values.operator.oneGatewayPerIngress }}
+            - {{ printf "--one-gateway-per-ingress=%v" . | quote }}
             {{- end }}
             {{- if .Values.operator.enableDeletion }}
             - --enable-deletion=true

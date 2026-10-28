@@ -19,6 +19,7 @@ package utils
 import (
 	"context"
 	"fmt"
+	"maps"
 	"strings"
 
 	corev1 "k8s.io/api/core/v1"
@@ -220,8 +221,15 @@ func (m *HTTPRouteManager) applyHTTPRoute(
 		return err
 	}
 
-	// Update existing HTTPRoute
-	existingHTTPRoute.Annotations = httpRoute.Annotations
+	// Update existing HTTPRoute, keeping the listener bookkeeping owned by the HTTPRoute controller
+	listenerGateway, hasListenerGateway := existingHTTPRoute.Annotations[ListenerGatewayAnnotation]
+	existingHTTPRoute.Annotations = maps.Clone(httpRoute.Annotations)
+	if hasListenerGateway {
+		if existingHTTPRoute.Annotations == nil {
+			existingHTTPRoute.Annotations = make(map[string]string)
+		}
+		existingHTTPRoute.Annotations[ListenerGatewayAnnotation] = listenerGateway
+	}
 	existingHTTPRoute.Spec = httpRoute.Spec
 	logger.Info("Updating HTTPRoute", "namespace", existingHTTPRoute.Namespace, "name", existingHTTPRoute.Name)
 	if err := m.Client.Update(ctx, existingHTTPRoute); err != nil {
