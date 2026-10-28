@@ -171,6 +171,62 @@ func TestBuildAuthSnippets_Caching(t *testing.T) {
 	}
 }
 
+func TestBuildAuthSnippets_ProxyBuffers(t *testing.T) {
+	tests := []struct {
+		name    string
+		extra   map[string]string
+		want    []string
+		notWant []string
+	}{
+		{
+			name:    "no buffer annotations",
+			notWant: []string{"proxy_buffer_size", "proxy_buffers"},
+		},
+		{
+			name:    "buffer size only",
+			extra:   map[string]string{authPrefix + "proxy-buffer-size": "16k"},
+			want:    []string{"proxy_buffer_size 16k;"},
+			notWant: []string{"proxy_buffers "},
+		},
+		{
+			name: "buffer size and number",
+			extra: map[string]string{
+				authPrefix + "proxy-buffer-size":    "16k",
+				authPrefix + "proxy-buffers-number": "8",
+			},
+			want: []string{"proxy_buffer_size 16k;", "proxy_buffers 8 16k;"},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			annotations := map[string]string{authPrefix + "auth-url": "https://auth.example.com/auth"}
+			for k, v := range tt.extra {
+				annotations[k] = v
+			}
+			snippets, _, _ := BuildNginxIngressSnippets(annotations, AuthInputs{Identifier: "x"}, nil)
+			server := snippetValue(snippets, "http.server")
+			authLocation := server[strings.Index(server, "location = /_doperator_auth_x {"):]
+			authLocation = authLocation[:strings.Index(authLocation, "\n}")]
+			for _, w := range tt.want {
+				if !strings.Contains(authLocation, w) {
+					t.Errorf("auth location missing %q: %q", w, authLocation)
+				}
+			}
+			for _, nw := range tt.notWant {
+				if strings.Contains(authLocation, nw) {
+					t.Errorf("auth location should not contain %q: %q", nw, authLocation)
+				}
+			}
+			if size, ok := tt.extra[authPrefix+"proxy-buffer-size"]; ok {
+				location := snippetValue(snippets, "http.server.location")
+				if !strings.Contains(location, "proxy_buffer_size "+size+";") {
+					t.Errorf("app location must keep proxy_buffer_size: %q", location)
+				}
+			}
+		})
+	}
+}
+
 func TestBuildAuthSnippets_ProxySetHeaders(t *testing.T) {
 	annotations := map[string]string{
 		authPrefix + "auth-url": "https://auth.example.com/auth",

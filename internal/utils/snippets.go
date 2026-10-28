@@ -501,7 +501,10 @@ func BuildNginxIngressSnippets(
 
 	state := ingestNginxIngressAnnotations(annotations, keys, suppress)
 	lines, warnings := buildNginxDirectiveLines(state)
-	authHTTP, authServer, authLocation, authWarnings := buildAuthRequestConfig(state.auth, auth)
+	authConfig := state.auth
+	authConfig.proxyBufferSize = state.proxyBufferSize
+	authConfig.proxyBuffersNumber = state.proxyBuffersNumber
+	authHTTP, authServer, authLocation, authWarnings := buildAuthRequestConfig(authConfig, auth)
 	warnings = append(warnings, authWarnings...)
 	id := sanitizeNginxIdentifier(auth.Identifier)
 	authLines := authSnippetLines{http: authHTTP, server: authServer, location: authLocation}
@@ -555,6 +558,11 @@ type authState struct {
 	cacheKey            string
 	cacheDuration       string
 	keepalive           string
+	// proxyBufferSize and proxyBuffersNumber mirror the Ingress-wide proxy-buffer-size and
+	// proxy-buffers-number: the auth location is a sibling of the app location and does not
+	// inherit its directives, and auth responses carrying tokens often exceed the default buffer.
+	proxyBufferSize    string
+	proxyBuffersNumber string
 }
 
 func ingestNginxIngressAnnotations(
@@ -1130,6 +1138,13 @@ func buildAuthLocationBlock(
 	httpLines = append(httpLines, keepaliveHTTP...)
 	if len(keepaliveHTTP) > 0 {
 		lines = append(lines, "proxy_http_version 1.1;", "proxy_set_header Connection \"\";")
+	}
+
+	if auth.proxyBufferSize != "" {
+		lines = append(lines, fmt.Sprintf("proxy_buffer_size %s;", auth.proxyBufferSize))
+		if auth.proxyBuffersNumber != "" {
+			lines = append(lines, fmt.Sprintf("proxy_buffers %s %s;", auth.proxyBuffersNumber, auth.proxyBufferSize))
+		}
 	}
 
 	cacheLines, cacheHTTP, cacheWarnings := buildAuthCache(auth, id)

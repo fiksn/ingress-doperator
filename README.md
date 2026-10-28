@@ -366,6 +366,10 @@ metadata:
 
 Notes and limitations:
 
+- `proxy-buffer-size` and `proxy-buffers-number` also apply to the auth subrequest,
+  as in ingress-nginx. If NGINX logs `upstream sent too big header` for the
+  `/_doperator_auth_*` subrequest (common when the auth service returns access/ID
+  tokens as headers), set e.g. `nginx.ingress.kubernetes.io/proxy-buffer-size: "16k"`.
 - `$escaped_request_uri` (defined by ingress-nginx, not core NGINX) is rewritten
   to the built-in `$request_uri`. The original query string is not re-escaped;
   this matches the common oauth2-proxy `rd=` case.
