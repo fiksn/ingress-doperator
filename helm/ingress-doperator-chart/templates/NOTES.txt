@@ -9,8 +9,8 @@ Configuration:
 - Gateway Namespace: {{ .Values.operator.gatewayNamespace }}
 - Gateway Name: {{ .Values.operator.gatewayName }}
 - Gateway Class: {{ .Values.operator.gatewayClassName }}
-{{- if .Values.operator.watchNamespace }}
-- Watch Namespace: {{ .Values.operator.watchNamespace }}
+{{- with .Values.operator.watchNamespaces }}
+- Watch Namespaces: {{ join ", " . }}
 {{- else }}
 - Watching: All namespaces
 {{- end }}

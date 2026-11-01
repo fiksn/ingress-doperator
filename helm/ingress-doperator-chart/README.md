@@ -14,7 +14,7 @@ This Helm chart deploys the ingress-doperator, a Kubernetes operator that transl
 Before installing this chart, ensure the Gateway API CRDs are installed:
 
 ```bash
-kubectl apply -f https://github.com/kubernetes-sigs/gateway-api/releases/download/v1.0.0/standard-install.yaml
+kubectl apply -f https://github.com/kubernetes-sigs/gateway-api/releases/download/v1.6.3/standard-install.yaml
 ```
 
 ## Installing the Chart
@@ -96,7 +96,7 @@ The following table lists the configurable parameters of the ingress-doperator c
 | `operator.gatewayNamespace` | Namespace where Gateway resources are created | `nginx-fabric` |
 | `operator.gatewayName` | Name of the Gateway resource | `ingress-gateway` |
 | `operator.gatewayClassName` | GatewayClass to use | `nginx` |
-| `operator.watchNamespace` | Namespace to watch (empty = all namespaces) | `""` |
+| `operator.watchNamespaces` | Namespaces to watch, names or glob patterns like `team-*` (empty = all namespaces) | `[]` |
 | `operator.ingressClassFilter` | Comma-separated glob patterns to filter ingress classes | `"*"` |
 | `operator.ingressClassIgnoreFilter` | Comma-separated glob patterns for ingress classes to ignore | `""` |
 | `operator.ingressClassEmpty` | Value used when an Ingress has no class set | `"none"` |
@@ -131,11 +131,11 @@ The following table lists the configurable parameters of the ingress-doperator c
 
 ## Examples
 
-### Watch a Specific Namespace
+### Watch Specific Namespaces
 
 ```bash
 helm install ingress-doperator ./helm/ingress-doperator \
-  --set operator.watchNamespace=my-app-namespace
+  --set "operator.watchNamespaces={infra,team-*}"
 ```
 
 ### Enable Resource Deletion

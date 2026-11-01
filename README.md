@@ -607,7 +607,7 @@ The operator accepts the following command-line flags:
 --gateway-name string                         Name of the Gateway resource when not using ingressClassName
                                               (default: "ingress-gateway")
 --gateway-class-name string                   GatewayClass for created Gateway resources (default: "nginx")
---watch-namespace string                      If specified, only watch Ingresses in this namespace
+--watch-namespace string                      Comma-separated list of namespace glob patterns to watch for Ingresses
                                               (default: watch all namespaces)
 --ingress-class-filter string                 Comma-separated list of glob patterns to filter which ingress classes to process
                                               (default: "*")
@@ -754,11 +754,13 @@ spec:
 ### Namespace Filtering
 
 By default, the operator watches Ingresses in **all namespaces**. You can
-restrict it to a specific namespace for testing:
+restrict it to specific namespaces, given as names or glob patterns
+(`*`, `?`, `[...]`). Namespaces created later that match a pattern are picked up
+automatically:
 
 ```bash
-# Watch only the test-namespace
-./bin/operator --watch-namespace=test-namespace
+# Watch test-namespace and every namespace starting with staging-
+./bin/operator --watch-namespace=test-namespace,staging-*
 ```
 
 This is useful for:

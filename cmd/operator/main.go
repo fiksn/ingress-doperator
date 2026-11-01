@@ -179,7 +179,7 @@ func main() {
 		GatewayNamespace:                 cfg.GatewayNamespace,
 		GatewayName:                      cfg.GatewayName,
 		GatewayClassName:                 cfg.GatewayClassName,
-		WatchNamespace:                   cfg.WatchNamespace,
+		WatchNamespaces:                  cfg.WatchNamespaces,
 		OneGatewayPerIngress:             cfg.OneGatewayPerIngressPatterns,
 		EnableDeletion:                   cfg.EnableDeletion,
 		HostnameRewriteFrom:              cfg.HostnameRewriteFrom,
@@ -230,8 +230,8 @@ func main() {
 		os.Exit(1)
 	}
 
-	if cfg.WatchNamespace != "" {
-		setupLog.Info("Watching Ingresses in specific namespace only", "namespace", cfg.WatchNamespace)
+	if len(cfg.WatchNamespaces) > 0 {
+		setupLog.Info("Watching Ingresses in specific namespaces only", "namespaces", cfg.WatchNamespaces)
 	} else {
 		setupLog.Info("Watching Ingresses in all namespaces")
 	}
@@ -347,6 +347,7 @@ type operatorConfig struct {
 	GatewayAnnotationsMap            map[string]string
 	GatewayInfraAnnotationsMap       map[string]string
 	InfrastructureAnnotationsByClass []translator.IngressClassAnnotationsRule
+	WatchNamespaces                  []string
 	IngressClassFilters              []string
 	IngressClassIgnoreFilters        []string
 	OneGatewayPerIngressPatterns     []string
@@ -367,7 +368,8 @@ func parseOperatorConfig() (operatorConfig, zap.Options, error) {
 	flag.StringVar(&cfg.GatewayClassName, "gateway-class-name", "nginx",
 		"The GatewayClass to use for created Gateway resources")
 	flag.StringVar(&cfg.WatchNamespace, "watch-namespace", "",
-		"If specified, only watch Ingresses in this namespace (default: watch all namespaces)")
+		"Comma-separated list of namespace glob patterns to watch for Ingresses "+
+			"(e.g., 'team-a,staging-*'). Default: watch all namespaces.")
 	flag.StringVar(&cfg.IngressClassFilter, "ingress-class-filter", "*",
 		"Comma-separated list of glob patterns to filter which ingress classes to process "+
 			"(e.g., '*private*', 'nginx', '*'). Default '*' processes all classes.")
@@ -490,6 +492,10 @@ func parseOperatorConfig() (operatorConfig, zap.Options, error) {
 	cfg.HTTPRouteFilters = splitCSV(cfg.HTTPRouteAnnotationFilters)
 	cfg.IngressClassFilters = utils.ParseCommaSeparatedList(cfg.IngressClassFilter)
 	cfg.IngressClassIgnoreFilters = utils.ParseCommaSeparatedList(cfg.IngressClassIgnoreFilter)
+	cfg.WatchNamespaces, err = controller.ParseWatchNamespaces(cfg.WatchNamespace)
+	if err != nil {
+		return cfg, opts, fmt.Errorf("invalid watch-namespace value: %w", err)
+	}
 	cfg.OneGatewayPerIngressPatterns, err = controller.ParseOneGatewayPerIngress(cfg.OneGatewayPerIngress)
 	if err != nil {
 		return cfg, opts, fmt.Errorf("invalid one-gateway-per-ingress value: %w", err)

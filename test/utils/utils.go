@@ -28,7 +28,7 @@ import (
 )
 
 const (
-	gatewayAPIVersion = "v1.2.1"
+	gatewayAPIVersion = "v1.6.3"
 	gatewayAPIURLTmpl = "https://github.com/kubernetes-sigs/gateway-api/releases/download/%s/standard-install.yaml"
 
 	defaultKindBinary  = "kind"

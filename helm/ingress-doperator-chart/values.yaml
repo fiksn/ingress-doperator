@@ -55,8 +55,8 @@ operator:
   gatewayName: ingress-gateway
   gatewayClassName: nginx
 
-  # Namespace to watch (empty means all namespaces)
-  watchNamespace: ""
+  # Namespaces to watch, as names or glob patterns (e.g. "team-*"); empty list means all namespaces
+  watchNamespaces: []
 
   # Ingress class filter (comma-separated glob patterns, default "*" processes all)
   ingressClassFilter: "*"

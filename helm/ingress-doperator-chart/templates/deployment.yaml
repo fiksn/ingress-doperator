@@ -35,8 +35,8 @@ spec:
             - --gateway-namespace={{ .Values.operator.gatewayNamespace }}
             - --gateway-name={{ .Values.operator.gatewayName }}
             - --gateway-class-name={{ .Values.operator.gatewayClassName }}
-            {{- if .Values.operator.watchNamespace }}
-            - --watch-namespace={{ .Values.operator.watchNamespace }}
+            {{- with .Values.operator.watchNamespaces }}
+            - --watch-namespace={{ join "," . }}
             {{- end }}
             - --ingress-class-filter={{ .Values.operator.ingressClassFilter }}
             {{- if .Values.operator.ingressClassIgnoreFilter }}

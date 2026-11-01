@@ -107,7 +107,7 @@ type IngressReconciler struct {
 	GatewayNamespace                 string
 	GatewayName                      string
 	GatewayClassName                 string
-	WatchNamespace                   string
+	WatchNamespaces                  []string // empty means all namespaces
 	OneGatewayPerIngress             []string // namespace/name globs selecting dedicated Gateways
 	EnableDeletion                   bool
 	HostnameRewriteFrom              string
@@ -1590,9 +1590,8 @@ func (r *IngressReconciler) SetupWithManager(mgr ctrl.Manager) error {
 	b := ctrl.NewControllerManagedBy(mgr).
 		For(&networkingv1.Ingress{})
 
-	// If watching specific namespace, add namespace filter
-	if r.WatchNamespace != "" {
-		b = b.WithEventFilter(NamespaceFilter(r.WatchNamespace))
+	if len(r.WatchNamespaces) > 0 {
+		b = b.WithEventFilter(NamespaceFilter(r.WatchNamespaces))
 	}
 
 	apiReader := mgr.GetAPIReader()
@@ -1668,17 +1667,13 @@ func (r *IngressReconciler) SetupWithManager(mgr ctrl.Manager) error {
 
 func (r *IngressReconciler) enqueueAllIngresses(ctx context.Context) []reconcile.Request {
 	list := &networkingv1.IngressList{}
-	opts := []client.ListOption{}
-	if r.WatchNamespace != "" {
-		opts = append(opts, client.InNamespace(r.WatchNamespace))
-	}
-	if err := r.List(ctx, list, opts...); err != nil {
+	if err := r.List(ctx, list); err != nil {
 		log.FromContext(ctx).Error(err, "failed to list Ingresses for extension filter change")
 		return nil
 	}
 	requests := make([]reconcile.Request, 0, len(list.Items))
 	for _, ingress := range list.Items {
-		if !r.shouldEnqueueIngressByClass(&ingress) {
+		if !r.shouldEnqueueIngress(&ingress) {
 			continue
 		}
 		requests = append(requests, reconcile.Request{
@@ -1726,16 +1721,12 @@ func (r *IngressReconciler) enqueueIngressesForSnippetsName(
 ) []reconcile.Request {
 	requests := r.enqueueIngressesForAnnotation(ctx, filterName, HTTPRouteSnippetsFilterAnnotation)
 	list := &networkingv1.IngressList{}
-	opts := []client.ListOption{}
-	if r.WatchNamespace != "" {
-		opts = append(opts, client.InNamespace(r.WatchNamespace))
-	}
-	if err := r.List(ctx, list, opts...); err != nil {
+	if err := r.List(ctx, list); err != nil {
 		log.FromContext(ctx).Error(err, "failed to list Ingresses for SnippetsFilter change")
 		return requests
 	}
 	for _, ingress := range list.Items {
-		if !r.shouldEnqueueIngressByClass(&ingress) {
+		if !r.shouldEnqueueIngress(&ingress) {
 			continue
 		}
 		ingressClass := r.getIngressClass(&ingress)
@@ -1802,17 +1793,13 @@ func (r *IngressReconciler) enqueueIngressesForAnnotation(
 	annotationKey string,
 ) []reconcile.Request {
 	list := &networkingv1.IngressList{}
-	opts := []client.ListOption{}
-	if r.WatchNamespace != "" {
-		opts = append(opts, client.InNamespace(r.WatchNamespace))
-	}
-	if err := r.List(ctx, list, opts...); err != nil {
+	if err := r.List(ctx, list); err != nil {
 		log.FromContext(ctx).Error(err, "failed to list Ingresses for extension filter change")
 		return nil
 	}
 	requests := make([]reconcile.Request, 0, len(list.Items))
 	for _, ingress := range list.Items {
-		if !r.shouldEnqueueIngressByClass(&ingress) {
+		if !r.shouldEnqueueIngress(&ingress) {
 			continue
 		}
 		names := utils.ParseCommaSeparatedAnnotation(ingress.Annotations, annotationKey)
@@ -1874,8 +1861,11 @@ func (r *IngressReconciler) shouldSkipReconcile(ingress *networkingv1.Ingress) b
 	return true
 }
 
-func (r *IngressReconciler) shouldEnqueueIngressByClass(ingress *networkingv1.Ingress) bool {
+func (r *IngressReconciler) shouldEnqueueIngress(ingress *networkingv1.Ingress) bool {
 	if ingress == nil {
+		return false
+	}
+	if !inWatchedNamespaces(r.WatchNamespaces, ingress.Namespace) {
 		return false
 	}
 	if r.matchesIngressClassIgnoreFilter(ingress) {
@@ -1935,12 +1925,6 @@ func (r *IngressReconciler) maybeRecordReconcile(
 	); err != nil {
 		log.FromContext(context.Background()).Error(err, "failed to persist reconcile cache")
 	}
-}
-
-func NamespaceFilter(namespace string) predicate.Predicate {
-	return predicate.NewPredicateFuncs(func(obj client.Object) bool {
-		return obj.GetNamespace() == namespace
-	})
 }
 
 func (r *IngressReconciler) recordWarning(ingress *networkingv1.Ingress, reason, message string) {
