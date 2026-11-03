@@ -82,6 +82,10 @@ operator:
   # How to post process ingress
   ingressPostProcessing: "none"
 
+  # Annotation prefix understood by external-dns
+  # (use "external-dns.alpha.kubernetes.io" for older external-dns versions)
+  externalDNSAnnotationPrefix: "external-dns.kubernetes.io"
+
   # Snippets filter configuration
   ingressClassSnippetsFilter: ""
   ingressNameSnippetsFilter: ""

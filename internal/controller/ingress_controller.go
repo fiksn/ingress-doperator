@@ -57,9 +57,6 @@ const (
 	IgnoreIngressAnnotation                  = "ingress-doperator.fiction.si/ignore-ingress"
 	OriginalIngressClassAnnotation           = "ingress-doperator.fiction.si/original-ingress-class"
 	OriginalIngressClassNameAnnotation       = "ingress-doperator.fiction.si/original-ingress-classname"
-	ExternalDNSIngressHostnameSource         = "external-dns.alpha.kubernetes.io/ingress-hostname-source"
-	ExternalDNSGatewayHostnameSource         = "external-dns.alpha.kubernetes.io/gateway-hostname-source"
-	ExternalDNSHostnameAnnotation            = "external-dns.alpha.kubernetes.io/hostname"
 	OriginalExternalDNSHostname              = "ingress-doperator.fiction.si/original-external-dns-hostname"
 	OriginalExternalDNSIngressHostnameSource = "ingress-doperator.fiction.si/original-external-dns-ingress-hostname-source"
 	OriginalExternalDNSGatewayHostnameSource = "ingress-doperator.fiction.si/original-external-dns-gateway-hostname-source"
@@ -76,11 +73,35 @@ const (
 	DefaultGatewayAnnotationFilters          = "ingress.kubernetes.io," +
 		"nginx.ingress.kubernetes.io,kubectl.kubernetes.io,kubernetes.io/ingress.class," +
 		"traefik.ingress.kubernetes.io,ingress-doperator.fiction.si," +
-		"external-dns.alpha.kubernetes.io"
+		DefaultExternalDNSAnnotationPrefix + "," + LegacyExternalDNSAnnotationPrefix
 	DefaultHTTPRouteAnnotationFilters = "ingress.kubernetes.io," +
 		"nginx.ingress.kubernetes.io,kubectl.kubernetes.io,kubernetes.io/ingress.class," +
 		"traefik.ingress.kubernetes.io,ingress-doperator.fiction.si"
 )
+
+const (
+	DefaultExternalDNSAnnotationPrefix = "external-dns.kubernetes.io"
+	LegacyExternalDNSAnnotationPrefix  = "external-dns.alpha.kubernetes.io"
+)
+
+// external-dns annotation keys; use SetExternalDNSAnnotationPrefix to switch prefixes.
+var (
+	ExternalDNSIngressHostnameSource string
+	ExternalDNSGatewayHostnameSource string
+	ExternalDNSHostnameAnnotation    string
+)
+
+func init() {
+	SetExternalDNSAnnotationPrefix(DefaultExternalDNSAnnotationPrefix)
+}
+
+// SetExternalDNSAnnotationPrefix sets the prefix (e.g. "external-dns.kubernetes.io") used for
+// the external-dns annotations the operator reads and writes. Call it before starting controllers.
+func SetExternalDNSAnnotationPrefix(prefix string) {
+	ExternalDNSIngressHostnameSource = prefix + "/ingress-hostname-source"
+	ExternalDNSGatewayHostnameSource = prefix + "/gateway-hostname-source"
+	ExternalDNSHostnameAnnotation = prefix + "/hostname"
+}
 
 // ingressPostProcessing
 type IngressPostProcessingMode string

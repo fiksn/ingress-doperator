@@ -89,6 +89,7 @@ func main() {
 	var preventFurtherReconciliation bool
 	var markIgnoreIngress bool
 	var ingressNamePattern string
+	var externalDNSAnnotationPrefix string
 
 	flag.CommandLine.SetOutput(os.Stderr)
 	flag.StringVar(&namespace, "namespace", "", "If set, only process Ingresses in this namespace")
@@ -109,6 +110,9 @@ func main() {
 		"If true, mark restored Ingresses as disabled to stop future reconciles")
 	flag.BoolVar(&markIgnoreIngress, "mark-ignore-ingress", false,
 		"If true, add ingress-doperator.fiction.si/ignore-ingress=true to restored Ingresses")
+	flag.StringVar(&externalDNSAnnotationPrefix, "external-dns-annotation-prefix",
+		controller.DefaultExternalDNSAnnotationPrefix,
+		"Annotation prefix understood by external-dns (must match the operator setting)")
 	flag.IntVar(&verbosity, "v", 0, "Log verbosity (0 = info, higher = more verbose)")
 	opts := zap.Options{
 		Development: true,
@@ -122,6 +126,12 @@ func main() {
 	}
 
 	ctrl.SetLogger(zap.New(zap.UseFlagOptions(&opts)))
+
+	if externalDNSAnnotationPrefix == "" {
+		_, _ = fmt.Fprintln(os.Stderr, "Invalid flag: --external-dns-annotation-prefix must not be empty")
+		os.Exit(1)
+	}
+	controller.SetExternalDNSAnnotationPrefix(externalDNSAnnotationPrefix)
 
 	if dangerouslyDeleteIngresses {
 		if restoreClass.set || restoreExternalDNS.set {

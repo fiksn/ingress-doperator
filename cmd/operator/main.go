@@ -269,7 +269,8 @@ func main() {
 	case controller.IngressPostProcessingModeRemove:
 		setupLog.Info("Ingress post processing mode: remove")
 	case controller.IngressPostProcessingModeDisableExternalDNS:
-		setupLog.Info("Ingress post processing mode: disable-external-dns")
+		setupLog.Info("Ingress post processing mode: disable-external-dns",
+			"externalDNSAnnotationPrefix", cfg.ExternalDNSAnnotationPrefix)
 	}
 
 	// +kubebuilder:scaffold:builder
@@ -336,6 +337,7 @@ type operatorConfig struct {
 	UseIngress2Gateway              bool
 	Ingress2GatewayProvider         string
 	Ingress2GatewayIngressClass     string
+	ExternalDNSAnnotationPrefix     string
 
 	ParsedClassSnippetsFilters       []utils.IngressClassSnippetsFilter
 	ParsedNameSnippetsFilters        []utils.IngressClassSnippetsFilter
@@ -395,6 +397,10 @@ func parseOperatorConfig() (operatorConfig, zap.Options, error) {
 		"How to handle the post processing of ingress: 'none' (no action), "+
 			"'disable' (remove ingress class), 'remove' (delete ingress), "+
 			"'disable-external-dns' (force external-dns to read annotations only)")
+	flag.StringVar(&cfg.ExternalDNSAnnotationPrefix, "external-dns-annotation-prefix",
+		controller.DefaultExternalDNSAnnotationPrefix,
+		"Annotation prefix understood by external-dns (use '"+controller.LegacyExternalDNSAnnotationPrefix+
+			"' for external-dns versions that only support the alpha prefix)")
 	flag.StringVar(&cfg.GatewayAnnotations, "gateway-annotations", DefaultGatewayAnnotations,
 		"Comma-separated key=value pairs for Gateway metadata annotations (applied to all Gateways)")
 	flag.StringVar(&cfg.GatewayInfraAnnotations, "gateway-infrastructure-annotations",
@@ -500,6 +506,10 @@ func parseOperatorConfig() (operatorConfig, zap.Options, error) {
 	if err != nil {
 		return cfg, opts, fmt.Errorf("invalid one-gateway-per-ingress value: %w", err)
 	}
+	if cfg.ExternalDNSAnnotationPrefix == "" {
+		return cfg, opts, fmt.Errorf("external-dns-annotation-prefix must not be empty")
+	}
+	controller.SetExternalDNSAnnotationPrefix(cfg.ExternalDNSAnnotationPrefix)
 	if cfg.IngressPostProcessingMode == controller.IngressPostProcessingModeDisableExternalDNS {
 		cfg.GatewayFilters = appendFilterIfMissing(cfg.GatewayFilters, controller.ExternalDNSIngressHostnameSource)
 		cfg.GatewayFilters = appendFilterIfMissing(cfg.GatewayFilters, controller.ExternalDNSHostnameAnnotation)

@@ -105,6 +105,7 @@ The following table lists the configurable parameters of the ingress-doperator c
 | `operator.hostnameRewriteFrom` | Comma-separated domain suffixes to match | `""` |
 | `operator.hostnameRewriteTo` | Comma-separated replacement domain suffixes | `""` |
 | `operator.ingressPostProcessing` | How to postprocess Ingress: `none`, `disable`, `remove`, or `disable-external-dns` | `"none"` |
+| `operator.externalDNSAnnotationPrefix` | Annotation prefix understood by external-dns (`external-dns.alpha.kubernetes.io` for older versions) | `"external-dns.kubernetes.io"` |
 | `operator.ingressClassSnippetsFilter` | SnippetsFilter mappings for ingress class patterns | `""` |
 | `operator.ingressNameSnippetsFilter` | SnippetsFilter mappings for ingress name patterns | `""` |
 | `operator.ingressAnnotationSnippetsAdd` | SnippetsFilter add rules based on ingress annotations | `""` |

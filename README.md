@@ -18,7 +18,7 @@ option is `--ingress-postprocessing disable-external-dns` to just "move" DNS rec
 In case anything goes wrong you can stop the operator and use [reenabler](#re-enabling-disabled-ingresses)
 CLI tool to get old state back with `--restore-external-dns` flag.
 Note that this last option depends on fairly recent version of `external-dns` that understands
-`external-dns.alpha.kubernetes.io/gateway-hostname-source` annotation. Else you will still have to remove `Httproute`
+`external-dns.kubernetes.io/gateway-hostname-source` annotation. Else you will still have to remove `Httproute`
 for proper DNS changes.
 
 Very important:
@@ -626,6 +626,9 @@ The operator accepts the following command-line flags:
                                               Transforms 'a.b.domain.cc' to 'a.b.foo.domain.cc'
 --ingress-postprocessing string               Post processing mode: none, disable, remove, or disable-external-dns
                                               (default: "none")
+--external-dns-annotation-prefix string       Annotation prefix understood by external-dns; use
+                                              'external-dns.alpha.kubernetes.io' for older external-dns
+                                              (default: "external-dns.kubernetes.io")
 --gateway-annotation-filters string           Comma-separated list of annotation prefixes to exclude from Gateway
                                               (default: "ingress.kubernetes.io,cert-manager.io,
                                               nginx.ingress.kubernetes.io")
@@ -842,9 +845,14 @@ for migrated ingresses.
 ```
 
 This will:
-- Set `external-dns.alpha.kubernetes.io/ingress-hostname-source=annotation-only`
-- If `external-dns.alpha.kubernetes.io/hostname` exists, save it to
+- Set `external-dns.kubernetes.io/ingress-hostname-source=annotation-only`
+- If `external-dns.kubernetes.io/hostname` exists, save it to
   `ingress-doperator.fiction.si/original-external-dns-hostname` and emit a warning
+
+The annotation prefix defaults to `external-dns.kubernetes.io`. Older external-dns versions only
+understand `external-dns.alpha.kubernetes.io`; select it with
+`--external-dns-annotation-prefix=external-dns.alpha.kubernetes.io` (pass the same flag to the
+reenabler).
 
 ## Deletion behaviour
 
