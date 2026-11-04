@@ -19,7 +19,6 @@ package translator
 import (
 	"context"
 	"fmt"
-	"path/filepath"
 	"regexp"
 	"sort"
 	"strings"
@@ -1031,32 +1030,7 @@ func (t *Translator) GetIngressClass(ingress *networkingv1.Ingress) string {
 }
 
 func (t *Translator) shouldApplyClassInfrastructureAnnotations(ingressClass string) bool {
-	hasFallback := false
-	matchedNonFallback := false
-	for _, rule := range t.Config.InfrastructureAnnotationsByClass {
-		if rule.Pattern == "" {
-			continue
-		}
-		if rule.Pattern == "!" {
-			if len(rule.Annotations) > 0 {
-				hasFallback = true
-			}
-			continue
-		}
-		matched, err := filepath.Match(rule.Pattern, ingressClass)
-		if err != nil {
-			logger := log.Log.WithName("classInfraAnnotations")
-			logger.Error(err, "Invalid ingress class pattern", "pattern", rule.Pattern)
-			continue
-		}
-		if matched && len(rule.Annotations) > 0 {
-			matchedNonFallback = true
-		}
-	}
-	if matchedNonFallback {
-		return true
-	}
-	return hasFallback
+	return len(ClassInfrastructureAnnotations(t.Config.InfrastructureAnnotationsByClass, ingressClass)) > 0
 }
 
 func (t *Translator) applyClassInfrastructureAnnotations(
@@ -1066,38 +1040,8 @@ func (t *Translator) applyClassInfrastructureAnnotations(
 	if annotations == nil {
 		return
 	}
-	matchedNonFallback := false
-	for _, rule := range t.Config.InfrastructureAnnotationsByClass {
-		if rule.Pattern == "" {
-			continue
-		}
-		if rule.Pattern == "!" {
-			continue
-		}
-		matched, err := filepath.Match(rule.Pattern, ingressClass)
-		if err != nil {
-			logger := log.Log.WithName("classInfraAnnotations")
-			logger.Error(err, "Invalid ingress class pattern", "pattern", rule.Pattern)
-			continue
-		}
-		if !matched {
-			continue
-		}
-		matchedNonFallback = true
-		for key, value := range rule.Annotations {
-			annotations[gatewayv1.AnnotationKey(key)] = gatewayv1.AnnotationValue(value)
-		}
-	}
-	if matchedNonFallback {
-		return
-	}
-	for _, rule := range t.Config.InfrastructureAnnotationsByClass {
-		if rule.Pattern != "!" {
-			continue
-		}
-		for key, value := range rule.Annotations {
-			annotations[gatewayv1.AnnotationKey(key)] = gatewayv1.AnnotationValue(value)
-		}
+	for key, value := range ClassInfrastructureAnnotations(t.Config.InfrastructureAnnotationsByClass, ingressClass) {
+		annotations[gatewayv1.AnnotationKey(key)] = gatewayv1.AnnotationValue(value)
 	}
 }
 

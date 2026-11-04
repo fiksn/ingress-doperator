@@ -370,15 +370,9 @@ func (r *IngressReconciler) reconcileIngressToHTTPRoute(
 	logger.V(1).Info("HTTPRoute applied successfully", "namespace", httpRoute.Namespace, "name", httpRoute.Name)
 
 	// Ensure Gateway listeners are updated from this Ingress change before post-processing
-	listenerReconciler := &HTTPRouteReconciler{
-		Client:              r.Client,
-		GatewayNamespace:    r.GatewayNamespace,
-		GatewayClassName:    r.GatewayClassName,
-		HostnameRewriteFrom: r.HostnameRewriteFrom,
-		HostnameRewriteTo:   r.HostnameRewriteTo,
-	}
+	listenerReconciler := r.newGatewayListenerReconciler()
 
-	gateway, canManageGateway, gatewayExists, err := r.ensureGatewayForListenerUpdate(ctx, gatewayName)
+	gateway, canManageGateway, gatewayExists, err := r.ensureGatewayForListenerUpdate(ctx, gatewayName, ingress)
 	if err != nil {
 		logger.Error(err, "failed to ensure Gateway for listener update")
 		return ctrl.Result{}, err
@@ -401,7 +395,7 @@ func (r *IngressReconciler) reconcileIngressToHTTPRoute(
 		}
 	}
 
-	updated := false
+	updated := listenerReconciler.applyConfiguredGatewayAnnotations(gateway, ingress)
 	for _, route := range httpRoutes {
 		routeUpdated := listenerReconciler.updateGatewayListeners(ctx, gateway, route, ingress)
 		if routeUpdated {
@@ -723,9 +717,26 @@ func firstSharedHostPath(
 	return ""
 }
 
+// newGatewayListenerReconciler returns an HTTPRouteReconciler sharing this reconciler's Gateway
+// settings, used to create and update Gateway listeners directly from Ingress reconciles.
+func (r *IngressReconciler) newGatewayListenerReconciler() *HTTPRouteReconciler {
+	return &HTTPRouteReconciler{
+		Client:                           r.Client,
+		GatewayNamespace:                 r.GatewayNamespace,
+		GatewayClassName:                 r.GatewayClassName,
+		HostnameRewriteFrom:              r.HostnameRewriteFrom,
+		HostnameRewriteTo:                r.HostnameRewriteTo,
+		DefaultGatewayAnnotations:        r.DefaultGatewayAnnotations,
+		GatewayInfrastructureAnnotations: r.GatewayInfrastructureAnnotations,
+		InfrastructureAnnotationsByClass: r.InfrastructureAnnotationsByClass,
+		IngressClassEmpty:                r.IngressClassEmpty,
+	}
+}
+
 func (r *IngressReconciler) ensureGatewayForListenerUpdate(
 	ctx context.Context,
 	gatewayName string,
+	ingress *networkingv1.Ingress,
 ) (*gatewayv1.Gateway, bool, bool, error) {
 	gatewayNN := types.NamespacedName{
 		Namespace: r.GatewayNamespace,
@@ -737,11 +748,7 @@ func (r *IngressReconciler) ensureGatewayForListenerUpdate(
 			return nil, false, false, err
 		}
 		// Return a new Gateway object without creating it yet
-		initializer := &HTTPRouteReconciler{
-			GatewayNamespace: r.GatewayNamespace,
-			GatewayClassName: r.GatewayClassName,
-		}
-		gateway = initializer.createInitialGateway(gatewayName)
+		gateway = r.newGatewayListenerReconciler().createInitialGateway(gatewayName, ingress)
 		return gateway, true, false, nil
 	}
 
@@ -1552,22 +1559,19 @@ func (r *IngressReconciler) getGatewayNameForClass(ingressClass string) string {
 
 // getIngressClass returns the ingress class from spec.ingressClassName or the legacy annotation
 func (r *IngressReconciler) getIngressClass(ingress *networkingv1.Ingress) string {
-	// First check spec.ingressClassName
+	return ingressClassOf(ingress, r.IngressClassEmpty)
+}
+
+// ingressClassOf returns the ingress class from spec.ingressClassName or the legacy annotation,
+// falling back to emptyClass when neither is set.
+func ingressClassOf(ingress *networkingv1.Ingress, emptyClass string) string {
 	if ingress.Spec.IngressClassName != nil && *ingress.Spec.IngressClassName != "" {
 		return *ingress.Spec.IngressClassName
 	}
-
-	// Fallback to legacy annotation
-	if ingress.Annotations != nil {
-		if class, ok := ingress.Annotations[IngressClassAnnotation]; ok && class != "" {
-			return class
-		}
+	if class, ok := ingress.Annotations[IngressClassAnnotation]; ok && class != "" {
+		return class
 	}
-
-	if r.IngressClassEmpty != "" {
-		return r.IngressClassEmpty
-	}
-	return ""
+	return emptyClass
 }
 
 // matchesIngressClassFilter checks if the Ingress class matches any configured filter pattern

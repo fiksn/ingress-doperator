@@ -18,7 +18,10 @@ package translator
 
 import (
 	"fmt"
+	"path/filepath"
 	"strings"
+
+	"sigs.k8s.io/controller-runtime/pkg/log"
 )
 
 // IngressClassAnnotationsRule maps a glob pattern to annotations.
@@ -79,4 +82,39 @@ func ParseIngressClassAnnotationsByClass(raw string) ([]IngressClassAnnotationsR
 		})
 	}
 	return rules, nil
+}
+
+// ClassInfrastructureAnnotations returns the annotations of every rule whose pattern matches
+// ingressClass, merged in rule order (later rules win). When no pattern matches, the annotations
+// of the "!" fallback rules are returned instead. Returns an empty map when nothing applies.
+func ClassInfrastructureAnnotations(rules []IngressClassAnnotationsRule, ingressClass string) map[string]string {
+	matched := make(map[string]string)
+	fallback := make(map[string]string)
+	for _, rule := range rules {
+		if rule.Pattern == "" {
+			continue
+		}
+		if rule.Pattern == "!" {
+			for key, value := range rule.Annotations {
+				fallback[key] = value
+			}
+			continue
+		}
+		ok, err := filepath.Match(rule.Pattern, ingressClass)
+		if err != nil {
+			log.Log.WithName("classInfraAnnotations").Error(err, "Invalid ingress class pattern",
+				"pattern", rule.Pattern)
+			continue
+		}
+		if !ok {
+			continue
+		}
+		for key, value := range rule.Annotations {
+			matched[key] = value
+		}
+	}
+	if len(matched) > 0 {
+		return matched
+	}
+	return fallback
 }

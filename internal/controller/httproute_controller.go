@@ -53,6 +53,16 @@ type HTTPRouteReconciler struct {
 	HostnameRewriteFrom       string
 	HostnameRewriteTo         string
 	IngressPostProcessingMode IngressPostProcessingMode
+	// DefaultGatewayAnnotations are set on every managed Gateway's metadata (--gateway-annotations)
+	DefaultGatewayAnnotations map[string]string
+	// GatewayInfrastructureAnnotations are set on every managed Gateway's spec.infrastructure
+	// (--gateway-infrastructure-annotations)
+	GatewayInfrastructureAnnotations map[string]string
+	// InfrastructureAnnotationsByClass are set on spec.infrastructure of Gateways whose source
+	// Ingress class matches (--annotations-by-class)
+	InfrastructureAnnotationsByClass []translator.IngressClassAnnotationsRule
+	// IngressClassEmpty is the class assumed for Ingresses without one (--ingress-class-empty)
+	IngressClassEmpty string
 
 	// Debouncing state
 	gatewayUpdateDebouncer *gatewayUpdateDebouncer
@@ -249,7 +259,7 @@ func (r *HTTPRouteReconciler) handleHTTPRouteCreateOrUpdate(ctx context.Context,
 	if err != nil {
 		if apierrors.IsNotFound(err) {
 			gatewayExists = false
-			gateway = r.createInitialGateway(gatewayName)
+			gateway = r.createInitialGateway(gatewayName, ingress)
 		} else {
 			logger.Error(err, "unable to fetch Gateway")
 			return ctrl.Result{}, err
@@ -280,6 +290,9 @@ func (r *HTTPRouteReconciler) handleHTTPRouteCreateOrUpdate(ctx context.Context,
 
 	// Merge this HTTPRoute into existing Gateway listeners (no removals here)
 	updated := r.updateGatewayListeners(ctx, gateway, httpRoute, ingress)
+	if r.applyConfiguredGatewayAnnotations(gateway, ingress) {
+		updated = true
+	}
 
 	if gatewayExists {
 		if updated {
@@ -480,6 +493,9 @@ func (r *HTTPRouteReconciler) reconcileGatewayListeners(
 		desiredTLS, certMismatches, tlsUnknown := r.buildDesiredListenerTLS(ctx, desiredState, routes)
 
 		updated := r.reconcileListenersToDesiredState(gateway, desiredState, desiredTLS, tlsUnknown, logger)
+		if r.applyConfiguredGatewayAnnotations(gateway, r.firstSourceIngress(ctx, routes)) {
+			updated = true
+		}
 		if len(gateway.Spec.Listeners) == 0 {
 			return r.handleGatewayWithoutListeners(ctx, gateway, len(routes))
 		}
@@ -1321,14 +1337,18 @@ func (r *HTTPRouteReconciler) validateIngressForHTTPRoute(ingress *networkingv1.
 	return nil
 }
 
-// createInitialGateway creates a minimal Gateway resource
-func (r *HTTPRouteReconciler) createInitialGateway(gatewayName string) *gatewayv1.Gateway {
+// createInitialGateway creates a minimal Gateway resource carrying the configured annotations.
+// ingress selects the --annotations-by-class rules and may be nil.
+func (r *HTTPRouteReconciler) createInitialGateway(
+	gatewayName string,
+	ingress *networkingv1.Ingress,
+) *gatewayv1.Gateway {
 	gatewayClassName := r.GatewayClassName
 	if gatewayClassName == "" {
 		gatewayClassName = "nginx" // Default from CLI flag
 	}
 
-	return &gatewayv1.Gateway{
+	gateway := &gatewayv1.Gateway{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      gatewayName,
 			Namespace: r.GatewayNamespace,
@@ -1341,6 +1361,83 @@ func (r *HTTPRouteReconciler) createInitialGateway(gatewayName string) *gatewayv
 			Listeners:        []gatewayv1.Listener{}, // Empty, will be populated by reconciler
 		},
 	}
+	r.applyConfiguredGatewayAnnotations(gateway, ingress)
+	return gateway
+}
+
+// applyConfiguredGatewayAnnotations sets DefaultGatewayAnnotations on the Gateway metadata, and
+// GatewayInfrastructureAnnotations plus the --annotations-by-class rules matching the class of
+// ingress on spec.infrastructure. Existing values for the same keys are overwritten; other
+// annotations are left untouched. A nil ingress skips the class rules. Returns true if the
+// Gateway changed.
+func (r *HTTPRouteReconciler) applyConfiguredGatewayAnnotations(
+	gateway *gatewayv1.Gateway,
+	ingress *networkingv1.Ingress,
+) bool {
+	changed := false
+	for key, value := range r.DefaultGatewayAnnotations {
+		if current, ok := gateway.Annotations[key]; ok && current == value {
+			continue
+		}
+		if gateway.Annotations == nil {
+			gateway.Annotations = make(map[string]string)
+		}
+		gateway.Annotations[key] = value
+		changed = true
+	}
+
+	for key, value := range r.desiredInfrastructureAnnotations(ingress) {
+		annotationKey := gatewayv1.AnnotationKey(key)
+		annotationValue := gatewayv1.AnnotationValue(value)
+		if gateway.Spec.Infrastructure == nil {
+			gateway.Spec.Infrastructure = &gatewayv1.GatewayInfrastructure{}
+		}
+		infra := gateway.Spec.Infrastructure
+		if current, ok := infra.Annotations[annotationKey]; ok && current == annotationValue {
+			continue
+		}
+		if infra.Annotations == nil {
+			infra.Annotations = make(map[gatewayv1.AnnotationKey]gatewayv1.AnnotationValue)
+		}
+		infra.Annotations[annotationKey] = annotationValue
+		changed = true
+	}
+	return changed
+}
+
+// desiredInfrastructureAnnotations merges GatewayInfrastructureAnnotations with the class rules
+// matching ingress; class rules win on conflicting keys.
+func (r *HTTPRouteReconciler) desiredInfrastructureAnnotations(ingress *networkingv1.Ingress) map[string]string {
+	desired := make(map[string]string, len(r.GatewayInfrastructureAnnotations))
+	for key, value := range r.GatewayInfrastructureAnnotations {
+		desired[key] = value
+	}
+	if ingress == nil || len(r.InfrastructureAnnotationsByClass) == 0 {
+		return desired
+	}
+	ingressClass := ingressClassOf(ingress, r.IngressClassEmpty)
+	for key, value := range translator.ClassInfrastructureAnnotations(r.InfrastructureAnnotationsByClass, ingressClass) {
+		desired[key] = value
+	}
+	return desired
+}
+
+// firstSourceIngress returns the source Ingress of the first route that has one, or nil. All
+// Ingresses sharing a Gateway have the same class, so any of them selects the class rules.
+func (r *HTTPRouteReconciler) firstSourceIngress(
+	ctx context.Context,
+	routes []gatewayv1.HTTPRoute,
+) *networkingv1.Ingress {
+	if len(r.InfrastructureAnnotationsByClass) == 0 {
+		return nil
+	}
+	for i := range routes {
+		ingress, _, err := r.resolveIngressForHTTPRoute(ctx, &routes[i])
+		if err == nil {
+			return ingress
+		}
+	}
+	return nil
 }
 
 // SetupWithManager sets up the controller with the Manager.
