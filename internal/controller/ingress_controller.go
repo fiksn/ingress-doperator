@@ -115,6 +115,9 @@ const (
 	IngressPostProcessingModeRemove IngressPostProcessingMode = "remove"
 	// IngressPostProcessingModeDisableExternalDNS forces external-dns to only read annotations
 	IngressPostProcessingModeDisableExternalDNS IngressPostProcessingMode = "disable-external-dns"
+	// IngressPostProcessingModeShadowExternalDNS leaves the source Ingress unchanged and hides the
+	// generated HTTPRoutes from external-dns, so DNS keeps following the Ingress
+	IngressPostProcessingModeShadowExternalDNS IngressPostProcessingMode = "shadow-external-dns"
 )
 
 const requeueAfterError = 30 * time.Second
@@ -348,6 +351,10 @@ func (r *IngressReconciler) reconcileIngressToHTTPRoute(
 	// Apply extension refs (snippets, auth, headers)
 	r.applyHTTPRouteExtensionRefs(ctx, ingress, httpRoute)
 
+	if effectiveMode == IngressPostProcessingModeShadowExternalDNS {
+		shadowExternalDNS(httpRoute)
+	}
+
 	// Resolve any named ports before applying (search canary siblings too)
 	if err := r.HTTPRouteManager.ResolveNamedPorts(ctx, ingress, httpRoute, canaries...); err != nil {
 		logger.Error(err, "failed to resolve named ports")
@@ -440,7 +447,7 @@ func (r *IngressReconciler) reconcileIngressToHTTPRoute(
 		// External-DNS disabling is now handled by HTTPRouteReconciler after Gateway is updated
 		// This ensures the Gateway has the listener ready before external-dns processing stops
 		logger.V(1).Info("External-DNS will be disabled by HTTPRouteReconciler after Gateway update")
-	case IngressPostProcessingModeNone:
+	case IngressPostProcessingModeNone, IngressPostProcessingModeShadowExternalDNS:
 		// Do nothing
 	}
 
@@ -1449,6 +1456,22 @@ func disableExternalDNS(ctx context.Context, cli client.Client, ingress *network
 	logger.Info("Successfully disabled external-dns on Ingress",
 		"namespace", ingress.Namespace, "name", ingress.Name)
 	return nil
+}
+
+// shadowExternalDNS hides an HTTPRoute from external-dns: it drops the external-dns annotations
+// copied from the Ingress (under both prefixes) and sets gateway-hostname-source to
+// annotation-only, so external-dns finds no hostname to publish for the route.
+func shadowExternalDNS(httpRoute *gatewayv1.HTTPRoute) {
+	for key := range httpRoute.Annotations {
+		if strings.HasPrefix(key, DefaultExternalDNSAnnotationPrefix+"/") ||
+			strings.HasPrefix(key, LegacyExternalDNSAnnotationPrefix+"/") {
+			delete(httpRoute.Annotations, key)
+		}
+	}
+	if httpRoute.Annotations == nil {
+		httpRoute.Annotations = make(map[string]string)
+	}
+	httpRoute.Annotations[ExternalDNSGatewayHostnameSource] = ExternalDNSHostnameSourceAnnotationOnly
 }
 
 func (r *IngressReconciler) ensureDisabledIngressClass(ctx context.Context) error {

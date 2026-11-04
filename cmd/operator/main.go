@@ -275,6 +275,9 @@ func main() {
 	case controller.IngressPostProcessingModeDisableExternalDNS:
 		setupLog.Info("Ingress post processing mode: disable-external-dns",
 			"externalDNSAnnotationPrefix", cfg.ExternalDNSAnnotationPrefix)
+	case controller.IngressPostProcessingModeShadowExternalDNS:
+		setupLog.Info("Ingress post processing mode: shadow-external-dns",
+			"externalDNSAnnotationPrefix", cfg.ExternalDNSAnnotationPrefix)
 	}
 
 	// +kubebuilder:scaffold:builder
@@ -400,7 +403,8 @@ func parseOperatorConfig() (operatorConfig, zap.Options, error) {
 	flag.StringVar(&cfg.IngressPostProcessing, "ingress-postprocessing", "none",
 		"How to handle the post processing of ingress: 'none' (no action), "+
 			"'disable' (remove ingress class), 'remove' (delete ingress), "+
-			"'disable-external-dns' (force external-dns to read annotations only)")
+			"'disable-external-dns' (force external-dns to read annotations only), "+
+			"'shadow-external-dns' (create HTTPRoutes hidden from external-dns, leave ingress unchanged)")
 	flag.StringVar(&cfg.ExternalDNSAnnotationPrefix, "external-dns-annotation-prefix",
 		controller.DefaultExternalDNSAnnotationPrefix,
 		"Annotation prefix understood by external-dns (use '"+controller.LegacyExternalDNSAnnotationPrefix+
@@ -562,9 +566,12 @@ func parseIngressPostProcessingMode(value string) (controller.IngressPostProcess
 		return controller.IngressPostProcessingModeRemove, nil
 	case "disable-external-dns":
 		return controller.IngressPostProcessingModeDisableExternalDNS, nil
+	case "shadow-external-dns":
+		return controller.IngressPostProcessingModeShadowExternalDNS, nil
 	default:
 		return controller.IngressPostProcessingModeNone,
-			fmt.Errorf("invalid ingress-post-processing value %q (allowed: none, disable, remove, disable-external-dns)", value)
+			fmt.Errorf("invalid ingress-post-processing value %q "+
+				"(allowed: none, disable, remove, disable-external-dns, shadow-external-dns)", value)
 	}
 }
 

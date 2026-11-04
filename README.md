@@ -11,7 +11,8 @@ It can transparently create `Gateway`, `Httproute` (and possibly
 annotations) from `Ingress` resources.
 Depending on `--ingress-postprocessing` it can either ("disable") disable the
 original ingress, disable DNS records using external-dns ("disable-external-dns"),
-remove it completely ("remove") or just leave it (for future reference).
+remove it completely ("remove"), keep DNS on the ingress while hiding the new `Httproute` from
+external-dns ("shadow-external-dns") or just leave it (for future reference).
 
 If you use [external-dns](https://github.com/kubernetes-sigs/external-dns) on your cluster the simplest
 option is `--ingress-postprocessing disable-external-dns` to just "move" DNS records from `Ingress` to `Httproute`.
@@ -624,7 +625,8 @@ The operator accepts the following command-line flags:
 --hostname-rewrite-from string                Domain suffix to match for rewriting (e.g., 'domain.cc')
 --hostname-rewrite-to string                  Replacement domain suffix (e.g., 'foo.domain.cc').
                                               Transforms 'a.b.domain.cc' to 'a.b.foo.domain.cc'
---ingress-postprocessing string               Post processing mode: none, disable, remove, or disable-external-dns
+--ingress-postprocessing string               Post processing mode: none, disable, remove, disable-external-dns,
+                                              or shadow-external-dns
                                               (default: "none")
 --external-dns-annotation-prefix string       Annotation prefix understood by external-dns; use
                                               'external-dns.alpha.kubernetes.io' for older external-dns
@@ -853,6 +855,30 @@ The annotation prefix defaults to `external-dns.kubernetes.io`. Older external-d
 understand `external-dns.alpha.kubernetes.io`; select it with
 `--external-dns-annotation-prefix=external-dns.alpha.kubernetes.io` (pass the same flag to the
 reenabler).
+
+### Shadowing HTTPRoutes from external-dns
+
+Use `--ingress-postprocessing=shadow-external-dns` to create the `Gateway` and `HTTPRoute`
+resources while DNS keeps pointing at the old ingress controller:
+
+```bash
+./bin/operator --ingress-postprocessing=shadow-external-dns
+```
+
+The source Ingress is left unchanged (as with `none`). Every generated HTTPRoute:
+- Gets `external-dns.kubernetes.io/gateway-hostname-source=annotation-only`
+- Has all `external-dns.kubernetes.io/*` and `external-dns.alpha.kubernetes.io/*` annotations
+  copied from the Ingress removed
+
+so external-dns (with the `gateway-httproute` source) publishes no records for it.
+
+To cut over, switch to `--ingress-postprocessing=disable-external-dns`: the next reconcile drops
+the shadow annotations from the HTTPRoutes and sets the Ingress to `annotation-only`. During one
+external-dns sync interval both may be published, so the record can briefly carry both targets.
+
+Ingresses already marked `ingress-doperator.fiction.si/disabled: external-dns` keep the
+`disable-external-dns` behaviour and are not shadowed. To move such an Ingress back, run the
+[reenabler](#re-enabling-disabled-ingresses) with `--restore-external-dns` first.
 
 ## Deletion behaviour
 

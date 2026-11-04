@@ -79,7 +79,7 @@ operator:
   hostnameRewriteFrom: ""
   hostnameRewriteTo: ""
 
-  # How to post process ingress
+  # How to post process ingress: none, disable, remove, disable-external-dns, shadow-external-dns
   ingressPostProcessing: "none"
 
   # Annotation prefix understood by external-dns

@@ -25,6 +25,7 @@ import (
 	"k8s.io/apimachinery/pkg/runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
+	gatewayv1 "sigs.k8s.io/gateway-api/apis/v1"
 )
 
 func TestDisableExternalDNSUsesConfiguredPrefix(t *testing.T) {
@@ -72,6 +73,72 @@ func TestDisableExternalDNSUsesConfiguredPrefix(t *testing.T) {
 			}
 			if v := got.Annotations[OriginalExternalDNSHostname]; v != "web.example.com" {
 				t.Errorf("%s = %q, want %q", OriginalExternalDNSHostname, v, "web.example.com")
+			}
+		})
+	}
+}
+
+func TestShadowExternalDNSHidesRouteFromExternalDNS(t *testing.T) {
+	for _, prefix := range []string{DefaultExternalDNSAnnotationPrefix, LegacyExternalDNSAnnotationPrefix} {
+		t.Run(prefix, func(t *testing.T) {
+			SetExternalDNSAnnotationPrefix(prefix)
+			t.Cleanup(func() { SetExternalDNSAnnotationPrefix(DefaultExternalDNSAnnotationPrefix) })
+
+			route := &gatewayv1.HTTPRoute{ObjectMeta: metav1.ObjectMeta{Annotations: map[string]string{
+				DefaultExternalDNSAnnotationPrefix + "/hostname":                "web.example.com",
+				LegacyExternalDNSAnnotationPrefix + "/hostname":                 "web.example.com",
+				LegacyExternalDNSAnnotationPrefix + "/cloudflare-proxied":       "true",
+				DefaultExternalDNSAnnotationPrefix + "/ingress-hostname-source": "defined-hosts-only",
+				"cert-manager.io/cluster-issuer":                                "letsencrypt",
+			}}}
+
+			shadowExternalDNS(route)
+
+			want := map[string]string{
+				prefix + "/gateway-hostname-source": ExternalDNSHostnameSourceAnnotationOnly,
+				"cert-manager.io/cluster-issuer":    "letsencrypt",
+			}
+			if len(route.Annotations) != len(want) {
+				t.Errorf("annotations = %v, want %v", route.Annotations, want)
+			}
+			for key, value := range want {
+				if route.Annotations[key] != value {
+					t.Errorf("annotation %q = %q, want %q", key, route.Annotations[key], value)
+				}
+			}
+		})
+	}
+}
+
+func TestShadowExternalDNSWithoutAnnotations(t *testing.T) {
+	route := &gatewayv1.HTTPRoute{}
+
+	shadowExternalDNS(route)
+
+	if v := route.Annotations[ExternalDNSGatewayHostnameSource]; v != ExternalDNSHostnameSourceAnnotationOnly {
+		t.Errorf("%s = %q, want %q", ExternalDNSGatewayHostnameSource, v, ExternalDNSHostnameSourceAnnotationOnly)
+	}
+}
+
+func TestResolveIngressPostProcessingModeInShadowMode(t *testing.T) {
+	tests := []struct {
+		disabled string
+		want     IngressPostProcessingMode
+	}{
+		{disabled: "", want: IngressPostProcessingModeShadowExternalDNS},
+		{disabled: IngressDisabledReasonExternalDNS, want: IngressPostProcessingModeDisableExternalDNS},
+		{disabled: IngressDisabledReasonNormal, want: IngressPostProcessingModeDisable},
+	}
+	r := &IngressReconciler{IngressPostProcessingMode: IngressPostProcessingModeShadowExternalDNS}
+
+	for _, tt := range tests {
+		t.Run(tt.disabled, func(t *testing.T) {
+			ingress := &networkingv1.Ingress{}
+			if tt.disabled != "" {
+				ingress.Annotations = map[string]string{IngressDisabledAnnotation: tt.disabled}
+			}
+			if got := r.resolveIngressPostProcessingMode(ingress); got != tt.want {
+				t.Errorf("resolveIngressPostProcessingMode() = %q, want %q", got, tt.want)
 			}
 		})
 	}
