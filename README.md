@@ -173,7 +173,7 @@ spec:
     spec:
       containers:
       - name: webhook
-        image: fiksn/ingress-doperator-webhook:v0.0.6
+        image: fiksn/ingress-doperator-webhook:v0.0.7
         imagePullPolicy: Always
         command:
           - /webhook
@@ -988,7 +988,7 @@ The operator:
 **Build and push your image to the location specified by `IMG`:**
 
 ```sh
-make docker-build docker-push IMG=fiksn/ingress-doperator:v0.0.6
+make docker-build docker-push IMG=fiksn/ingress-doperator:v0.0.7
 ```
 
 **NOTE:** This image ought to be published in the personal registry you specified.
@@ -1047,7 +1047,7 @@ Following the options to release and provide this solution to the users.
 1. Build the installer for the image built and published in the registry:
 
 ```sh
-make build-installer IMG=fiksn/ingress-doperator:v0.0.6
+make build-installer IMG=fiksn/ingress-doperator:v0.0.7
 ```
 
 **NOTE:** The makefile target mentioned above generates an 'install.yaml'
