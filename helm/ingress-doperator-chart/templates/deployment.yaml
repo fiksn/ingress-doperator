@@ -46,6 +46,15 @@ spec:
             {{- with .Values.operator.oneGatewayPerIngress }}
             - {{ printf "--one-gateway-per-ingress=%v" . | quote }}
             {{- end }}
+            {{- with .Values.operator.wildcardListeners }}
+            - {{ printf "--wildcard-listeners=%s" . | quote }}
+            {{- end }}
+            {{- if .Values.operator.httpRedirect }}
+            - --http-redirect=true
+            {{- end }}
+            {{- if .Values.operator.gatewaySharding }}
+            - --gateway-sharding=true
+            {{- end }}
             {{- if .Values.operator.enableDeletion }}
             - --enable-deletion=true
             {{- end }}

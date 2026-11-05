@@ -174,7 +174,7 @@ spec:
     spec:
       containers:
       - name: webhook
-        image: fiksn/ingress-doperator-webhook:v0.0.7
+        image: fiksn/ingress-doperator-webhook:v0.1.0
         imagePullPolicy: Always
         command:
           - /webhook
@@ -620,6 +620,14 @@ The operator accepts the following command-line flags:
                                               get a dedicated Gateway named <namespace>-<name>-<hash>.
                                               Without a value (or =true) all Ingresses match ('*/*').
                                               (default: "" - all Ingresses use shared Gateways)
+--gateway-sharding                            Spill shared Gateways over to <name>-2, <name>-3, ... when they
+                                              reach the 64-listener limit (default: false)
+--http-redirect                               Add a catch-all port 80 listener redirecting HTTP to HTTPS; hosts
+                                              served over plain HTTP by ingress-nginx are served on it
+                                              (default: false)
+--wildcard-listeners string                   Comma-separated '*.<domain>=<namespace>/<secret>' entries; hostnames
+                                              one label below <domain> share one listener with that certificate
+                                              (default: "")
 --enable-deletion                             Delete HTTPRoute (and empty managed Gateways) when Ingress is deleted
                                               (default: false)
 --hostname-rewrite-from string                Domain suffix to match for rewriting (e.g., 'domain.cc')
@@ -717,6 +725,92 @@ Gateway, its HTTPRoute is re-parented and the listeners it used are removed from
 previous Gateway. A managed Gateway left without any listeners is deleted. The Gateway an
 HTTPRoute's listeners live on is tracked in the
 `ingress-doperator.fiction.si/listener-gateway` annotation.
+
+### Listener Limit and Gateway Sharding
+
+Gateway API allows at most 64 listeners per Gateway, and the operator creates one listener per
+hostname. When a Gateway is full, the operator adds the listeners that fit and records a
+`GatewayListenerLimit` warning event on the Ingress listing the hostnames left without a
+listener.
+
+With `--gateway-sharding`, shared Gateways spill over instead:
+
+```bash
+./bin/operator --gateway-sharding
+```
+
+**Behaviour:**
+- Shards of the shared Gateway `<name>` are named `<name>-2`, `<name>-3`, ...
+- All hostnames of an Ingress go to one shard. A hostname already served by a shard (from
+  another Ingress) keeps the Ingress on that shard.
+- An HTTPRoute whose shard already has listeners for its hostnames stays on that shard, so
+  hostnames keep their Gateway and address. New hostnames that do not fit there get the
+  `GatewayListenerLimit` warning instead of moving the route.
+- A route without listeners yet goes to the first shard with room, or a new one.
+- Each shard is a separate Gateway with its own load balancer and address. An HTTPRoute that
+  moves to another shard changes the address its hostnames resolve to.
+- Gateways named like a shard but not managed by ingress-doperator are skipped.
+- Dedicated Gateways (`--one-gateway-per-ingress`) are not sharded.
+
+### Wildcard Listeners
+
+By default every hostname gets its own listener. Use `--wildcard-listeners` to serve all
+hostnames under a domain from one listener with a wildcard certificate:
+
+```bash
+./bin/operator --wildcard-listeners='*.review.example.com=nginx-gateway/review-wildcard-tls'
+```
+
+**Behaviour:**
+- Hostnames exactly one label below the domain (`foo.review.example.com`) share a listener
+  with hostname `*.review.example.com`, named `wildcard-review-example-com` (listener names
+  cannot contain `*`). Deeper hostnames (`a.b.review.example.com`) are not covered by a
+  wildcard certificate and keep their own listener.
+- The listener serves the configured Secret; the `tls` section of the matching Ingresses is
+  not used for these hostnames. The operator only references the Secret, so it can be issued
+  by cert-manager or managed in any other way.
+- A Secret outside `--gateway-namespace` gets the `ingress-doperator-gateway-secrets`
+  ReferenceGrant in its namespace, which is removed when no Gateway has the listener anymore.
+- The listener allows routes from all namespaces of the matching HTTPRoutes. HTTPRoutes keep
+  their exact hostnames and point their `sectionName` at the wildcard listener.
+- Existing per-hostname listeners for matching hostnames are replaced by the wildcard listener
+  on the next reconcile; the Gateway and its address stay the same.
+- Several wildcards can be given, separated by commas.
+
+### HTTP and Redirect to HTTPS
+
+By default the operator only creates HTTPS listeners on port 443. Use `--http-redirect` to also
+serve port 80:
+
+```bash
+./bin/operator --http-redirect
+```
+
+**Behaviour:**
+- Every managed Gateway (shards included) gets one listener `http` on port 80 without a hostname,
+  and an HTTPRoute `<gateway>-https-redirect` in the Gateway namespace that redirects every
+  request on it to HTTPS (301). The route is owned by the Gateway, names no hostnames and is set
+  to `gateway-hostname-source: annotation-only`, so external-dns ignores it.
+- The `http` listener is one listener per Gateway, whatever the number of hostnames; it is added
+  before new hostname listeners, so it is never the one left out at the 64-listener limit.
+- Hostnames follow ingress-nginx:
+
+  | Ingress | Served |
+  |---|---|
+  | host with TLS | HTTPS; HTTP redirects |
+  | host with TLS, `nginx.ingress.kubernetes.io/ssl-redirect: "false"` | HTTPS and plain HTTP |
+  | host without TLS | plain HTTP only (no HTTPS listener) |
+  | host without TLS, `nginx.ingress.kubernetes.io/force-ssl-redirect: "true"` | HTTPS; HTTP redirects |
+
+  A host covered by `--wildcard-listeners` counts as having TLS. Hostnames served over plain HTTP
+  go into a second HTTPRoute `<ingress>-http` attached to the `http` listener; a route with a
+  hostname takes precedence over the redirect route, which has none. The `http` listener only
+  allows the Gateway namespace and the namespaces of those routes.
+- A Gateway left with only the `http` listener and no HTTPRoutes is deleted.
+- An existing listener named `http` of another shape, or an HTTPRoute `<gateway>-https-redirect`
+  the operator did not create, is left alone.
+- Turning `--http-redirect` off again leaves the `http` listener and redirect routes in place;
+  remove them manually.
 
 ### Adding Your Own Listeners (TCPRoute, UDPRoute, ...)
 
@@ -1010,11 +1104,31 @@ The operator:
 - kubectl version v1.11.3+.
 - Access to a Kubernetes v1.11.3+ cluster.
 
+### Releasing
+
+```sh
+make release VERSION=v0.0.8
+```
+
+This:
+1. Sets the version everywhere it is pinned (`hack/bump-version.sh`): `IMG` in the Makefile,
+   the Helm chart (`version: 0.0.8` without the `v`, as Helm requires SemVer, and
+   `appVersion`/`image.tag: v0.0.8`), `config/manager/kustomization.yaml`, the e2e test image and
+   the README. If any of them is not at the current version, nothing is changed.
+2. Builds and pushes `fiksn/ingress-doperator:v0.1.0` and `fiksn/ingress-doperator-webhook:v0.1.0`
+   for `PLATFORMS` with `docker buildx`, with the version stamped into the binaries.
+3. Packages the chart and pushes it to `HELM_REPO` (default `oci://registry-1.docker.io/fiksn`),
+   installable with
+   `helm install ingress-doperator oci://registry-1.docker.io/fiksn/ingress-doperator-chart --version 0.0.8`.
+
+Log in first (`docker login`, `helm registry login registry-1.docker.io`). The version bump is
+left uncommitted; commit and tag it yourself.
+
 ### To Deploy on the cluster
 **Build and push your image to the location specified by `IMG`:**
 
 ```sh
-make docker-build docker-push IMG=fiksn/ingress-doperator:v0.0.7
+make docker-build docker-push IMG=fiksn/ingress-doperator:v0.1.0
 ```
 
 **NOTE:** This image ought to be published in the personal registry you specified.
@@ -1073,7 +1187,7 @@ Following the options to release and provide this solution to the users.
 1. Build the installer for the image built and published in the registry:
 
 ```sh
-make build-installer IMG=fiksn/ingress-doperator:v0.0.7
+make build-installer IMG=fiksn/ingress-doperator:v0.1.0
 ```
 
 **NOTE:** The makefile target mentioned above generates an 'install.yaml'

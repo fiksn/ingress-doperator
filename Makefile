@@ -1,5 +1,7 @@
 # Image URL to use all building/pushing image targets
-IMG ?= fiksn/ingress-doperator:v0.0.7
+IMG ?= fiksn/ingress-doperator:v0.1.0
+IMAGE_REPO = $(firstword $(subst :, ,$(IMG)))
+WEBHOOK_IMG = $(IMAGE_REPO)-webhook:$(lastword $(subst :, ,$(IMG)))
 
 # Get the currently used golang install path (in GOPATH/bin, unless GOBIN is set)
 ifeq (,$(shell go env GOBIN))
@@ -115,9 +117,12 @@ lint-config: golangci-lint ## Verify golangci-lint linter configuration
 
 ##@ Build
 
+VERSION ?= $(shell git describe --tags --always --dirty 2>/dev/null || echo unknown)
+LDFLAGS := -X main.version=$(VERSION)
+
 .PHONY: build
 build: manifests generate fmt vet ## Build operator binary.
-	go build -o bin/operator cmd/operator/main.go
+	go build -ldflags "$(LDFLAGS)" -o bin/operator ./cmd/operator
 
 .PHONY: build-webhook
 build-webhook: ## Build webhook binary.
@@ -125,18 +130,18 @@ build-webhook: ## Build webhook binary.
 
 .PHONY: run
 run: manifests generate fmt vet ## Run a controller from your host.
-	go run ./cmd/operator/main.go
+	go run -ldflags "$(LDFLAGS)" ./cmd/operator
 
 # If you wish to build the manager image targeting other platforms you can use the --platform flag.
 # (i.e. docker build --platform linux/arm64). However, you must enable docker buildKit for it.
 # More info: https://docs.docker.com/develop/develop-images/build_enhancements/
 .PHONY: docker-build
 docker-build: ## Build docker image with the operator.
-	$(CONTAINER_TOOL) build -t ${IMG} .
+	$(CONTAINER_TOOL) build --build-arg VERSION=$(VERSION) -t ${IMG} .
 
 .PHONY: docker-build-webhook
 docker-build-webhook: ## Build docker image with the webhook.
-	$(CONTAINER_TOOL) build -f Dockerfile.webhook -t ${IMG}-webhook .
+	$(CONTAINER_TOOL) build -f Dockerfile.webhook -t ${WEBHOOK_IMG} .
 
 .PHONY: docker-push
 docker-push: ## Push docker image with the operator.
@@ -144,7 +149,7 @@ docker-push: ## Push docker image with the operator.
 
 .PHONY: docker-push-webhook
 docker-push-webhook: ## Push docker image with the webhook.
-	$(CONTAINER_TOOL) push ${IMG}-webhook
+	$(CONTAINER_TOOL) push ${WEBHOOK_IMG}
 
 # PLATFORMS defines the target platforms for the operator image be built to provide support to multiple
 # architectures. (i.e. make docker-buildx IMG=myregistry/mypoperator:0.0.1). To use this option you need to:
@@ -152,22 +157,52 @@ docker-push-webhook: ## Push docker image with the webhook.
 # - have enabled BuildKit. More info: https://docs.docker.com/develop/develop-images/build_enhancements/
 # - be able to push the image to your registry (i.e. if you do not set a valid value via IMG=<myregistry/image:<tag>> then the export will fail)
 # To adequately provide solutions that are compatible with multiple platforms, you should consider using this option.
-PLATFORMS ?= linux/arm64,linux/amd64,linux/s390x,linux/ppc64le
-.PHONY: docker-buildx
-docker-buildx: ## Build and push docker image for the operator for cross-platform support
-	# copy existing Dockerfile and insert --platform=${BUILDPLATFORM} into Dockerfile.cross, and preserve the original Dockerfile
-	sed -e '1 s/\(^FROM\)/FROM --platform=\$$\{BUILDPLATFORM\}/; t' -e ' 1,// s//FROM --platform=\$$\{BUILDPLATFORM\}/' Dockerfile > Dockerfile.cross
+PLATFORMS ?= linux/amd64,linux/arm64
+# buildx-push builds Dockerfile $(1) for PLATFORMS and pushes it as image $(2). It copies the
+# Dockerfile to Dockerfile.cross with --platform=${BUILDPLATFORM} inserted into the FROM lines; a
+# failed build removes the temporary builder and file and fails the target.
+define buildx-push
+	sed -e '1 s/\(^FROM\)/FROM --platform=\$$\{BUILDPLATFORM\}/; t' -e ' 1,// s//FROM --platform=\$$\{BUILDPLATFORM\}/' $(1) > Dockerfile.cross
 	- $(CONTAINER_TOOL) buildx create --name ingress-doperator-builder
 	$(CONTAINER_TOOL) buildx use ingress-doperator-builder
-	- $(CONTAINER_TOOL) buildx build --push --platform=$(PLATFORMS) --tag ${IMG} -f Dockerfile.cross .
+	$(CONTAINER_TOOL) buildx build --push --platform=$(PLATFORMS) --build-arg VERSION=$(VERSION) --tag $(2) -f Dockerfile.cross . \
+		|| { $(CONTAINER_TOOL) buildx rm ingress-doperator-builder; rm Dockerfile.cross; exit 1; }
 	- $(CONTAINER_TOOL) buildx rm ingress-doperator-builder
 	rm Dockerfile.cross
+endef
+
+.PHONY: docker-buildx
+docker-buildx: ## Build and push docker image for the operator for cross-platform support
+	$(call buildx-push,Dockerfile,${IMG})
+
+.PHONY: docker-buildx-webhook
+docker-buildx-webhook: ## Build and push docker image for the webhook for cross-platform support
+	$(call buildx-push,Dockerfile.webhook,${WEBHOOK_IMG})
 
 .PHONY: build-installer
 build-installer: manifests generate kustomize ## Generate a consolidated YAML with CRDs and deployment.
 	mkdir -p dist
 	cd config/manager && "$(KUSTOMIZE)" edit set image controller=${IMG}
 	"$(KUSTOMIZE)" build config/default > dist/install.yaml
+
+##@ Release
+
+HELM_REPO ?= oci://registry-1.docker.io/fiksn
+CHART_DIR := helm/ingress-doperator-chart
+
+.PHONY: release
+release: ## Release VERSION=vX.Y.Z: bump pinned versions, push both images (buildx) and the Helm chart.
+	@case "$(origin VERSION)" in "command line"|environment) ;; \
+		*) echo "VERSION is required: make release VERSION=vX.Y.Z" >&2; exit 1 ;; esac
+	hack/bump-version.sh $(VERSION)
+	$(MAKE) docker-buildx docker-buildx-webhook IMG=$(IMAGE_REPO):$(VERSION)
+	$(MAKE) helm-push
+
+.PHONY: helm-push
+helm-push: ## Package the Helm chart and push it to HELM_REPO.
+	mkdir -p dist
+	helm package $(CHART_DIR) --destination dist
+	helm push dist/ingress-doperator-chart-$$(sed -n 's/^version: *//p' $(CHART_DIR)/Chart.yaml).tgz $(HELM_REPO)
 
 ##@ Deployment
 

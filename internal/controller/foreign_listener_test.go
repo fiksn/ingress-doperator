@@ -122,7 +122,7 @@ func TestUpdateGatewayListeners_DoesNotTouchForeignListenerForHostname(t *testin
 	ingress := &networkingv1.Ingress{ObjectMeta: metav1.ObjectMeta{Namespace: "app", Name: "api"}}
 	r := &HTTPRouteReconciler{}
 
-	if r.updateGatewayListeners(context.Background(), gw, route, ingress) {
+	if updated, _ := r.updateGatewayListeners(context.Background(), gw, route, ingress); updated {
 		t.Error("no change expected when a foreign listener serves the hostname")
 	}
 	if len(gw.Spec.Listeners) != 1 || gw.Spec.Listeners[0].AllowedRoutes != nil {

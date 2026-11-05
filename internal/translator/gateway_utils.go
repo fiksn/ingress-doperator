@@ -23,13 +23,23 @@ import (
 	gatewayv1 "sigs.k8s.io/gateway-api/apis/v1"
 )
 
+// ListenerNameForHostname returns the name ingress-doperator gives the listener for hostname: the
+// hostname itself, or wildcard-<domain with dots replaced by dashes> for a wildcard hostname
+// (*.<domain>), because listener names cannot contain '*'.
+func ListenerNameForHostname(hostname string) string {
+	if domain, ok := strings.CutPrefix(hostname, "*."); ok {
+		return "wildcard-" + strings.ReplaceAll(domain, ".", "-")
+	}
+	return hostname
+}
+
 // IsOperatorListener reports whether a Gateway listener was created by ingress-doperator, which
-// only creates HTTPS listeners named after their hostname. Any other listener, such as a TCP
-// listener added for a TCPRoute, belongs to someone else and must be left untouched.
+// only creates HTTPS listeners named by ListenerNameForHostname. Any other listener, such as a
+// TCP listener added for a TCPRoute, belongs to someone else and must be left untouched.
 func IsOperatorListener(listener gatewayv1.Listener) bool {
 	return listener.Protocol == gatewayv1.HTTPSProtocolType &&
 		listener.Hostname != nil &&
-		string(listener.Name) == string(*listener.Hostname)
+		string(listener.Name) == ListenerNameForHostname(string(*listener.Hostname))
 }
 
 // MergeGatewaySpec merges the desired Gateway spec into the existing Gateway

@@ -101,6 +101,9 @@ The following table lists the configurable parameters of the ingress-doperator c
 | `operator.ingressClassIgnoreFilter` | Comma-separated glob patterns for ingress classes to ignore | `""` |
 | `operator.ingressClassEmpty` | Value used when an Ingress has no class set | `"none"` |
 | `operator.oneGatewayPerIngress` | Comma-separated `namespace/name` globs of Ingresses that get a dedicated Gateway (`true` = all) | `""` |
+| `operator.wildcardListeners` | Comma-separated `*.<domain>=<namespace>/<secret>` entries; matching hostnames share one wildcard listener | `""` |
+| `operator.httpRedirect` | Add a port 80 listener redirecting HTTP to HTTPS; HTTP-only hosts are served on it | `false` |
+| `operator.gatewaySharding` | Spill shared Gateways over to `<name>-2`, `<name>-3`, ... at the 64-listener limit | `false` |
 | `operator.enableDeletion` | Delete resources when Ingress is deleted | `false` |
 | `operator.hostnameRewriteFrom` | Comma-separated domain suffixes to match | `""` |
 | `operator.hostnameRewriteTo` | Comma-separated replacement domain suffixes | `""` |

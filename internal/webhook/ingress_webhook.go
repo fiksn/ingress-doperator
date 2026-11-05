@@ -160,7 +160,7 @@ func (m *IngressMutator) Handle(ctx context.Context, req admission.Request) admi
 	m.applyIngressNameSnippetsFilters(ctx, ingress, httpRoutes)
 	m.applyIngressAnnotationSnippetsOverrides(ctx, ingress, httpRoutes)
 	m.applyIngressAnnotationSnippetsFilter(ctx, ingress, httpRoutes)
-	if err := m.HTTPRouteManager.ApplyHTTPRoutesAtomic(ctx, ingress, httpRoutes, metricRecorder); err != nil {
+	if err := m.HTTPRouteManager.ApplyHTTPRoutes(ctx, ingress, httpRoutes, metricRecorder); err != nil {
 		logger.Error(err, "failed to apply HTTPRoutes")
 		m.recordWarning(ingress, "HTTPRouteApplyFailed", "failed to apply HTTPRoutes")
 		// Don't fail the admission, just log

@@ -63,6 +63,10 @@ type HTTPRouteReconciler struct {
 	InfrastructureAnnotationsByClass []translator.IngressClassAnnotationsRule
 	// IngressClassEmpty is the class assumed for Ingresses without one (--ingress-class-empty)
 	IngressClassEmpty string
+	// WildcardListeners group hostnames into one wildcard listener each (--wildcard-listeners)
+	WildcardListeners []WildcardListener
+	// HTTPRedirect adds a catch-all port 80 listener redirecting to HTTPS (--http-redirect)
+	HTTPRedirect bool
 
 	// Debouncing state
 	gatewayUpdateDebouncer *gatewayUpdateDebouncer
@@ -289,7 +293,7 @@ func (r *HTTPRouteReconciler) handleHTTPRouteCreateOrUpdate(ctx context.Context,
 	}
 
 	// Merge this HTTPRoute into existing Gateway listeners (no removals here)
-	updated := r.updateGatewayListeners(ctx, gateway, httpRoute, ingress)
+	updated, _ := r.updateGatewayListeners(ctx, gateway, httpRoute, ingress)
 	if r.applyConfiguredGatewayAnnotations(gateway, ingress) {
 		updated = true
 	}
@@ -312,6 +316,9 @@ func (r *HTTPRouteReconciler) handleHTTPRouteCreateOrUpdate(ctx context.Context,
 			return ctrl.Result{}, err
 		}
 		metrics.GatewayResourcesTotal.WithLabelValues("create", gateway.Namespace, gateway.Name).Inc()
+		if err := r.syncGatewayCompanions(ctx, gateway); err != nil {
+			logger.Error(err, "failed to sync ReferenceGrants and redirect HTTPRoute of Gateway")
+		}
 
 		// Gateway created successfully - now safe to disable external-dns on source Ingress
 		if r.IngressPostProcessingMode == IngressPostProcessingModeDisableExternalDNS {
@@ -393,7 +400,7 @@ func (r *HTTPRouteReconciler) handleGatewayWithoutListeners(
 		return false, client.IgnoreNotFound(err)
 	}
 	metrics.GatewayResourcesTotal.WithLabelValues("delete", gateway.Namespace, gateway.Name).Inc()
-	return true, nil
+	return true, r.syncWildcardReferenceGrants(ctx, gateway)
 }
 
 // handleHTTPRouteDelete removes listeners/namespaces from Gateway when HTTPRoute is deleted
@@ -492,9 +499,19 @@ func (r *HTTPRouteReconciler) reconcileGatewayListeners(
 		// Update Gateway listeners to match desired state (incremental updates)
 		desiredTLS, certMismatches, tlsUnknown := r.buildDesiredListenerTLS(ctx, desiredState, routes)
 
-		updated := r.reconcileListenersToDesiredState(gateway, desiredState, desiredTLS, tlsUnknown, logger)
+		updated := r.removeStaleListeners(gateway, desiredState, logger)
+		// The HTTP listener goes before new hostname listeners, so it is not the one left out at the limit.
+		if r.ensureHTTPListener(gateway, r.httpListenerNamespaces(routes), logger) {
+			updated = true
+		}
+		if r.applyDesiredListeners(gateway, desiredState, desiredTLS, tlsUnknown, logger) {
+			updated = true
+		}
 		if r.applyConfiguredGatewayAnnotations(gateway, r.firstSourceIngress(ctx, routes)) {
 			updated = true
+		}
+		if len(routes) == 0 && onlyHTTPListener(gateway) {
+			return r.handleGatewayWithoutListeners(ctx, gateway, 0)
 		}
 		if len(gateway.Spec.Listeners) == 0 {
 			return r.handleGatewayWithoutListeners(ctx, gateway, len(routes))
@@ -531,6 +548,9 @@ func (r *HTTPRouteReconciler) reconcileGatewayListeners(
 			}
 			logger.Info("Reconciled Gateway listeners", "gateway", gatewayNN, "listenerCount", len(gateway.Spec.Listeners))
 		}
+		if err := r.syncGatewayCompanions(ctx, gateway); err != nil {
+			return updated, err
+		}
 
 		return updated, nil
 	}
@@ -544,7 +564,10 @@ func (r *HTTPRouteReconciler) calculateDesiredListenerState(routes []gatewayv1.H
 	state := make(map[string]map[string]bool)
 
 	for _, route := range routes {
-		for _, hostname := range route.Spec.Hostnames {
+		if attachesToHTTPListener(&route) {
+			continue
+		}
+		for _, hostname := range listenerHostnames(r.WildcardListeners, route.Spec.Hostnames) {
 			hostnameStr := string(hostname)
 			if _, exists := state[hostnameStr]; !exists {
 				state[hostnameStr] = make(map[string]bool)
@@ -556,18 +579,14 @@ func (r *HTTPRouteReconciler) calculateDesiredListenerState(routes []gatewayv1.H
 	return state
 }
 
-// reconcileListenersToDesiredState incrementally updates Gateway listeners
-// Returns true if Gateway was modified
-func (r *HTTPRouteReconciler) reconcileListenersToDesiredState(
+// removeStaleListeners removes our hostname listeners no route needs anymore; listeners added by
+// others are kept as is. Returns true if the Gateway was modified.
+func (r *HTTPRouteReconciler) removeStaleListeners(
 	gateway *gatewayv1.Gateway,
 	desiredState map[string]map[string]bool,
-	desiredTLS map[string]*gatewayv1.ListenerTLSConfig,
-	tlsUnknown map[string]bool,
 	logger logr.Logger,
 ) bool {
 	updated := false
-
-	// Step 1: Remove our listeners that shouldn't exist; listeners added by others are kept as is
 	newListeners := make([]gatewayv1.Listener, 0, len(gateway.Spec.Listeners))
 	for _, listener := range gateway.Spec.Listeners {
 		if !translator.IsOperatorListener(listener) {
@@ -586,9 +605,27 @@ func (r *HTTPRouteReconciler) reconcileListenersToDesiredState(
 		}
 	}
 	gateway.Spec.Listeners = newListeners
+	return updated
+}
 
-	// Step 2: Update existing listeners and add new ones
-	for hostname, namespaces := range desiredState {
+// applyDesiredListeners updates our existing hostname listeners and adds missing ones. Hostnames
+// are sorted so that, at the listener limit, the same hostnames are left out on every reconcile.
+// Returns true if the Gateway was modified.
+func (r *HTTPRouteReconciler) applyDesiredListeners(
+	gateway *gatewayv1.Gateway,
+	desiredState map[string]map[string]bool,
+	desiredTLS map[string]*gatewayv1.ListenerTLSConfig,
+	tlsUnknown map[string]bool,
+	logger logr.Logger,
+) bool {
+	updated := false
+	hostnames := make([]string, 0, len(desiredState))
+	for hostname := range desiredState {
+		hostnames = append(hostnames, hostname)
+	}
+	sort.Strings(hostnames)
+	for _, hostname := range hostnames {
+		namespaces := desiredState[hostname]
 		listenerIdx, blocked := findListenerForHostname(gateway, hostname)
 		if blocked {
 			logger.Info("Hostname is served by a listener not managed by ingress-doperator, leaving it",
@@ -618,6 +655,10 @@ func (r *HTTPRouteReconciler) reconcileListenersToDesiredState(
 		} else {
 			// Add new listener only when TLS is known (safe)
 			if !tlsUnknown[hostname] {
+				if len(gateway.Spec.Listeners) >= MaxGatewayListeners {
+					logListenerLimit(logger, gateway, hostname)
+					continue
+				}
 				listener := r.createListenerWithNamespaces(hostname, namespaceList, desiredTLS[hostname])
 				gateway.Spec.Listeners = append(gateway.Spec.Listeners, listener)
 				logger.Info("Added new listener", "listener", listener.Name, "hostname", hostname, "namespaces", namespaceList)
@@ -629,24 +670,39 @@ func (r *HTTPRouteReconciler) reconcileListenersToDesiredState(
 	return updated
 }
 
-// updateGatewayListeners merges this HTTPRoute into existing Gateway listeners (no removals)
+// updateGatewayListeners merges this HTTPRoute into existing Gateway listeners (no removals).
+// Hostnames that need a new listener on a Gateway already at MaxGatewayListeners are left out and
+// returned as dropped.
 func (r *HTTPRouteReconciler) updateGatewayListeners(
 	ctx context.Context,
 	gateway *gatewayv1.Gateway,
 	httpRoute *gatewayv1.HTTPRoute,
 	ingress *networkingv1.Ingress,
-) bool {
+) (updated bool, dropped []string) {
 	logger := log.FromContext(ctx)
-	updated := false
 
 	if ingress == nil {
-		return false
+		return false, nil
+	}
+	if r.HTTPRedirect {
+		namespace := r.GatewayNamespace
+		if attachesToHTTPListener(httpRoute) {
+			namespace = httpRoute.Namespace
+		}
+		updated = r.addHTTPListenerNamespace(gateway, namespace, logger)
+	}
+	if attachesToHTTPListener(httpRoute) {
+		return updated, nil
 	}
 
 	desiredTLS, certMismatches := r.buildTLSForRouteFromIngress(httpRoute, ingress)
 
-	for _, hostname := range httpRoute.Spec.Hostnames {
+	for _, hostname := range listenerHostnames(r.WildcardListeners, httpRoute.Spec.Hostnames) {
 		hostnameStr := string(hostname)
+		tlsConfig := desiredTLS[hostnameStr]
+		if wildcard, ok := wildcardTLS(r.WildcardListeners, hostnameStr); ok {
+			tlsConfig = wildcard
+		}
 		listenerIdx, blocked := findListenerForHostname(gateway, hostnameStr)
 		if blocked {
 			logger.Info("Hostname is served by a listener not managed by ingress-doperator, leaving it",
@@ -659,12 +715,17 @@ func (r *HTTPRouteReconciler) updateGatewayListeners(
 				updated = true
 			}
 			// Only set TLS if listener doesn't have it yet
-			if gateway.Spec.Listeners[listenerIdx].TLS == nil && desiredTLS[hostnameStr] != nil {
-				gateway.Spec.Listeners[listenerIdx].TLS = desiredTLS[hostnameStr]
+			if gateway.Spec.Listeners[listenerIdx].TLS == nil && tlsConfig != nil {
+				gateway.Spec.Listeners[listenerIdx].TLS = tlsConfig
 				updated = true
 			}
 		} else {
-			listener := r.createListenerWithNamespaces(hostnameStr, []string{httpRoute.Namespace}, desiredTLS[hostnameStr])
+			if len(gateway.Spec.Listeners) >= MaxGatewayListeners {
+				logListenerLimit(logger, gateway, hostnameStr)
+				dropped = append(dropped, hostnameStr)
+				continue
+			}
+			listener := r.createListenerWithNamespaces(hostnameStr, []string{httpRoute.Namespace}, tlsConfig)
 			gateway.Spec.Listeners = append(gateway.Spec.Listeners, listener)
 			updated = true
 			logger.Info("Added new listener", "listener", listener.Name, "hostname", hostname)
@@ -684,7 +745,18 @@ func (r *HTTPRouteReconciler) updateGatewayListeners(
 		}
 	}
 
-	return updated
+	return updated, dropped
+}
+
+// MaxGatewayListeners is the Gateway API limit on spec.listeners (MaxItems=64); the API server
+// rejects a Gateway update with more.
+const MaxGatewayListeners = 64
+
+func logListenerLimit(logger logr.Logger, gateway *gatewayv1.Gateway, hostname string) {
+	logger.Info("Gateway is at the listener limit, not adding listener",
+		"gateway", gateway.Namespace+"/"+gateway.Name,
+		"hostname", hostname,
+		"limit", MaxGatewayListeners)
 }
 
 // findListenerByHostname finds a listener index by hostname, returns -1 if not found
@@ -701,7 +773,7 @@ func findListenerForHostname(gateway *gatewayv1.Gateway, hostname string) (idx i
 			}
 			continue
 		}
-		sameName := string(listener.Name) == hostname
+		sameName := string(listener.Name) == translator.ListenerNameForHostname(hostname)
 		sameSlot := listener.Protocol == gatewayv1.HTTPSProtocolType && listener.Port == 443 &&
 			listener.Hostname != nil && string(*listener.Hostname) == hostname
 		if sameName || sameSlot {
@@ -790,7 +862,7 @@ func (r *HTTPRouteReconciler) createListenerWithNamespaces(
 ) gatewayv1.Listener {
 	from := gatewayv1.NamespacesFromSelector
 	return gatewayv1.Listener{
-		Name:     gatewayv1.SectionName(hostname),
+		Name:     gatewayv1.SectionName(translator.ListenerNameForHostname(hostname)),
 		Hostname: (*gatewayv1.Hostname)(&hostname),
 		Port:     gatewayv1.PortNumber(443),
 		Protocol: gatewayv1.HTTPSProtocolType,
@@ -857,16 +929,20 @@ func (r *HTTPRouteReconciler) getGatewayNameFromHTTPRoute(httpRoute *gatewayv1.H
 // ensureReferenceGrant creates or updates a ReferenceGrant for the HTTPRoute's namespace
 // Tracks the HTTPRoute in the source annotation (no ownerReference to avoid premature deletion)
 func (r *HTTPRouteReconciler) ensureReferenceGrant(ctx context.Context, httpRoute *gatewayv1.HTTPRoute) error {
+	return r.ensureReferenceGrantSource(ctx, httpRoute.Namespace, fmt.Sprintf("%s/%s", httpRoute.Namespace, httpRoute.Name))
+}
+
+// ensureReferenceGrantSource makes sure the managed ReferenceGrant letting Gateways read Secrets in
+// namespace exists and lists sourceKey among the sources that need it.
+func (r *HTTPRouteReconciler) ensureReferenceGrantSource(ctx context.Context, namespace, sourceKey string) error {
 	logger := log.FromContext(ctx)
 
 	refGrantName := translator.ReferenceGrantName
 	refGrant := &gatewayv1beta1.ReferenceGrant{}
 	refGrantNN := types.NamespacedName{
-		Namespace: httpRoute.Namespace,
+		Namespace: namespace,
 		Name:      refGrantName,
 	}
-
-	httpRouteKey := fmt.Sprintf("%s/%s", httpRoute.Namespace, httpRoute.Name)
 
 	err := r.Get(ctx, refGrantNN, refGrant)
 	if err != nil {
@@ -878,10 +954,10 @@ func (r *HTTPRouteReconciler) ensureReferenceGrant(ctx context.Context, httpRout
 		newRefGrant := &gatewayv1beta1.ReferenceGrant{
 			ObjectMeta: metav1.ObjectMeta{
 				Name:      refGrantName,
-				Namespace: httpRoute.Namespace,
+				Namespace: namespace,
 				Annotations: map[string]string{
 					translator.ManagedByAnnotation: translator.ManagedByValue,
-					translator.SourceAnnotation:    httpRouteKey,
+					translator.SourceAnnotation:    sourceKey,
 				},
 			},
 			Spec: gatewayv1beta1.ReferenceGrantSpec{
@@ -901,11 +977,11 @@ func (r *HTTPRouteReconciler) ensureReferenceGrant(ctx context.Context, httpRout
 			},
 		}
 
-		logger.Info("Creating ReferenceGrant", "namespace", httpRoute.Namespace, "name", refGrantName, "source", httpRouteKey)
+		logger.Info("Creating ReferenceGrant", "namespace", namespace, "name", refGrantName, "source", sourceKey)
 		if err := r.Create(ctx, newRefGrant); err != nil {
 			if apierrors.IsAlreadyExists(err) {
 				// Race condition - retry to update it
-				return r.ensureReferenceGrant(ctx, httpRoute)
+				return r.ensureReferenceGrantSource(ctx, namespace, sourceKey)
 			}
 			return err
 		}
@@ -914,7 +990,7 @@ func (r *HTTPRouteReconciler) ensureReferenceGrant(ctx context.Context, httpRout
 
 	// Skip ReferenceGrant not managed by us
 	if refGrant.Annotations == nil || refGrant.Annotations[translator.ManagedByAnnotation] != translator.ManagedByValue {
-		logger.V(1).Info("ReferenceGrant not managed by us, skipping update", "namespace", httpRoute.Namespace, "name", refGrantName)
+		logger.V(1).Info("ReferenceGrant not managed by us, skipping update", "namespace", namespace, "name", refGrantName)
 		return nil
 	}
 
@@ -924,12 +1000,12 @@ func (r *HTTPRouteReconciler) ensureReferenceGrant(ctx context.Context, httpRout
 
 	// ReferenceGrant exists - add this HTTPRoute to sources if not present
 	sources := getSourcesFromAnnotation(refGrant.Annotations[translator.SourceAnnotation])
-	if !utils.ContainsString(sources, httpRouteKey) {
-		sources = append(sources, httpRouteKey)
+	if !utils.ContainsString(sources, sourceKey) {
+		sources = append(sources, sourceKey)
 		sort.Strings(sources)
 		refGrant.Annotations[translator.SourceAnnotation] = strings.Join(sources, ",")
 
-		logger.Info("Updating ReferenceGrant sources", "namespace", httpRoute.Namespace, "name", refGrantName, "addedSource", httpRouteKey)
+		logger.Info("Updating ReferenceGrant sources", "namespace", namespace, "name", refGrantName, "addedSource", sourceKey)
 		if err := r.Update(ctx, refGrant); err != nil {
 			return err
 		}
@@ -940,6 +1016,12 @@ func (r *HTTPRouteReconciler) ensureReferenceGrant(ctx context.Context, httpRout
 
 // cleanupReferenceGrant removes the HTTPRoute from ReferenceGrant sources and deletes if empty
 func (r *HTTPRouteReconciler) cleanupReferenceGrant(ctx context.Context, namespace, name string) error {
+	return r.removeReferenceGrantSource(ctx, namespace, fmt.Sprintf("%s/%s", namespace, name))
+}
+
+// removeReferenceGrantSource removes sourceKey from the sources of the managed ReferenceGrant in
+// namespace and deletes the ReferenceGrant once no source is left.
+func (r *HTTPRouteReconciler) removeReferenceGrantSource(ctx context.Context, namespace, sourceKey string) error {
 	logger := log.FromContext(ctx)
 
 	refGrantName := translator.ReferenceGrantName
@@ -969,11 +1051,9 @@ func (r *HTTPRouteReconciler) cleanupReferenceGrant(ctx context.Context, namespa
 		return nil
 	}
 
-	httpRouteKey := fmt.Sprintf("%s/%s", namespace, name)
-
-	// Remove this HTTPRoute from sources
+	// Remove this source
 	sources := getSourcesFromAnnotation(refGrant.Annotations[translator.SourceAnnotation])
-	newSources := utils.RemoveString(sources, httpRouteKey)
+	newSources := utils.RemoveString(sources, sourceKey)
 
 	if len(newSources) == 0 {
 		// No more HTTPRoutes use this ReferenceGrant - delete it
@@ -987,7 +1067,7 @@ func (r *HTTPRouteReconciler) cleanupReferenceGrant(ctx context.Context, namespa
 	if len(newSources) != len(sources) {
 		// Update sources annotation
 		refGrant.Annotations[translator.SourceAnnotation] = strings.Join(newSources, ",")
-		logger.Info("Updating ReferenceGrant sources", "namespace", namespace, "name", refGrantName, "removedSource", httpRouteKey)
+		logger.Info("Updating ReferenceGrant sources", "namespace", namespace, "name", refGrantName, "removedSource", sourceKey)
 		if err := r.Update(ctx, refGrant); err != nil {
 			return err
 		}
@@ -1033,7 +1113,7 @@ func (r *HTTPRouteReconciler) listHTTPRoutesForGateway(
 
 	routes := make([]gatewayv1.HTTPRoute, 0, len(allRoutes.Items))
 	for _, route := range allRoutes.Items {
-		if !route.DeletionTimestamp.IsZero() {
+		if !route.DeletionTimestamp.IsZero() || isHTTPSRedirectRoute(&route) {
 			continue
 		}
 		if excludeKey != "" && fmt.Sprintf("%s/%s", route.Namespace, route.Name) == excludeKey {
@@ -1123,6 +1203,10 @@ func (r *HTTPRouteReconciler) buildDesiredListenerTLS(
 	}
 
 	for hostname := range desiredState {
+		if tlsConfig, ok := wildcardTLS(r.WildcardListeners, hostname); ok {
+			desiredTLS[hostname] = tlsConfig
+			continue
+		}
 		candidate, ok := bestCandidates[hostname]
 		if !ok || tlsUnknown[hostname] {
 			desiredTLS[hostname] = nil

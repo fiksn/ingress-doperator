@@ -85,6 +85,7 @@ func main() {
 	}
 
 	ctrl.SetLogger(zap.New(zap.UseFlagOptions(&opts)))
+	setupLog.Info("Starting ingress-doperator operator", "version", buildVersion())
 
 	// if the enable-http2 flag is false (the default), http/2 should be disabled
 	// due to its vulnerabilities. More specifically, disabling http/2 will
@@ -181,6 +182,9 @@ func main() {
 		GatewayClassName:                 cfg.GatewayClassName,
 		WatchNamespaces:                  cfg.WatchNamespaces,
 		OneGatewayPerIngress:             cfg.OneGatewayPerIngressPatterns,
+		GatewaySharding:                  cfg.GatewaySharding,
+		WildcardListeners:                cfg.ParsedWildcardListeners,
+		HTTPRedirect:                     cfg.HTTPRedirect,
 		EnableDeletion:                   cfg.EnableDeletion,
 		HostnameRewriteFrom:              cfg.HostnameRewriteFrom,
 		HostnameRewriteTo:                cfg.HostnameRewriteTo,
@@ -229,6 +233,8 @@ func main() {
 		GatewayInfrastructureAnnotations: cfg.GatewayInfraAnnotationsMap,
 		InfrastructureAnnotationsByClass: cfg.InfrastructureAnnotationsByClass,
 		IngressClassEmpty:                cfg.IngressClassEmpty,
+		WildcardListeners:                cfg.ParsedWildcardListeners,
+		HTTPRedirect:                     cfg.HTTPRedirect,
 	}).SetupWithManager(mgr); err != nil {
 		setupLog.Error(err, "unable to create controller", "controller", "HTTPRoute")
 		os.Exit(1)
@@ -245,6 +251,16 @@ func main() {
 			"patterns", cfg.OneGatewayPerIngressPatterns, "sharedGatewayName", cfg.GatewayName)
 	} else {
 		setupLog.Info("Mode: Shared Gateway", "gatewayName", cfg.GatewayName)
+	}
+	for _, wildcard := range cfg.ParsedWildcardListeners {
+		setupLog.Info("Wildcard listener", "hostname", wildcard.Hostname,
+			"secret", wildcard.SecretNamespace+"/"+wildcard.SecretName)
+	}
+	if cfg.HTTPRedirect {
+		setupLog.Info("HTTP to HTTPS redirect enabled")
+	}
+	if cfg.GatewaySharding {
+		setupLog.Info("Gateway sharding enabled", "maxListenersPerGateway", controller.MaxGatewayListeners)
 	}
 
 	if cfg.EnableDeletion {
@@ -322,6 +338,9 @@ type operatorConfig struct {
 	GatewayClassName                string
 	WatchNamespace                  string
 	OneGatewayPerIngress            string
+	GatewaySharding                 bool
+	WildcardListeners               string
+	HTTPRedirect                    bool
 	GatewayAnnotationFilters        string
 	HTTPRouteAnnotationFilters      string
 	EnableDeletion                  bool
@@ -360,6 +379,7 @@ type operatorConfig struct {
 	IngressClassFilters              []string
 	IngressClassIgnoreFilters        []string
 	OneGatewayPerIngressPatterns     []string
+	ParsedWildcardListeners          []controller.WildcardListener
 }
 
 func parseOperatorConfig() (operatorConfig, zap.Options, error) {
@@ -369,6 +389,7 @@ func parseOperatorConfig() (operatorConfig, zap.Options, error) {
 	}
 
 	flag.CommandLine.SetOutput(os.Stderr)
+	flag.Usage = usage
 	flag.StringVar(&cfg.GatewayNamespace, "gateway-namespace", "nginx-fabric",
 		"The namespace where the Gateway resource will be created")
 	flag.StringVar(&cfg.GatewayName, "gateway-name", "ingress-gateway",
@@ -391,6 +412,16 @@ func parseOperatorConfig() (operatorConfig, zap.Options, error) {
 		"Comma-separated namespace/name glob patterns (e.g. 'prod/api-*,*/public-*'). Matching Ingresses get "+
 			"a dedicated Gateway named <namespace>-<name>-<hash>; the rest share a Gateway per ingress class. "+
 			"Passing the flag without a value (or 'true') selects all Ingresses ('*/*').")
+	flag.BoolVar(&cfg.GatewaySharding, "gateway-sharding", false,
+		"If true, a shared Gateway that reaches the Gateway API limit of 64 listeners spills over to "+
+			"Gateways named <name>-2, <name>-3, ... (each one gets its own load balancer)")
+	flag.StringVar(&cfg.WildcardListeners, "wildcard-listeners", "",
+		"Comma-separated '*.<domain>=<namespace>/<secret>' entries (e.g. "+
+			"'*.review.example.com=nginx-gateway/review-wildcard-tls'). Hostnames one label below <domain> "+
+			"share one listener serving that certificate. A Secret outside --gateway-namespace gets a ReferenceGrant.")
+	flag.BoolVar(&cfg.HTTPRedirect, "http-redirect", false,
+		"If true, every managed Gateway gets a port 80 listener redirecting HTTP to HTTPS; hostnames "+
+			"ingress-nginx serves over plain HTTP (no TLS, or ssl-redirect: \"false\") are served there instead")
 	flag.BoolVar(&cfg.EnableDeletion, "enable-deletion", false,
 		"If true, delete HTTPRoute when Ingress is deleted (a managed Gateway is deleted once no routes remain)")
 	flag.StringVar(&cfg.HostnameRewriteFrom, "hostname-rewrite-from", "",
@@ -510,6 +541,10 @@ func parseOperatorConfig() (operatorConfig, zap.Options, error) {
 	if err != nil {
 		return cfg, opts, fmt.Errorf("invalid watch-namespace value: %w", err)
 	}
+	cfg.ParsedWildcardListeners, err = controller.ParseWildcardListeners(cfg.WildcardListeners)
+	if err != nil {
+		return cfg, opts, fmt.Errorf("invalid wildcard-listeners value: %w", err)
+	}
 	cfg.OneGatewayPerIngressPatterns, err = controller.ParseOneGatewayPerIngress(cfg.OneGatewayPerIngress)
 	if err != nil {
 		return cfg, opts, fmt.Errorf("invalid one-gateway-per-ingress value: %w", err)
@@ -519,10 +554,15 @@ func parseOperatorConfig() (operatorConfig, zap.Options, error) {
 	}
 	controller.SetExternalDNSAnnotationPrefix(cfg.ExternalDNSAnnotationPrefix)
 	if cfg.IngressPostProcessingMode == controller.IngressPostProcessingModeDisableExternalDNS {
-		cfg.GatewayFilters = appendFilterIfMissing(cfg.GatewayFilters, controller.ExternalDNSIngressHostnameSource)
-		cfg.GatewayFilters = appendFilterIfMissing(cfg.GatewayFilters, controller.ExternalDNSHostnameAnnotation)
-		cfg.HTTPRouteFilters = appendFilterIfMissing(cfg.HTTPRouteFilters, controller.ExternalDNSIngressHostnameSource)
-		cfg.HTTPRouteFilters = appendFilterIfMissing(cfg.HTTPRouteFilters, controller.ExternalDNSHostnameAnnotation)
+		// Ingresses may carry either prefix, whichever one external-dns is configured with.
+		for _, prefix := range []string{
+			controller.DefaultExternalDNSAnnotationPrefix, controller.LegacyExternalDNSAnnotationPrefix,
+		} {
+			for _, key := range []string{prefix + "/ingress-hostname-source", prefix + "/hostname"} {
+				cfg.GatewayFilters = appendFilterIfMissing(cfg.GatewayFilters, key)
+				cfg.HTTPRouteFilters = appendFilterIfMissing(cfg.HTTPRouteFilters, key)
+			}
+		}
 	}
 	cfg.GatewayAnnotationsMap = parseKeyValueCSV(cfg.GatewayAnnotations)
 	cfg.GatewayInfraAnnotationsMap = parseKeyValueCSV(cfg.GatewayInfraAnnotations)

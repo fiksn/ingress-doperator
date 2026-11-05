@@ -109,10 +109,10 @@ func (m *HTTPRouteManager) SplitHTTPRouteIfNeeded(httpRoute *gatewayv1.HTTPRoute
 	return result
 }
 
-// ApplyHTTPRoutesAtomic handles applying HTTPRoutes with proper cleanup of obsolete split routes
-// If there's only one HTTPRoute before and after, it does an atomic update
-// If the count changed, it deletes all old HTTPRoutes first, then creates all new ones
-func (m *HTTPRouteManager) ApplyHTTPRoutesAtomic(
+// ApplyHTTPRoutes makes the Ingress's managed HTTPRoutes match desiredRoutes: managed routes that
+// are no longer desired (e.g. split parts or an HTTP route that is not needed anymore) are deleted,
+// then every desired route is created or updated in place, so unchanged routes are never recreated.
+func (m *HTTPRouteManager) ApplyHTTPRoutes(
 	ctx context.Context,
 	ingress *networkingv1.Ingress,
 	desiredRoutes []*gatewayv1.HTTPRoute,
@@ -120,62 +120,35 @@ func (m *HTTPRouteManager) ApplyHTTPRoutesAtomic(
 ) error {
 	logger := log.FromContext(ctx)
 
-	// Get existing HTTPRoutes for this Ingress
 	existingRoutes, err := m.GetHTTPRoutesWithPrefix(ctx, ingress.Namespace, ingress.Name)
 	if err != nil {
 		return fmt.Errorf("failed to get existing HTTPRoutes: %w", err)
 	}
 
-	existingCount := len(existingRoutes)
-	desiredCount := len(desiredRoutes)
-
-	logger.V(3).Info("HTTPRoute reconciliation",
-		"ingress", ingress.Name,
-		"existingCount", existingCount,
-		"desiredCount", desiredCount)
-
-	// Case 1: Single HTTPRoute before and after - atomic update
-	if existingCount == 1 && desiredCount == 1 {
-		logger.V(3).Info("Single HTTPRoute case - performing atomic update")
-		return m.applyHTTPRoute(ctx, desiredRoutes[0], metricRecorder)
+	desiredNames := make(map[string]bool, len(desiredRoutes))
+	for _, route := range desiredRoutes {
+		desiredNames[route.Name] = true
 	}
-
-	// Case 2: Count changed - delete all old, create all new
-	logger.Info("HTTPRoute count changed - performing atomic replacement",
-		"ingress", ingress.Name,
-		"from", existingCount,
-		"to", desiredCount)
-
-	// First, delete all existing HTTPRoutes that we manage for this ingress
-	for _, existingRoute := range existingRoutes {
-		if IsManagedByUsForIngress(&existingRoute, ingress.Namespace, ingress.Name) {
-			logger.Info("Deleting obsolete HTTPRoute",
-				"namespace", existingRoute.Namespace,
-				"name", existingRoute.Name)
-			if err := m.Client.Delete(ctx, &existingRoute); err != nil && !apierrors.IsNotFound(err) {
-				return fmt.Errorf("failed to delete obsolete HTTPRoute %s: %w", existingRoute.Name, err)
-			}
-			if metricRecorder != nil {
-				metricRecorder("delete", existingRoute.Namespace, existingRoute.Name)
-			}
-		} else {
-			logger.Info("Skipping deletion of HTTPRoute - not managed by us for this Ingress",
-				"namespace", existingRoute.Namespace,
-				"name", existingRoute.Name)
+	for i := range existingRoutes {
+		existingRoute := &existingRoutes[i]
+		if desiredNames[existingRoute.Name] {
+			continue
+		}
+		logger.Info("Deleting obsolete HTTPRoute", "namespace", existingRoute.Namespace, "name", existingRoute.Name)
+		if err := m.Client.Delete(ctx, existingRoute); err != nil && !apierrors.IsNotFound(err) {
+			return fmt.Errorf("failed to delete obsolete HTTPRoute %s/%s: %w",
+				existingRoute.Namespace, existingRoute.Name, err)
+		}
+		if metricRecorder != nil {
+			metricRecorder("delete", existingRoute.Namespace, existingRoute.Name)
 		}
 	}
 
-	// Then, create all new HTTPRoutes
 	for _, desiredRoute := range desiredRoutes {
 		if err := m.applyHTTPRoute(ctx, desiredRoute, metricRecorder); err != nil {
 			return fmt.Errorf("failed to apply HTTPRoute %s: %w", desiredRoute.Name, err)
 		}
 	}
-
-	logger.Info("HTTPRoute atomic replacement completed successfully",
-		"ingress", ingress.Name,
-		"routesCreated", desiredCount)
-
 	return nil
 }
 

@@ -20,6 +20,7 @@ import (
 	"context"
 	"testing"
 
+	networkingv1 "k8s.io/api/networking/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
@@ -76,5 +77,55 @@ func TestApplyHTTPRoute_KeepsListenerGatewayAnnotation(t *testing.T) {
 				t.Error("applyHTTPRoute must not mutate the desired route's annotations")
 			}
 		})
+	}
+}
+
+func sourcedRoute(name string) *gatewayv1.HTTPRoute {
+	route := managedRoute(map[string]string{SourceAnnotation: "app/api"})
+	route.Name = name
+	return route
+}
+
+func TestApplyHTTPRoutes_UpdatesInPlaceAndDeletesObsolete(t *testing.T) {
+	scheme := runtime.NewScheme()
+	if err := gatewayv1.Install(scheme); err != nil {
+		t.Fatalf("failed to add gatewayv1 to scheme: %v", err)
+	}
+	foreign := managedRoute(map[string]string{SourceAnnotation: "app/other"})
+	foreign.Name = "api-other"
+	existing := sourcedRoute("api")
+	existing.UID = "existing-api"
+	c := fake.NewClientBuilder().WithScheme(scheme).
+		WithObjects(existing, sourcedRoute("api-2"), foreign).Build()
+	m := &HTTPRouteManager{Client: c}
+	ctx := context.Background()
+
+	before := &gatewayv1.HTTPRoute{}
+	if err := c.Get(ctx, types.NamespacedName{Namespace: "app", Name: "api"}, before); err != nil {
+		t.Fatalf("failed to get route: %v", err)
+	}
+	ingress := &networkingv1.Ingress{ObjectMeta: metav1.ObjectMeta{Namespace: "app", Name: "api"}}
+	desired := []*gatewayv1.HTTPRoute{sourcedRoute("api"), sourcedRoute("api-http")}
+
+	if err := m.ApplyHTTPRoutes(ctx, ingress, desired, nil); err != nil {
+		t.Fatalf("ApplyHTTPRoutes() error: %v", err)
+	}
+
+	exists := func(name string) (*gatewayv1.HTTPRoute, bool) {
+		route := &gatewayv1.HTTPRoute{}
+		err := c.Get(ctx, types.NamespacedName{Namespace: "app", Name: name}, route)
+		return route, err == nil
+	}
+	if got, ok := exists("api"); !ok || got.UID != before.UID {
+		t.Errorf("route api must be updated in place, not recreated (exists=%v)", ok)
+	}
+	if _, ok := exists("api-http"); !ok {
+		t.Error("route api-http must be created")
+	}
+	if _, ok := exists("api-2"); ok {
+		t.Error("obsolete route api-2 must be deleted")
+	}
+	if _, ok := exists("api-other"); !ok {
+		t.Error("route of another Ingress sharing the name prefix must be kept")
 	}
 }

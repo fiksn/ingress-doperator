@@ -133,6 +133,9 @@ type IngressReconciler struct {
 	GatewayClassName                 string
 	WatchNamespaces                  []string // empty means all namespaces
 	OneGatewayPerIngress             []string // namespace/name globs selecting dedicated Gateways
+	GatewaySharding                  bool     // spread shared Gateways over <name>, <name>-2, ...
+	WildcardListeners                []WildcardListener
+	HTTPRedirect                     bool // catch-all port 80 listener redirecting to HTTPS
 	EnableDeletion                   bool
 	HostnameRewriteFrom              string
 	HostnameRewriteTo                string
@@ -350,10 +353,7 @@ func (r *IngressReconciler) reconcileIngressToHTTPRoute(
 
 	// Apply extension refs (snippets, auth, headers)
 	r.applyHTTPRouteExtensionRefs(ctx, ingress, httpRoute)
-
-	if effectiveMode == IngressPostProcessingModeShadowExternalDNS {
-		shadowExternalDNS(httpRoute)
-	}
+	applyWildcardSectionNames(httpRoute, r.WildcardListeners)
 
 	// Resolve any named ports before applying (search canary siblings too)
 	if err := r.HTTPRouteManager.ResolveNamedPorts(ctx, ingress, httpRoute, canaries...); err != nil {
@@ -361,14 +361,30 @@ func (r *IngressReconciler) reconcileIngressToHTTPRoute(
 		// Continue anyway with fallback ports
 	}
 
-	// Split HTTPRoute if it exceeds the Gateway API limit
-	httpRoutes := r.HTTPRouteManager.SplitHTTPRouteIfNeeded(httpRoute)
+	routes := r.httpListenerRoutes(ingress, singleTrans, httpRoute)
+	if effectiveMode == IngressPostProcessingModeShadowExternalDNS {
+		for _, route := range routes {
+			shadowExternalDNS(route)
+		}
+	}
+
+	gatewayName, err := r.applyGatewaySharding(ctx, ingress, gatewayName, routes)
+	if err != nil {
+		logger.Error(err, "failed to select Gateway shard")
+		return ctrl.Result{}, err
+	}
+
+	// Split HTTPRoutes that exceed the Gateway API limit on rules
+	var httpRoutes []*gatewayv1.HTTPRoute
+	for _, route := range routes {
+		httpRoutes = append(httpRoutes, r.HTTPRouteManager.SplitHTTPRouteIfNeeded(route)...)
+	}
 
 	// Apply all HTTPRoute(s) with proper cleanup of obsolete split routes
 	metricRecorder := func(operation, namespace, name string) {
 		metrics.HTTPRouteResourcesTotal.WithLabelValues(operation, namespace, name).Inc()
 	}
-	if err := r.HTTPRouteManager.ApplyHTTPRoutesAtomic(ctx, ingress, httpRoutes, metricRecorder); err != nil {
+	if err := r.HTTPRouteManager.ApplyHTTPRoutes(ctx, ingress, httpRoutes, metricRecorder); err != nil {
 		logger.Error(err, "failed to apply HTTPRoutes")
 		r.logErrorRateLimited(err, "apply-httproutes", "failed to apply HTTPRoutes")
 		return ctrl.Result{}, err
@@ -402,31 +418,9 @@ func (r *IngressReconciler) reconcileIngressToHTTPRoute(
 		}
 	}
 
-	updated := listenerReconciler.applyConfiguredGatewayAnnotations(gateway, ingress)
-	for _, route := range httpRoutes {
-		routeUpdated := listenerReconciler.updateGatewayListeners(ctx, gateway, route, ingress)
-		if routeUpdated {
-			updated = true
-		}
-	}
-	if updated {
-		if gatewayExists {
-			if err := r.Update(ctx, gateway); err != nil {
-				logger.Error(err, "failed to update Gateway after listener changes")
-				return ctrl.Result{}, err
-			}
-			metrics.GatewayResourcesTotal.WithLabelValues("update", gateway.Namespace, gateway.Name).Inc()
-		} else if len(gateway.Spec.Listeners) > 0 {
-			if err := r.Create(ctx, gateway); err != nil {
-				if apierrors.IsAlreadyExists(err) {
-					return ctrl.Result{RequeueAfter: requeueAfterError}, nil
-				}
-				logger.Error(err, "failed to create Gateway after listener changes")
-				return ctrl.Result{}, err
-			}
-			metrics.GatewayResourcesTotal.WithLabelValues("create", gateway.Namespace, gateway.Name).Inc()
-		}
-		logger.Info("Updated Gateway listeners from Ingress", "gateway", gatewayName)
+	if result, err := r.writeGatewayListeners(ctx, gateway, gatewayExists, ingress, httpRoutes); err != nil ||
+		!result.IsZero() {
+		return result, err
 	}
 
 	// Handle post-processing based on mode
@@ -737,7 +731,64 @@ func (r *IngressReconciler) newGatewayListenerReconciler() *HTTPRouteReconciler 
 		GatewayInfrastructureAnnotations: r.GatewayInfrastructureAnnotations,
 		InfrastructureAnnotationsByClass: r.InfrastructureAnnotationsByClass,
 		IngressClassEmpty:                r.IngressClassEmpty,
+		WildcardListeners:                r.WildcardListeners,
+		HTTPRedirect:                     r.HTTPRedirect,
 	}
+}
+
+// writeGatewayListeners merges the listeners for httpRoutes into gateway and creates or updates
+// the Gateway. Hostnames left out at the listener limit are reported as a warning event on the
+// Ingress.
+func (r *IngressReconciler) writeGatewayListeners(
+	ctx context.Context,
+	gateway *gatewayv1.Gateway,
+	gatewayExists bool,
+	ingress *networkingv1.Ingress,
+	httpRoutes []*gatewayv1.HTTPRoute,
+) (ctrl.Result, error) {
+	logger := log.FromContext(ctx)
+	listenerReconciler := r.newGatewayListenerReconciler()
+
+	updated := listenerReconciler.applyConfiguredGatewayAnnotations(gateway, ingress)
+	var dropped []string
+	for _, route := range httpRoutes {
+		routeUpdated, routeDropped := listenerReconciler.updateGatewayListeners(ctx, gateway, route, ingress)
+		if routeUpdated {
+			updated = true
+		}
+		dropped = append(dropped, routeDropped...)
+	}
+	if len(dropped) > 0 {
+		r.recordWarning(ingress, "GatewayListenerLimit",
+			fmt.Sprintf("Gateway %s/%s has reached the limit of %d listeners; no listener for: %s. "+
+				"Enable --gateway-sharding or move Ingresses to other Gateways.",
+				gateway.Namespace, gateway.Name, MaxGatewayListeners, strings.Join(dropped, ", ")))
+	}
+	if updated {
+		if gatewayExists {
+			if err := r.Update(ctx, gateway); err != nil {
+				logger.Error(err, "failed to update Gateway after listener changes")
+				return ctrl.Result{}, err
+			}
+			metrics.GatewayResourcesTotal.WithLabelValues("update", gateway.Namespace, gateway.Name).Inc()
+		} else if len(gateway.Spec.Listeners) > 0 {
+			if err := r.Create(ctx, gateway); err != nil {
+				if apierrors.IsAlreadyExists(err) {
+					return ctrl.Result{RequeueAfter: requeueAfterError}, nil
+				}
+				logger.Error(err, "failed to create Gateway after listener changes")
+				return ctrl.Result{}, err
+			}
+			metrics.GatewayResourcesTotal.WithLabelValues("create", gateway.Namespace, gateway.Name).Inc()
+		}
+		logger.Info("Updated Gateway listeners from Ingress", "gateway", gateway.Name)
+	}
+	if gatewayExists || len(gateway.Spec.Listeners) > 0 {
+		if err := listenerReconciler.syncGatewayCompanions(ctx, gateway); err != nil {
+			logger.Error(err, "failed to sync ReferenceGrants and redirect HTTPRoute of Gateway")
+		}
+	}
+	return ctrl.Result{}, nil
 }
 
 func (r *IngressReconciler) ensureGatewayForListenerUpdate(
