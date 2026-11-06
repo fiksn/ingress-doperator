@@ -21,11 +21,11 @@ if [[ "$old" == "$new" ]]; then
 	exit 0
 fi
 
-# file|perl substitution; every one must change exactly what it targets. The chart version drops
-# the leading v (Helm requires SemVer 2); appVersion and image tags keep it.
+# file|perl substitution; every one must change exactly what it targets. The chart version is
+# matched with or without the leading v and always written with it, like appVersion and image tags.
 edits=(
 	"Makefile|s{^(IMG \?= fiksn/ingress-doperator:)\Q$old\E$}{\${1}$new}m"
-	"$chart|s{^(version: )v?\Q${old#v}\E$}{\${1}${new#v}}m"
+	"$chart|s{^(version: )v?\Q${old#v}\E$}{\${1}$new}m"
 	"$chart|s{^(appVersion: )\Q$old\E$}{\${1}$new}m"
 	"helm/ingress-doperator-chart/values.yaml|s{^(  tag: )\Q$old\E$}{\${1}$new}m"
 	"config/manager/kustomization.yaml|s{^(  newTag: )\Q$old\E$}{\${1}$new}m"

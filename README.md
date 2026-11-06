@@ -1107,19 +1107,18 @@ The operator:
 ### Releasing
 
 ```sh
-make release VERSION=v0.0.8
+make release VERSION=vX.Y.Z
 ```
 
 This:
 1. Sets the version everywhere it is pinned (`hack/bump-version.sh`): `IMG` in the Makefile,
-   the Helm chart (`version: 0.0.8` without the `v`, as Helm requires SemVer, and
-   `appVersion`/`image.tag: v0.0.8`), `config/manager/kustomization.yaml`, the e2e test image and
-   the README. If any of them is not at the current version, nothing is changed.
-2. Builds and pushes `fiksn/ingress-doperator:v0.1.0` and `fiksn/ingress-doperator-webhook:v0.1.0`
+   the Helm chart (`version`, `appVersion` and `image.tag`), `config/manager/kustomization.yaml`,
+   the e2e test image and the README. If any of them is not at the current version, nothing is changed.
+2. Builds and pushes `fiksn/ingress-doperator:vX.Y.Z` and `fiksn/ingress-doperator-webhook:vX.Y.Z`
    for `PLATFORMS` with `docker buildx`, with the version stamped into the binaries.
 3. Packages the chart and pushes it to `HELM_REPO` (default `oci://registry-1.docker.io/fiksn`),
    installable with
-   `helm install ingress-doperator oci://registry-1.docker.io/fiksn/ingress-doperator-chart --version 0.0.8`.
+   `helm install ingress-doperator oci://registry-1.docker.io/fiksn/ingress-doperator-chart --version vX.Y.Z`.
 
 Log in first (`docker login`, `helm registry login registry-1.docker.io`). The version bump is
 left uncommitted; commit and tag it yourself.

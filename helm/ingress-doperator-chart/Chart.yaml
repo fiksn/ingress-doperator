@@ -2,7 +2,7 @@ apiVersion: v2
 name: ingress-doperator-chart
 description: A Kubernetes operator that translates Ingress resources to Gateway API resources
 type: application
-version: 0.1.0
+version: v0.1.0
 appVersion: v0.1.0
 keywords:
   - ingress
