@@ -56,8 +56,8 @@ func TestDisableExternalDNSUsesConfiguredPrefix(t *testing.T) {
 			}}
 			c := fake.NewClientBuilder().WithScheme(scheme).WithObjects(ingress).Build()
 
-			if err := disableExternalDNS(context.Background(), c, ingress); err != nil {
-				t.Fatalf("disableExternalDNS returned error: %v", err)
+			if err := DisableExternalDNS(context.Background(), c, ingress); err != nil {
+				t.Fatalf("DisableExternalDNS returned error: %v", err)
 			}
 
 			got := &networkingv1.Ingress{}
@@ -92,7 +92,7 @@ func TestShadowExternalDNSHidesRouteFromExternalDNS(t *testing.T) {
 				"cert-manager.io/cluster-issuer":                                "letsencrypt",
 			}}}
 
-			shadowExternalDNS(route)
+			ShadowExternalDNS(route)
 
 			want := map[string]string{
 				prefix + "/gateway-hostname-source": ExternalDNSHostnameSourceAnnotationOnly,
@@ -113,32 +113,104 @@ func TestShadowExternalDNSHidesRouteFromExternalDNS(t *testing.T) {
 func TestShadowExternalDNSWithoutAnnotations(t *testing.T) {
 	route := &gatewayv1.HTTPRoute{}
 
-	shadowExternalDNS(route)
+	ShadowExternalDNS(route)
 
 	if v := route.Annotations[ExternalDNSGatewayHostnameSource]; v != ExternalDNSHostnameSourceAnnotationOnly {
 		t.Errorf("%s = %q, want %q", ExternalDNSGatewayHostnameSource, v, ExternalDNSHostnameSourceAnnotationOnly)
 	}
 }
 
-func TestResolveIngressPostProcessingModeInShadowMode(t *testing.T) {
+func TestResolveIngressPostProcessingMode(t *testing.T) {
+	const (
+		shadow     = IngressPostProcessingModeShadowExternalDNS
+		disableDNS = IngressPostProcessingModeDisableExternalDNS
+	)
 	tests := []struct {
+		name     string
+		global   IngressPostProcessingMode
 		disabled string
+		shadow   string
 		want     IngressPostProcessingMode
 	}{
-		{disabled: "", want: IngressPostProcessingModeShadowExternalDNS},
-		{disabled: IngressDisabledReasonExternalDNS, want: IngressPostProcessingModeDisableExternalDNS},
-		{disabled: IngressDisabledReasonNormal, want: IngressPostProcessingModeDisable},
+		{"no annotations use global", shadow, "", "", shadow},
+		{"disabled=external-dns overrides shadow", shadow, IngressDisabledReasonExternalDNS, "", disableDNS},
+		{"disabled=normal overrides shadow", shadow, IngressDisabledReasonNormal, "",
+			IngressPostProcessingModeDisable},
+		{"shadow overrides disable-external-dns", disableDNS, "", "true", shadow},
+		{"shadow overrides none", IngressPostProcessingModeNone, "", "true", shadow},
+		{"shadow=false uses global", disableDNS, "", "false", disableDNS},
+		{"disabled marker wins over shadow", disableDNS, IngressDisabledReasonExternalDNS, "true", disableDNS},
 	}
-	r := &IngressReconciler{IngressPostProcessingMode: IngressPostProcessingModeShadowExternalDNS}
-
 	for _, tt := range tests {
-		t.Run(tt.disabled, func(t *testing.T) {
-			ingress := &networkingv1.Ingress{}
+		t.Run(tt.name, func(t *testing.T) {
+			ingress := &networkingv1.Ingress{ObjectMeta: metav1.ObjectMeta{Annotations: map[string]string{}}}
 			if tt.disabled != "" {
-				ingress.Annotations = map[string]string{IngressDisabledAnnotation: tt.disabled}
+				ingress.Annotations[IngressDisabledAnnotation] = tt.disabled
 			}
-			if got := r.resolveIngressPostProcessingMode(ingress); got != tt.want {
+			if tt.shadow != "" {
+				ingress.Annotations[ShadowExternalDNSAnnotation] = tt.shadow
+			}
+			if got := resolveIngressPostProcessingMode(tt.global, ingress); got != tt.want {
 				t.Errorf("resolveIngressPostProcessingMode() = %q, want %q", got, tt.want)
+			}
+		})
+	}
+}
+
+// TestHTTPRouteReconcilerDisablesExternalDNSPerIngress covers cutting over Ingresses whose route
+// the Gateway already serves (e.g. after a shadow-external-dns phase): only Ingresses whose
+// effective mode is disable-external-dns, and that are not ignored, are hidden from external-dns.
+func TestHTTPRouteReconcilerDisablesExternalDNSPerIngress(t *testing.T) {
+	marked := map[string]string{IngressDisabledAnnotation: IngressDisabledReasonExternalDNS}
+	tests := []struct {
+		name        string
+		globalMode  IngressPostProcessingMode
+		annotations map[string]string
+		wantSource  string
+	}{
+		{"shadow, marked", IngressPostProcessingModeShadowExternalDNS, marked,
+			ExternalDNSHostnameSourceAnnotationOnly},
+		{"shadow, unmarked", IngressPostProcessingModeShadowExternalDNS, nil, ""},
+		{"none, marked", IngressPostProcessingModeNone, marked, ExternalDNSHostnameSourceAnnotationOnly},
+		{"disable-external-dns, unmarked", IngressPostProcessingModeDisableExternalDNS, nil,
+			ExternalDNSHostnameSourceAnnotationOnly},
+		{"disable-external-dns, shadow annotation", IngressPostProcessingModeDisableExternalDNS,
+			map[string]string{ShadowExternalDNSAnnotation: "true"}, ""},
+		{"disable-external-dns, ignored", IngressPostProcessingModeDisableExternalDNS,
+			map[string]string{IgnoreIngressAnnotation: "true"}, ""},
+		{"marked, ignored", IngressPostProcessingModeShadowExternalDNS,
+			map[string]string{IngressDisabledAnnotation: IngressDisabledReasonExternalDNS,
+				IgnoreIngressAnnotation: "true"}, ""},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			ingress := &networkingv1.Ingress{
+				TypeMeta: metav1.TypeMeta{APIVersion: "networking.k8s.io/v1", Kind: "Ingress"},
+				ObjectMeta: metav1.ObjectMeta{
+					Namespace: "app", Name: "api", UID: "api-uid", Annotations: tt.annotations,
+				},
+				Spec: networkingv1.IngressSpec{Rules: []networkingv1.IngressRule{{
+					Host: "api.example.com",
+				}}},
+			}
+			route := testRoute("api", "nginx", "nginx", "api.example.com")
+			setHTTPRouteOwnerReference(route, ingress)
+			gateway := testGateway("nginx", true, "api.example.com")
+			r := newReleaseReconciler(t, ingress, route, gateway)
+			r.IngressPostProcessingMode = tt.globalMode
+			r.gatewayUpdateDebouncer = newGatewayUpdateDebouncer(r)
+
+			ctx := context.Background()
+			if _, err := r.handleHTTPRouteCreateOrUpdate(ctx, route); err != nil {
+				t.Fatalf("handleHTTPRouteCreateOrUpdate() error: %v", err)
+			}
+
+			got := &networkingv1.Ingress{}
+			if err := r.Get(ctx, client.ObjectKeyFromObject(ingress), got); err != nil {
+				t.Fatalf("failed to get Ingress: %v", err)
+			}
+			if v := got.Annotations[ExternalDNSIngressHostnameSource]; v != tt.wantSource {
+				t.Errorf("%s = %q, want %q", ExternalDNSIngressHostnameSource, v, tt.wantSource)
 			}
 		})
 	}

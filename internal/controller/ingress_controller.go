@@ -55,6 +55,7 @@ const (
 	IngressDisabledAnnotation                = "ingress-doperator.fiction.si/disabled"
 	IngressRemovedAnnotation                 = "ingress-doperator.fiction.si/removed"
 	IgnoreIngressAnnotation                  = "ingress-doperator.fiction.si/ignore-ingress"
+	ShadowExternalDNSAnnotation              = "ingress-doperator.fiction.si/shadow-external-dns"
 	OriginalIngressClassAnnotation           = "ingress-doperator.fiction.si/original-ingress-class"
 	OriginalIngressClassNameAnnotation       = "ingress-doperator.fiction.si/original-ingress-classname"
 	OriginalExternalDNSHostname              = "ingress-doperator.fiction.si/original-external-dns-hostname"
@@ -326,7 +327,7 @@ func (r *IngressReconciler) reconcileIngressToHTTPRoute(
 	}
 
 	// Handle source Ingress post-processing mode
-	effectiveMode := r.resolveIngressPostProcessingMode(ingress)
+	effectiveMode := resolveIngressPostProcessingMode(r.IngressPostProcessingMode, ingress)
 
 	// Get translator
 	trans := r.getTranslator()
@@ -364,7 +365,7 @@ func (r *IngressReconciler) reconcileIngressToHTTPRoute(
 	routes := r.httpListenerRoutes(ingress, singleTrans, httpRoute)
 	if effectiveMode == IngressPostProcessingModeShadowExternalDNS {
 		for _, route := range routes {
-			shadowExternalDNS(route)
+			ShadowExternalDNS(route)
 		}
 	}
 
@@ -880,21 +881,29 @@ func (r *IngressReconciler) shouldIncludeIngressForSynthesis(
 	return true
 }
 
-func (r *IngressReconciler) resolveIngressPostProcessingMode(
+// resolveIngressPostProcessingMode returns the post-processing mode for one Ingress: its
+// IngressDisabledAnnotation overrides the globally configured mode, then its
+// ShadowExternalDNSAnnotation does. The disabled marker wins so an Ingress that was already cut
+// over is not silently flipped back; that takes the reenabler with --restore-external-dns.
+func resolveIngressPostProcessingMode(
+	global IngressPostProcessingMode,
 	ingress *networkingv1.Ingress,
 ) IngressPostProcessingMode {
 	if ingress == nil || ingress.Annotations == nil {
-		return r.IngressPostProcessingMode
+		return global
 	}
 	switch ingress.Annotations[IngressDisabledAnnotation] {
 	case IngressDisabledReasonNormal:
 		return IngressPostProcessingModeDisable
 	case IngressDisabledReasonExternalDNS:
 		return IngressPostProcessingModeDisableExternalDNS
-	default:
-		return r.IngressPostProcessingMode
 	}
+	if ingress.Annotations[ShadowExternalDNSAnnotation] == "true" {
+		return IngressPostProcessingModeShadowExternalDNS
+	}
+	return global
 }
+
 func (r *IngressReconciler) applyHTTPRouteExtensionRefs(
 	ctx context.Context,
 	ingress *networkingv1.Ingress,
@@ -1428,9 +1437,9 @@ func (r *IngressReconciler) disableIngress(ctx context.Context, ingress *network
 	return nil
 }
 
-// disableExternalDNS is a package-level function that disables external-dns processing on an Ingress
+// DisableExternalDNS is a package-level function that disables external-dns processing on an Ingress
 // It can be called by both IngressReconciler and HTTPRouteReconciler
-func disableExternalDNS(ctx context.Context, cli client.Client, ingress *networkingv1.Ingress) error {
+func DisableExternalDNS(ctx context.Context, cli client.Client, ingress *networkingv1.Ingress) error {
 	if ingress == nil {
 		return nil
 	}
@@ -1509,10 +1518,10 @@ func disableExternalDNS(ctx context.Context, cli client.Client, ingress *network
 	return nil
 }
 
-// shadowExternalDNS hides an HTTPRoute from external-dns: it drops the external-dns annotations
+// ShadowExternalDNS hides an HTTPRoute from external-dns: it drops the external-dns annotations
 // copied from the Ingress (under both prefixes) and sets gateway-hostname-source to
 // annotation-only, so external-dns finds no hostname to publish for the route.
-func shadowExternalDNS(httpRoute *gatewayv1.HTTPRoute) {
+func ShadowExternalDNS(httpRoute *gatewayv1.HTTPRoute) {
 	for key := range httpRoute.Annotations {
 		if strings.HasPrefix(key, DefaultExternalDNSAnnotationPrefix+"/") ||
 			strings.HasPrefix(key, LegacyExternalDNSAnnotationPrefix+"/") {

@@ -174,7 +174,7 @@ spec:
     spec:
       containers:
       - name: webhook
-        image: fiksn/ingress-doperator-webhook:v0.1.0
+        image: fiksn/ingress-doperator-webhook:v0.1.2
         imagePullPolicy: Always
         command:
           - /webhook
@@ -970,9 +970,34 @@ To cut over, switch to `--ingress-postprocessing=disable-external-dns`: the next
 the shadow annotations from the HTTPRoutes and sets the Ingress to `annotation-only`. During one
 external-dns sync interval both may be published, so the record can briefly carry both targets.
 
+To cut over a single Ingress instead, keep the flag and annotate that Ingress:
+
+```bash
+kubectl annotate ingress <name> -n <namespace> ingress-doperator.fiction.si/disabled=external-dns
+```
+
+Its HTTPRoute is no longer shadowed and the Ingress is set to `annotation-only`, exactly as with
+`disable-external-dns`; all other Ingresses stay shadowed.
+
+To cut over all but a few Ingresses, run with `--ingress-postprocessing=disable-external-dns` and
+annotate the exceptions **before** switching the flag (otherwise they are cut over on the first
+reconcile):
+
+```bash
+kubectl annotate ingress <name> -n <namespace> ingress-doperator.fiction.si/shadow-external-dns=true
+```
+
+Such an Ingress keeps its DNS and its HTTPRoute is shadowed, but still follows changes to the
+Ingress. An existing `ingress-doperator.fiction.si/disabled` marker takes precedence, so an
+Ingress that was already cut over is not flipped back; use the reenabler's
+[`--dns-target=ingress`](#moving-dns-records-for-selected-ingresses) for that.
+
+The operator never hides an Ingress marked `ingress-doperator.fiction.si/ignore-ingress: "true"`
+from external-dns, since its HTTPRoute is no longer updated and may still be shadowed.
+
 Ingresses already marked `ingress-doperator.fiction.si/disabled: external-dns` keep the
 `disable-external-dns` behaviour and are not shadowed. To move such an Ingress back, run the
-[reenabler](#re-enabling-disabled-ingresses) with `--restore-external-dns` first.
+reenabler with [`--dns-target=ingress`](#moving-dns-records-for-selected-ingresses).
 
 ## Deletion behaviour
 
@@ -1084,6 +1109,37 @@ Delete disabled Ingresses managed by ingress-doperator:
 ./bin/reenabler --dangerously-delete-ingresses
 ```
 
+### Moving DNS records for selected Ingresses
+
+`--dns-target` chooses which resource external-dns publishes an Ingress's hostnames from,
+whatever the operator's `--ingress-postprocessing` mode. Select Ingresses with `--namespace`
+and `--ingress-name`:
+
+```bash
+# Publish from the generated HTTPRoute(s)
+./bin/reenabler --namespace=app --ingress-name='api,web-*' --dns-target=httproute
+
+# Publish from the Ingress again
+./bin/reenabler --namespace=app --ingress-name='api,web-*' --dns-target=ingress
+```
+
+- `httproute` sets `ingress-doperator.fiction.si/disabled=external-dns` and removes
+  `ingress-doperator.fiction.si/shadow-external-dns`, un-shadows the HTTPRoutes, then sets the
+  Ingress to `annotation-only` (saving the original values).
+- `ingress` restores the Ingress's external-dns annotations, removes the `disabled` marker and
+  sets `ingress-doperator.fiction.si/shadow-external-dns=true` in one update, then shadows the
+  HTTPRoutes.
+
+The annotations override the operator's mode, so it keeps the result; the reenabler also applies
+it directly, so it works while the operator is stopped. Each step makes the new source publish
+before the old one stops, so the record always has a source (both may briefly be published).
+Gateways are not changed.
+
+The switch is refused, per Ingress, when the Ingress was disabled with
+`--ingress-postprocessing=disable` (re-enable it with `--restore-class` first), and for
+`httproute` when the Ingress has `ignore-ingress: "true"` or no HTTPRoute was generated for it
+yet. `--dns-target` cannot be combined with the other reenabler actions.
+
 ## Behaviour
 
 The operator:
@@ -1127,7 +1183,7 @@ left uncommitted; commit and tag it yourself.
 **Build and push your image to the location specified by `IMG`:**
 
 ```sh
-make docker-build docker-push IMG=fiksn/ingress-doperator:v0.1.0
+make docker-build docker-push IMG=fiksn/ingress-doperator:v0.1.2
 ```
 
 **NOTE:** This image ought to be published in the personal registry you specified.
@@ -1186,7 +1242,7 @@ Following the options to release and provide this solution to the users.
 1. Build the installer for the image built and published in the registry:
 
 ```sh
-make build-installer IMG=fiksn/ingress-doperator:v0.1.0
+make build-installer IMG=fiksn/ingress-doperator:v0.1.2
 ```
 
 **NOTE:** The makefile target mentioned above generates an 'install.yaml'

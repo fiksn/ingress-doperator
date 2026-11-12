@@ -135,7 +135,7 @@ func (d *gatewayUpdateDebouncer) executeGatewayUpdate(ctx context.Context, gatew
 	}
 
 	// Gateway successfully updated - now safe to disable external-dns on source Ingresses
-	if updated && d.reconciler.IngressPostProcessingMode == IngressPostProcessingModeDisableExternalDNS {
+	if updated {
 		// Track which Ingresses we've already processed to avoid duplicates
 		processedIngresses := make(map[string]bool)
 
@@ -156,7 +156,7 @@ func (d *gatewayUpdateDebouncer) executeGatewayUpdate(ctx context.Context, gatew
 			}
 			processedIngresses[ingressKey] = true
 
-			if err := disableExternalDNS(ctx, d.reconciler.Client, ingress); err != nil {
+			if err := d.reconciler.disableExternalDNSIfCutOver(ctx, ingress); err != nil {
 				logger.Error(err, "failed to disable external-dns on source Ingress after Gateway update",
 					"ingress", ingressKey)
 				// Don't fail - continue with other Ingresses
@@ -303,6 +303,9 @@ func (r *HTTPRouteReconciler) handleHTTPRouteCreateOrUpdate(ctx context.Context,
 			// Use debounced update to batch rapid concurrent changes
 			logger.V(1).Info("Scheduling debounced Gateway update", "gateway", gatewayName)
 			r.gatewayUpdateDebouncer.scheduleGatewayUpdate(ctx, gatewayName)
+		} else if err := r.disableExternalDNSIfCutOver(ctx, ingress); err != nil {
+			// The Gateway already serves this route, e.g. after a shadow-external-dns phase
+			logger.Error(err, "failed to disable external-dns on source Ingress")
 		}
 	} else if updated && len(gateway.Spec.Listeners) > 0 {
 		// For Gateway creation, don't debounce - create immediately
@@ -321,11 +324,9 @@ func (r *HTTPRouteReconciler) handleHTTPRouteCreateOrUpdate(ctx context.Context,
 		}
 
 		// Gateway created successfully - now safe to disable external-dns on source Ingress
-		if r.IngressPostProcessingMode == IngressPostProcessingModeDisableExternalDNS {
-			if err := disableExternalDNS(ctx, r.Client, ingress); err != nil {
-				logger.Error(err, "failed to disable external-dns on source Ingress after Gateway creation")
-				// Don't fail the reconcile - Gateway is already created
-			}
+		if err := r.disableExternalDNSIfCutOver(ctx, ingress); err != nil {
+			logger.Error(err, "failed to disable external-dns on source Ingress after Gateway creation")
+			// Don't fail the reconcile - Gateway is already created
 		}
 	}
 
@@ -335,6 +336,25 @@ func (r *HTTPRouteReconciler) handleHTTPRouteCreateOrUpdate(ctx context.Context,
 	}
 
 	return ctrl.Result{}, nil
+}
+
+// disableExternalDNSIfCutOver hides the source Ingress from external-dns when its effective
+// post-processing mode (see resolveIngressPostProcessingMode) is disable-external-dns. Call it
+// only once the Gateway serves the Ingress's HTTPRoute. Ignored Ingresses are left alone: the
+// IngressReconciler no longer updates their HTTPRoute, so it may still be shadowed and hiding
+// the Ingress too would drop the DNS record.
+func (r *HTTPRouteReconciler) disableExternalDNSIfCutOver(
+	ctx context.Context,
+	ingress *networkingv1.Ingress,
+) error {
+	if ingress != nil && ingress.Annotations[IgnoreIngressAnnotation] == "true" {
+		return nil
+	}
+	mode := resolveIngressPostProcessingMode(r.IngressPostProcessingMode, ingress)
+	if mode != IngressPostProcessingModeDisableExternalDNS {
+		return nil
+	}
+	return DisableExternalDNS(ctx, r.Client, ingress)
 }
 
 // releasePreviousGateway cleans up the Gateway this HTTPRoute was attached to before its parentRef

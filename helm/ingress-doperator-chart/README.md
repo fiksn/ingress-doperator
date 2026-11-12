@@ -14,7 +14,7 @@ This Helm chart deploys the ingress-doperator, a Kubernetes operator that transl
 Before installing this chart, ensure the Gateway API CRDs are installed:
 
 ```bash
-kubectl apply -f https://github.com/kubernetes-sigs/gateway-api/releases/download/v1.6.3/standard-install.yaml
+kubectl apply -f https://github.com/kubernetes-sigs/gateway-api/releases/download/v1.7.0/standard-install.yaml
 ```
 
 ## Installing the Chart
