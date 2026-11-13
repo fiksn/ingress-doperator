@@ -18,12 +18,16 @@ package main
 
 import (
 	"context"
+	"strings"
 	"testing"
 
 	networkingv1 "k8s.io/api/networking/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/utils/ptr"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
+	"sigs.k8s.io/controller-runtime/pkg/client/interceptor"
 	gatewayv1 "sigs.k8s.io/gateway-api/apis/v1"
 
 	"github.com/fiksn/ingress-doperator/internal/controller"
@@ -53,9 +57,33 @@ func testRoute(annotations map[string]string) *gatewayv1.HTTPRoute {
 	for key, value := range annotations {
 		all[key] = value
 	}
-	return &gatewayv1.HTTPRoute{ObjectMeta: metav1.ObjectMeta{
-		Namespace: "app", Name: "api", Annotations: all,
-	}}
+	parent := gatewayv1.ParentReference{Name: "nginx", Namespace: ptr.To(gatewayv1.Namespace("gateways"))}
+	return &gatewayv1.HTTPRoute{
+		ObjectMeta: metav1.ObjectMeta{Namespace: "app", Name: "api", Annotations: all, Generation: 1},
+		Spec: gatewayv1.HTTPRouteSpec{
+			CommonRouteSpec: gatewayv1.CommonRouteSpec{ParentRefs: []gatewayv1.ParentReference{parent}},
+		},
+		Status: gatewayv1.HTTPRouteStatus{RouteStatus: gatewayv1.RouteStatus{
+			Parents: []gatewayv1.RouteParentStatus{{
+				ParentRef:      parent,
+				ControllerName: "gateway.nginx.org/nginx-gateway-controller",
+				Conditions: []metav1.Condition{{
+					Type: string(gatewayv1.RouteConditionAccepted), Status: metav1.ConditionTrue,
+					Reason: "Accepted", ObservedGeneration: 1,
+				}},
+			}},
+		}},
+	}
+}
+
+// rejectedRoute is testRoute as reported by a Gateway that has no listener for it.
+func rejectedRoute(annotations map[string]string) *gatewayv1.HTTPRoute {
+	route := testRoute(annotations)
+	condition := &route.Status.Parents[0].Conditions[0]
+	condition.Status = metav1.ConditionFalse
+	condition.Reason = "NoMatchingParent"
+	condition.Message = "The Listener is not found for this parent ref"
+	return route
 }
 
 // cutOverIngress is an Ingress after the operator moved its DNS to the HTTPRoute.
@@ -223,4 +251,79 @@ func TestDNSTargetRefusals(t *testing.T) {
 			}
 		})
 	}
+}
+
+// TestDNSTargetRetriesRouteConflicts simulates the operator rewriting the HTTPRoute (as it does
+// when it reconciles the Ingress the reenabler just updated) right before the reenabler's write.
+func TestDNSTargetRetriesRouteConflicts(t *testing.T) {
+	const operatorKey = "operator-wrote"
+	ingress := cutOverIngress()
+	route := testRoute(map[string]string{hostnameKey: testHostname})
+	concurrentWrites := 0
+	cli := fake.NewClientBuilder().WithScheme(scheme).WithObjects(ingress, route).
+		WithInterceptorFuncs(interceptor.Funcs{Update: func(
+			ctx context.Context, c client.WithWatch, obj client.Object, opts ...client.UpdateOption,
+		) error {
+			if _, ok := obj.(*gatewayv1.HTTPRoute); ok && concurrentWrites == 0 {
+				concurrentWrites++
+				latest := &gatewayv1.HTTPRoute{}
+				if err := c.Get(ctx, client.ObjectKeyFromObject(obj), latest); err != nil {
+					return err
+				}
+				latest.Annotations[operatorKey] = "true"
+				if err := c.Update(ctx, latest); err != nil {
+					return err
+				}
+			}
+			return c.Update(ctx, obj, opts...)
+		}}).Build()
+
+	err := runReenabler(context.Background(), cli, "app", "", reenablerOptions{dnsTarget: dnsTargetIngress})
+	if err != nil {
+		t.Fatalf("runReenabler() error: %v", err)
+	}
+
+	assertAnnotations(t, "HTTPRoute", getAnnotations(t, cli, route), map[string]string{
+		gatewaySourceKey: annotationOnly,
+		operatorKey:      "true",
+	})
+}
+
+func TestDNSTargetSkipsVanishedRoute(t *testing.T) {
+	ingress := cutOverIngress()
+	route := testRoute(nil)
+	cli := fake.NewClientBuilder().WithScheme(scheme).WithObjects(ingress, route).
+		WithInterceptorFuncs(interceptor.Funcs{Get: func(
+			ctx context.Context, c client.WithWatch, key client.ObjectKey, obj client.Object, opts ...client.GetOption,
+		) error {
+			if _, ok := obj.(*gatewayv1.HTTPRoute); ok {
+				return apierrors.NewNotFound(gatewayv1.Resource("httproutes"), key.Name)
+			}
+			return c.Get(ctx, key, obj, opts...)
+		}}).Build()
+
+	err := runReenabler(context.Background(), cli, "app", "", reenablerOptions{dnsTarget: dnsTargetIngress})
+	if err != nil {
+		t.Fatalf("runReenabler() error: %v", err)
+	}
+}
+
+// TestDNSTargetHTTPRouteRefusesRouteNotAccepted covers a route whose Gateway has no listener for
+// it (e.g. a full Gateway): external-dns would not publish it, so nothing may change.
+func TestDNSTargetHTTPRouteRefusesRouteNotAccepted(t *testing.T) {
+	annotations := map[string]string{controller.ShadowExternalDNSAnnotation: "true", hostnameKey: testHostname}
+	ingress := testIngress(annotations)
+	route := rejectedRoute(map[string]string{gatewaySourceKey: annotationOnly})
+
+	cli, err := runSwitch(t, dnsTargetHTTPRoute, ingress, route)
+	if err == nil || !strings.Contains(err.Error(), "NoMatchingParent") {
+		t.Fatalf("runReenabler() error = %v, want a refusal naming NoMatchingParent", err)
+	}
+
+	assertAnnotations(t, "Ingress", getAnnotations(t, cli, ingress), map[string]string{
+		controller.ShadowExternalDNSAnnotation: "true",
+		controller.IngressDisabledAnnotation:   "",
+		ingressSourceKey:                       "",
+	})
+	assertAnnotations(t, "HTTPRoute", getAnnotations(t, cli, route), map[string]string{gatewaySourceKey: annotationOnly})
 }

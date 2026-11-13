@@ -174,7 +174,7 @@ spec:
     spec:
       containers:
       - name: webhook
-        image: fiksn/ingress-doperator-webhook:v0.1.2
+        image: fiksn/ingress-doperator-webhook:v0.1.4
         imagePullPolicy: Always
         command:
           - /webhook
@@ -640,11 +640,16 @@ The operator accepts the following command-line flags:
                                               'external-dns.alpha.kubernetes.io' for older external-dns
                                               (default: "external-dns.kubernetes.io")
 --gateway-annotation-filters string           Comma-separated list of annotation prefixes to exclude from Gateway
-                                              (default: "ingress.kubernetes.io,cert-manager.io,
-                                              nginx.ingress.kubernetes.io")
+                                              (default: "ingress.kubernetes.io,nginx.ingress.kubernetes.io,
+                                              kubectl.kubernetes.io,kubernetes.io/ingress.class,
+                                              traefik.ingress.kubernetes.io,ingress-doperator.fiction.si,
+                                              external-dns.kubernetes.io,external-dns.alpha.kubernetes.io";
+                                              the Helm chart also excludes cert-manager.io)
 --httproute-annotation-filters string         Comma-separated list of annotation prefixes to exclude from HTTPRoute
-                                              (default: "ingress.kubernetes.io,cert-manager.io,
-                                              nginx.ingress.kubernetes.io")
+                                              (default: "ingress.kubernetes.io,nginx.ingress.kubernetes.io,
+                                              kubectl.kubernetes.io,kubernetes.io/ingress.class,
+                                              traefik.ingress.kubernetes.io,ingress-doperator.fiction.si";
+                                              the Helm chart also excludes cert-manager.io)
 --ingress-class-snippets-filter string        Comma-separated list of pattern:snippetsFilterName entries
 --ingress-name-snippets-filter string         Comma-separated list of pattern:snippetsFilterName entries
 --ingress-annotation-snippets-add string      Semicolon-separated list of key=value:filter1,filter2 entries
@@ -970,14 +975,20 @@ To cut over, switch to `--ingress-postprocessing=disable-external-dns`: the next
 the shadow annotations from the HTTPRoutes and sets the Ingress to `annotation-only`. During one
 external-dns sync interval both may be published, so the record can briefly carry both targets.
 
+The Ingress is only set to `annotation-only` once every HTTPRoute generated from it reports
+`Accepted=True` from its Gateways for its current generation, because external-dns only publishes
+accepted routes. Until then the Ingress keeps publishing and the operator logs why it is waiting,
+e.g. `NoMatchingParent` when the route's listener could not be added to a full Gateway (see
+[Listener Limit and Gateway Sharding](#listener-limit-and-gateway-sharding)).
+
 To cut over a single Ingress instead, keep the flag and annotate that Ingress:
 
 ```bash
 kubectl annotate ingress <name> -n <namespace> ingress-doperator.fiction.si/disabled=external-dns
 ```
 
-Its HTTPRoute is no longer shadowed and the Ingress is set to `annotation-only`, exactly as with
-`disable-external-dns`; all other Ingresses stay shadowed.
+Its HTTPRoute is no longer shadowed and, once the route is accepted, the Ingress is set to
+`annotation-only`, exactly as with `disable-external-dns`; all other Ingresses stay shadowed.
 
 To cut over all but a few Ingresses, run with `--ingress-postprocessing=disable-external-dns` and
 annotate the exceptions **before** switching the flag (otherwise they are cut over on the first
@@ -1137,8 +1148,10 @@ Gateways are not changed.
 
 The switch is refused, per Ingress, when the Ingress was disabled with
 `--ingress-postprocessing=disable` (re-enable it with `--restore-class` first), and for
-`httproute` when the Ingress has `ignore-ingress: "true"` or no HTTPRoute was generated for it
-yet. `--dns-target` cannot be combined with the other reenabler actions.
+`httproute` when the Ingress has `ignore-ingress: "true"`, no HTTPRoute was generated for it yet,
+or one of its HTTPRoutes is not accepted by its Gateway (the error gives the Gateway's reason).
+These checks run before anything is changed. `--dns-target` cannot be combined with the other
+reenabler actions.
 
 ## Behaviour
 
@@ -1183,7 +1196,7 @@ left uncommitted; commit and tag it yourself.
 **Build and push your image to the location specified by `IMG`:**
 
 ```sh
-make docker-build docker-push IMG=fiksn/ingress-doperator:v0.1.2
+make docker-build docker-push IMG=fiksn/ingress-doperator:v0.1.4
 ```
 
 **NOTE:** This image ought to be published in the personal registry you specified.
@@ -1242,7 +1255,7 @@ Following the options to release and provide this solution to the users.
 1. Build the installer for the image built and published in the registry:
 
 ```sh
-make build-installer IMG=fiksn/ingress-doperator:v0.1.2
+make build-installer IMG=fiksn/ingress-doperator:v0.1.4
 ```
 
 **NOTE:** The makefile target mentioned above generates an 'install.yaml'

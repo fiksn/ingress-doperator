@@ -156,10 +156,14 @@ func (d *gatewayUpdateDebouncer) executeGatewayUpdate(ctx context.Context, gatew
 			}
 			processedIngresses[ingressKey] = true
 
-			if err := d.reconciler.disableExternalDNSIfCutOver(ctx, ingress); err != nil {
+			waiting, err := d.reconciler.disableExternalDNSIfCutOver(ctx, ingress)
+			if err != nil {
 				logger.Error(err, "failed to disable external-dns on source Ingress after Gateway update",
 					"ingress", ingressKey)
 				// Don't fail - continue with other Ingresses
+			} else if waiting != "" {
+				logger.Info("Keeping external-dns on source Ingress until its HTTPRoutes are accepted",
+					"ingress", ingressKey, "reason", waiting)
 			}
 		}
 	}
@@ -303,9 +307,20 @@ func (r *HTTPRouteReconciler) handleHTTPRouteCreateOrUpdate(ctx context.Context,
 			// Use debounced update to batch rapid concurrent changes
 			logger.V(1).Info("Scheduling debounced Gateway update", "gateway", gatewayName)
 			r.gatewayUpdateDebouncer.scheduleGatewayUpdate(ctx, gatewayName)
-		} else if err := r.disableExternalDNSIfCutOver(ctx, ingress); err != nil {
-			// The Gateway already serves this route, e.g. after a shadow-external-dns phase
-			logger.Error(err, "failed to disable external-dns on source Ingress")
+		} else {
+			// The Gateway already has this route's listeners, e.g. after a shadow-external-dns phase.
+			waiting, err := r.disableExternalDNSIfCutOver(ctx, ingress)
+			if err != nil {
+				// Requeue: until the Ingress is hidden, both it and the route publish the hostname.
+				logger.Error(err, "failed to disable external-dns on source Ingress")
+				return ctrl.Result{}, err
+			}
+			if waiting != "" {
+				// The route's status update triggers a reconcile; the requeue is a fallback.
+				logger.Info("Keeping external-dns on source Ingress until its HTTPRoutes are accepted",
+					"reason", waiting)
+				return ctrl.Result{RequeueAfter: requeueAfterError}, nil
+			}
 		}
 	} else if updated && len(gateway.Spec.Listeners) > 0 {
 		// For Gateway creation, don't debounce - create immediately
@@ -323,10 +338,15 @@ func (r *HTTPRouteReconciler) handleHTTPRouteCreateOrUpdate(ctx context.Context,
 			logger.Error(err, "failed to sync ReferenceGrants and redirect HTTPRoute of Gateway")
 		}
 
-		// Gateway created successfully - now safe to disable external-dns on source Ingress
-		if err := r.disableExternalDNSIfCutOver(ctx, ingress); err != nil {
+		// Gateway created. The Gateway controller has not accepted the route yet, so this normally
+		// waits; the route's status update triggers the reconcile that completes the cut-over.
+		waiting, err := r.disableExternalDNSIfCutOver(ctx, ingress)
+		if err != nil {
 			logger.Error(err, "failed to disable external-dns on source Ingress after Gateway creation")
 			// Don't fail the reconcile - Gateway is already created
+		} else if waiting != "" {
+			logger.Info("Keeping external-dns on source Ingress until its HTTPRoutes are accepted",
+				"reason", waiting)
 		}
 	}
 
@@ -339,22 +359,31 @@ func (r *HTTPRouteReconciler) handleHTTPRouteCreateOrUpdate(ctx context.Context,
 }
 
 // disableExternalDNSIfCutOver hides the source Ingress from external-dns when its effective
-// post-processing mode (see resolveIngressPostProcessingMode) is disable-external-dns. Call it
-// only once the Gateway serves the Ingress's HTTPRoute. Ignored Ingresses are left alone: the
-// IngressReconciler no longer updates their HTTPRoute, so it may still be shadowed and hiding
-// the Ingress too would drop the DNS record.
+// post-processing mode (see resolveIngressPostProcessingMode) is disable-external-dns and every
+// HTTPRoute generated from it is accepted by its Gateways. external-dns only publishes accepted
+// routes, so hiding the Ingress earlier would leave its hostnames without DNS records. When the
+// routes are not accepted yet, waiting says why and the Ingress is left unchanged. Ignored
+// Ingresses are left alone: the IngressReconciler no longer updates their HTTPRoute, so it may
+// still be shadowed and hiding the Ingress too would drop the DNS record.
 func (r *HTTPRouteReconciler) disableExternalDNSIfCutOver(
 	ctx context.Context,
 	ingress *networkingv1.Ingress,
-) error {
+) (waiting string, err error) {
 	if ingress != nil && ingress.Annotations[IgnoreIngressAnnotation] == "true" {
-		return nil
+		return "", nil
 	}
 	mode := resolveIngressPostProcessingMode(r.IngressPostProcessingMode, ingress)
 	if mode != IngressPostProcessingModeDisableExternalDNS {
-		return nil
+		return "", nil
 	}
-	return DisableExternalDNS(ctx, r.Client, ingress)
+	accepted, reason, err := IngressRoutesAccepted(ctx, r.Client, ingress)
+	if err != nil {
+		return "", err
+	}
+	if !accepted {
+		return reason, nil
+	}
+	return "", DisableExternalDNS(ctx, r.Client, ingress)
 }
 
 // releasePreviousGateway cleans up the Gateway this HTTPRoute was attached to before its parentRef
@@ -984,7 +1013,7 @@ func (r *HTTPRouteReconciler) ensureReferenceGrantSource(ctx context.Context, na
 				From: []gatewayv1beta1.ReferenceGrantFrom{
 					{
 						Group:     gatewayv1.GroupName,
-						Kind:      "Gateway",
+						Kind:      gatewayKind,
 						Namespace: gatewayv1.Namespace(r.GatewayNamespace),
 					},
 				},

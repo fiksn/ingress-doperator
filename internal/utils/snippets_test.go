@@ -390,3 +390,64 @@ func TestBuildNginxIngressSnippets_CustomErrorPerIngressLocation(t *testing.T) {
 		t.Errorf("server context missing per-Ingress named error location: %q", server)
 	}
 }
+
+func TestBuildNginxIngressSnippets_ValidatesValueSyntax(t *testing.T) {
+	tests := []struct {
+		annotation string
+		value      string
+		directive  string
+		valid      bool
+	}{
+		{"proxy-body-size", "10m", "client_max_body_size 10m;", true},
+		{"proxy-body-size", "0", "client_max_body_size 0;", true},
+		{"proxy-body-size", "10Mb", "client_max_body_size", false},
+		{"proxy-body-size", "1.5m", "client_max_body_size", false},
+		{"client-max-body-size", "512K", "client_max_body_size 512K;", true},
+		{"client-max-body-size", "lots", "client_max_body_size", false},
+		{"proxy-buffer-size", "16k", "proxy_buffer_size 16k;", true},
+		{"proxy-buffer-size", "16kb", "proxy_buffer_size", false},
+		{"proxy-read-timeout", "100", "proxy_read_timeout 100;", true},
+		{"proxy-read-timeout", "1m30s", "proxy_read_timeout 1m30s;", true},
+		{"proxy-read-timeout", "100sec", "proxy_read_timeout", false},
+		{"proxy-next-upstream-tries", "3", "proxy_next_upstream_tries 3;", true},
+		{"proxy-next-upstream-tries", "three", "proxy_next_upstream_tries", false},
+		{"proxy-buffering", "off", "proxy_buffering off;", true},
+		{"proxy-buffering", "false", "proxy_buffering", false},
+		{"satisfy", "any", "satisfy any;", true},
+		{"satisfy", "some", "satisfy", false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.annotation+"="+tt.value, func(t *testing.T) {
+			annotations := map[string]string{
+				authPrefix + tt.annotation:    tt.value,
+				authPrefix + "proxy-ssl-name": "upstream.example.com",
+			}
+			snippets, warnings, ok := BuildNginxIngressSnippets(annotations, AuthInputs{Identifier: "x"}, nil)
+			if !ok {
+				t.Fatal("BuildNginxIngressSnippets() produced no snippets")
+			}
+			location := snippetValue(snippets, "http.server.location")
+			if got := strings.Contains(location, tt.directive); got != tt.valid {
+				t.Errorf("snippet contains %q = %v, want %v; snippet:\n%s", tt.directive, got, tt.valid, location)
+			}
+			if got := containsWarning(warnings, "not valid nginx syntax"); got == tt.valid {
+				t.Errorf("syntax warning = %v, want %v; warnings: %v", got, !tt.valid, warnings)
+			}
+		})
+	}
+}
+
+func TestBuildNginxIngressSnippets_ValidatesProxyBuffersNumber(t *testing.T) {
+	annotations := map[string]string{
+		authPrefix + "proxy-buffers-number": "four",
+		authPrefix + "proxy-buffer-size":    "8k",
+	}
+	snippets, warnings, _ := BuildNginxIngressSnippets(annotations, AuthInputs{Identifier: "x"}, nil)
+
+	if location := snippetValue(snippets, "http.server.location"); strings.Contains(location, "proxy_buffers ") {
+		t.Errorf("snippet contains proxy_buffers for invalid number:\n%s", location)
+	}
+	if !containsWarning(warnings, "proxy-buffers-number") {
+		t.Errorf("missing warning for proxy-buffers-number; warnings: %v", warnings)
+	}
+}

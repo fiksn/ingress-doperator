@@ -22,6 +22,8 @@ import (
 	"maps"
 
 	networkingv1 "k8s.io/api/networking/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	"k8s.io/client-go/util/retry"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	gatewayv1 "sigs.k8s.io/gateway-api/apis/v1"
 
@@ -109,7 +111,8 @@ func moveDNSToIngress(
 }
 
 // moveDNSToHTTPRoute marks the Ingress as cut over, un-shadows its HTTPRoutes and only then
-// hides the Ingress from external-dns, so the record is never left without a source.
+// hides the Ingress from external-dns, so the record is never left without a source. It refuses,
+// before changing anything, when a route is not accepted by its Gateway.
 func moveDNSToHTTPRoute(
 	ctx context.Context,
 	cli client.Client,
@@ -123,6 +126,13 @@ func moveDNSToHTTPRoute(
 	if len(routes) == 0 {
 		return fmt.Errorf("no HTTPRoute managed by ingress-doperator exists for this Ingress yet; " +
 			"wait for the operator to convert it")
+	}
+	// external-dns only publishes routes their Gateway accepted; hiding the Ingress before that
+	// would leave its hostnames without DNS records.
+	for i := range routes {
+		if accepted, reason := controller.RouteAccepted(&routes[i]); !accepted {
+			return fmt.Errorf("refusing to move DNS to HTTPRoutes, external-dns would not publish them: %s", reason)
+		}
 	}
 	err := updateIngressWithRetry(ctx, cli, ingress, func(updated *networkingv1.Ingress) (bool, error) {
 		if updated.Annotations == nil {
@@ -158,6 +168,8 @@ func unshadowExternalDNS(route *gatewayv1.HTTPRoute) {
 	}
 }
 
+// updateRoutes applies mutate to the latest version of each route, retrying on conflicts: the
+// operator rewrites the routes when it reconciles the Ingress the reenabler just updated.
 func updateRoutes(
 	ctx context.Context,
 	cli client.Client,
@@ -165,14 +177,25 @@ func updateRoutes(
 	mutate func(*gatewayv1.HTTPRoute),
 ) error {
 	for i := range routes {
-		route := &routes[i]
-		updated := route.DeepCopy()
-		mutate(updated)
-		if maps.Equal(route.Annotations, updated.Annotations) {
+		key := client.ObjectKeyFromObject(&routes[i])
+		err := retry.RetryOnConflict(retry.DefaultRetry, func() error {
+			current := &gatewayv1.HTTPRoute{}
+			if err := cli.Get(ctx, key, current); err != nil {
+				return err
+			}
+			updated := current.DeepCopy()
+			mutate(updated)
+			if maps.Equal(current.Annotations, updated.Annotations) {
+				return nil
+			}
+			return cli.Update(ctx, updated)
+		})
+		if apierrors.IsNotFound(err) {
+			setupLog.Info("HTTPRoute disappeared, skipping", "namespace", key.Namespace, "name", key.Name)
 			continue
 		}
-		if err := cli.Update(ctx, updated); err != nil {
-			return fmt.Errorf("failed to update HTTPRoute %s/%s: %w", route.Namespace, route.Name, err)
+		if err != nil {
+			return fmt.Errorf("failed to update HTTPRoute %s: %w", key, err)
 		}
 	}
 	return nil

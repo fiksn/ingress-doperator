@@ -247,7 +247,7 @@ func desiredHTTPSRedirectRoute(gateway *gatewayv1.Gateway) *gatewayv1.HTTPRoute 
 			},
 			OwnerReferences: []metav1.OwnerReference{{
 				APIVersion: gatewayv1.GroupVersion.String(),
-				Kind:       "Gateway",
+				Kind:       gatewayKind,
 				Name:       gateway.Name,
 				UID:        gateway.UID,
 				Controller: ptr.To(true),

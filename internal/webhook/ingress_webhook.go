@@ -531,6 +531,7 @@ func (m *IngressMutator) applyIngressAnnotationSnippetsFilter(
 			"warning", warning,
 			"namespace", ingress.Namespace,
 			"name", ingress.Name)
+		m.recordWarning(ingress, "SnippetAnnotationWarning", warning)
 	}
 
 	filterName := utils.AutomaticSnippetsFilterName(ingress.Name)

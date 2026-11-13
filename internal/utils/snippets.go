@@ -71,6 +71,8 @@ const (
 	proxyRedirectFromKey     = "proxy-redirect-from"
 	proxyRedirectToKey       = "proxy-redirect-to"
 	proxyBuffersNumberKey    = "proxy-buffers-number"
+	proxyBufferSizeKey       = "proxy-buffer-size"
+	sslPreferServerCiphers   = "ssl-prefer-server-ciphers"
 	browserXssFilterKey      = "browser-xss-filter"
 	contentTypeNosniffKey    = "content-type-nosniff"
 	referrerPolicyKey        = "referrer-policy"
@@ -111,7 +113,7 @@ type AuthInputs struct {
 var nginxIngressDirectiveWhitelist = map[string]struct{}{
 	"client-body-buffer-size":     {},
 	"http2-push-preload":          {},
-	"proxy-buffer-size":           {},
+	proxyBufferSizeKey:            {},
 	"proxy-buffering":             {},
 	"proxy-busy-buffers-size":     {},
 	"proxy-connect-timeout":       {},
@@ -133,7 +135,59 @@ var nginxIngressDirectiveWhitelist = map[string]struct{}{
 	"proxy-ssl-verify-depth":      {},
 	"satisfy":                     {},
 	"ssl-ciphers":                 {},
-	"ssl-prefer-server-ciphers":   {},
+	sslPreferServerCiphers:        {},
+}
+
+// NGINX value syntax per annotation suffix. Values are copied verbatim into SnippetsFilters, and
+// NGINX rejects the whole configuration of a Gateway when one directive is invalid (e.g.
+// client_max_body_size 10Mb), so invalid values are dropped instead.
+var (
+	nginxSizeSyntax    = regexp.MustCompile(`^[0-9]+[kKmMgG]?$`)
+	nginxTimeSyntax    = regexp.MustCompile(`^([0-9]+|([0-9]+(ms|s|m|h|d|w|M|y))+)$`)
+	nginxNumberSyntax  = regexp.MustCompile(`^[0-9]+$`)
+	nginxOnOffSyntax   = regexp.MustCompile(`^(on|off)$`)
+	nginxSatisfySyntax = regexp.MustCompile(`^(all|any)$`)
+
+	nginxIngressValueSyntax = map[string]*regexp.Regexp{
+		proxyBodySizeKey:              nginxSizeSyntax,
+		clientMaxBodySizeKey:          nginxSizeSyntax,
+		"client-body-buffer-size":     nginxSizeSyntax,
+		proxyBufferSizeKey:            nginxSizeSyntax,
+		"proxy-busy-buffers-size":     nginxSizeSyntax,
+		"proxy-max-temp-file-size":    nginxSizeSyntax,
+		"proxy-connect-timeout":       nginxTimeSyntax,
+		"proxy-read-timeout":          nginxTimeSyntax,
+		"proxy-send-timeout":          nginxTimeSyntax,
+		"proxy-next-upstream-timeout": nginxTimeSyntax,
+		proxyBuffersNumberKey:         nginxNumberSyntax,
+		"proxy-next-upstream-tries":   nginxNumberSyntax,
+		"proxy-ssl-verify-depth":      nginxNumberSyntax,
+		"http2-push-preload":          nginxOnOffSyntax,
+		"proxy-buffering":             nginxOnOffSyntax,
+		"proxy-request-buffering":     nginxOnOffSyntax,
+		"proxy-ssl-server-name":       nginxOnOffSyntax,
+		"proxy-ssl-verify":            nginxOnOffSyntax,
+		sslPreferServerCiphers:        nginxOnOffSyntax,
+		"satisfy":                     nginxSatisfySyntax,
+	}
+)
+
+// isValidSnippetValue reports whether value is valid NGINX syntax for the annotation suffix,
+// recording a warning when it is not. Suffixes without a known syntax are accepted.
+func isValidSnippetValue(state *nginxIngressSnippetState, suffix, value string) bool {
+	syntax, known := nginxIngressValueSyntax[suffix]
+	if !known || syntax.MatchString(value) {
+		return true
+	}
+	state.warnings = append(state.warnings, fmt.Sprintf(
+		"annotation %s%s value %q is not valid nginx syntax; ignoring", nginxIngressAnnotationPrefix, suffix, value))
+	return false
+}
+
+// isUsableSnippetValue reports whether value is both free of injection characters and valid
+// NGINX syntax for the annotation suffix.
+func isUsableSnippetValue(state *nginxIngressSnippetState, suffix, value string) bool {
+	return isSafeSnippetValue(state, suffix, value) && isValidSnippetValue(state, suffix, value)
 }
 
 func isWhitelistedNginxIngressDirective(suffix string) bool {
@@ -145,8 +199,8 @@ func isWhitelistedNginxIngressDirective(suffix string) bool {
 // nginx server (not location) context. They must be emitted in the http.server
 // SnippetsFilter context and therefore collide when multiple Ingresses share a host.
 var nginxServerOnlyDirectives = map[string]struct{}{
-	"ssl-ciphers":               {},
-	"ssl-prefer-server-ciphers": {},
+	"ssl-ciphers":          {},
+	sslPreferServerCiphers: {},
 }
 
 func isServerOnlyNginxIngressDirective(suffix string) bool {
@@ -580,7 +634,8 @@ func ingestNginxIngressAnnotations(
 			if !isWhitelistedNginxIngressDirective(entry.suffix) {
 				continue
 			}
-			if !isSafeSnippetValue(&state, entry.fullKey, value) {
+			if !isSafeSnippetValue(&state, entry.fullKey, value) ||
+				!isValidSnippetValue(&state, entry.suffix, value) {
 				continue
 			}
 			directive := strings.ReplaceAll(entry.suffix, "-", "_")
@@ -591,7 +646,7 @@ func ingestNginxIngressAnnotations(
 				state.serverOnlyLines = append(state.serverOnlyLines, fmt.Sprintf("%s %s;", directive, value))
 				continue
 			}
-			if entry.suffix == "proxy-buffer-size" {
+			if entry.suffix == proxyBufferSizeKey {
 				state.proxyBufferSize = value
 			}
 			state.lines = append(state.lines, fmt.Sprintf("%s %s;", directive, value))
@@ -614,7 +669,7 @@ func applyIngressAnnotationValue(state *nginxIngressSnippetState, suffix, value 
 	case configurationSnippetKey, serverSnippetKey, authSnippetKey:
 		return true
 	case proxyBodySizeKey:
-		if !isSafeSnippetValue(state, suffix, value) {
+		if !isUsableSnippetValue(state, suffix, value) {
 			return true
 		}
 		state.proxyBodySizeValue = value
@@ -630,7 +685,7 @@ func applyIngressAnnotationValue(state *nginxIngressSnippetState, suffix, value 
 		state.blacklistSourceRanges = append(state.blacklistSourceRanges, ranges...)
 		return true
 	case clientMaxBodySizeKey:
-		if !isSafeSnippetValue(state, suffix, value) {
+		if !isUsableSnippetValue(state, suffix, value) {
 			return true
 		}
 		state.clientMaxBodySize = value
@@ -648,7 +703,7 @@ func applyIngressAnnotationValue(state *nginxIngressSnippetState, suffix, value 
 		state.proxyRedirectTo = value
 		return true
 	case proxyBuffersNumberKey:
-		if !isSafeSnippetValue(state, suffix, value) {
+		if !isUsableSnippetValue(state, suffix, value) {
 			return true
 		}
 		state.proxyBuffersNumber = value
