@@ -346,24 +346,8 @@ func (r *IngressReconciler) reconcileIngressToHTTPRoute(
 	transConfig.GatewayName = gatewayName
 	singleTrans := translator.New(transConfig)
 
-	// Gather canary siblings sharing a path with this primary Ingress.
-	canaries := r.findCanarySiblings(ctx, ingress)
-
-	// Translate to HTTPRoute (we no longer create Gateway here)
-	httpRoute := singleTrans.TranslateToHTTPRouteWithCanaries(ingress, canaries)
-	setHTTPRouteOwnerReference(httpRoute, ingress)
-
-	// Apply extension refs (snippets, auth, headers)
-	r.applyHTTPRouteExtensionRefs(ctx, ingress, httpRoute)
-	applyWildcardSectionNames(httpRoute, r.WildcardListeners)
-
-	// Resolve any named ports before applying (search canary siblings too)
-	if err := r.HTTPRouteManager.ResolveNamedPorts(ctx, ingress, httpRoute, canaries...); err != nil {
-		logger.Error(err, "failed to resolve named ports")
-		// Continue anyway with fallback ports
-	}
-
-	routes := r.httpListenerRoutes(ingress, singleTrans, httpRoute)
+	// Translate to HTTPRoutes (we no longer create Gateway here)
+	routes, unresolvedPorts := r.translateIngressRoutes(ctx, ingress, singleTrans)
 	if effectiveMode == IngressPostProcessingModeShadowExternalDNS {
 		for _, route := range routes {
 			ShadowExternalDNS(route)
@@ -392,7 +376,7 @@ func (r *IngressReconciler) reconcileIngressToHTTPRoute(
 		return ctrl.Result{}, err
 	}
 
-	logger.V(1).Info("HTTPRoute applied successfully", "namespace", httpRoute.Namespace, "name", httpRoute.Name)
+	logger.V(1).Info("HTTPRoutes applied successfully", "namespace", ingress.Namespace, "count", len(httpRoutes))
 
 	// Ensure Gateway listeners are updated from this Ingress change before post-processing
 	listenerReconciler := r.newGatewayListenerReconciler()
@@ -447,8 +431,58 @@ func (r *IngressReconciler) reconcileIngressToHTTPRoute(
 		// Do nothing
 	}
 
+	if len(unresolvedPorts) > 0 {
+		// The routes use fallback ports until the Services exist. Requeueing keeps the Ingress out
+		// of the reconcile cache; the Service watch usually triggers the retry sooner.
+		r.recordWarning(ingress, "NamedPortUnresolved", fmt.Sprintf(
+			"named Service ports %s could not be resolved (Service or port missing), using port 80 until they are",
+			strings.Join(unresolvedPorts, ", ")))
+		return ctrl.Result{RequeueAfter: requeueAfterError}, nil
+	}
+
 	r.recordNormal(ingress, "ReconcileSuccess", "Ingress reconciled to HTTPRoute successfully")
 	return ctrl.Result{}, nil
+}
+
+// translateIngressRoutes translates the Ingress, with its canary siblings folded in, into the
+// HTTPRoutes it needs before sharding and splitting: one per group of hosts with identical paths
+// (see TranslateToHTTPRoutesWithCanaries), plus the plain HTTP routes of --http-redirect. Named
+// Service ports are resolved per path before translating, so paths using the same Service on
+// different named ports keep their own port; unresolvedPorts lists those whose Service or port
+// does not exist (yet).
+func (r *IngressReconciler) translateIngressRoutes(
+	ctx context.Context,
+	ingress *networkingv1.Ingress,
+	trans *translator.Translator,
+) (routes []*gatewayv1.HTTPRoute, unresolvedPorts []string) {
+	logger := log.FromContext(ctx)
+	canaries := r.findCanarySiblings(ctx, ingress)
+	resolvedCanaries := make([]*networkingv1.Ingress, 0, len(canaries))
+	for _, canary := range canaries {
+		resolvedCanary, unresolved := r.HTTPRouteManager.WithResolvedNamedPorts(ctx, canary)
+		resolvedCanaries = append(resolvedCanaries, resolvedCanary)
+		unresolvedPorts = append(unresolvedPorts, unresolved...)
+	}
+	resolved, unresolved := r.HTTPRouteManager.WithResolvedNamedPorts(ctx, ingress)
+	unresolvedPorts = append(unresolvedPorts, unresolved...)
+
+	translated := trans.TranslateToHTTPRoutesWithCanaries(resolved, resolvedCanaries)
+	routes = make([]*gatewayv1.HTTPRoute, 0, len(translated))
+	for _, httpRoute := range translated {
+		setHTTPRouteOwnerReference(httpRoute, ingress)
+
+		// Apply extension refs (snippets, auth, headers)
+		r.applyHTTPRouteExtensionRefs(ctx, ingress, httpRoute)
+		applyWildcardSectionNames(httpRoute, r.WildcardListeners)
+
+		// Resolve named ports that could not be resolved per path (search canary siblings too)
+		if err := r.HTTPRouteManager.ResolveNamedPorts(ctx, ingress, httpRoute, canaries...); err != nil {
+			logger.Error(err, "failed to resolve named ports")
+			// Continue anyway with fallback ports
+		}
+		routes = append(routes, r.httpListenerRoutes(ingress, trans, httpRoute)...)
+	}
+	return routes, unresolvedPorts
 }
 
 // listSiblingIngresses returns the Ingresses in the same namespace as the given Ingress.
@@ -1696,7 +1730,8 @@ func matchIngressClassPatterns(patterns []string, ingressClass, label string) bo
 
 func (r *IngressReconciler) SetupWithManager(mgr ctrl.Manager) error {
 	b := ctrl.NewControllerManagedBy(mgr).
-		For(&networkingv1.Ingress{})
+		For(&networkingv1.Ingress{}).
+		Watches(&corev1.Service{}, handler.EnqueueRequestsFromMapFunc(r.enqueueIngressesForService))
 
 	if len(r.WatchNamespaces) > 0 {
 		b = b.WithEventFilter(NamespaceFilter(r.WatchNamespaces))
@@ -1771,6 +1806,31 @@ func (r *IngressReconciler) SetupWithManager(mgr ctrl.Manager) error {
 	}
 
 	return b.Complete(r)
+}
+
+// enqueueIngressesForService re-reconciles the Ingresses that use the Service by a named port, so
+// their HTTPRoutes pick up the Service's port numbers when it is created (e.g. after the Ingress)
+// or its ports change. They are evicted from the reconcile cache, which would otherwise skip them
+// as unchanged.
+func (r *IngressReconciler) enqueueIngressesForService(ctx context.Context, obj client.Object) []reconcile.Request {
+	list := &networkingv1.IngressList{}
+	if err := r.List(ctx, list, client.InNamespace(obj.GetNamespace())); err != nil {
+		log.FromContext(ctx).Error(err, "failed to list Ingresses for Service change",
+			"namespace", obj.GetNamespace(), "service", obj.GetName())
+		return nil
+	}
+	var requests []reconcile.Request
+	for i := range list.Items {
+		ingress := &list.Items[i]
+		if !r.shouldEnqueueIngress(ingress) || !utils.ReferencesServiceByPortName(ingress, obj.GetName()) {
+			continue
+		}
+		r.evictReconcileCache(ingress)
+		requests = append(requests, reconcile.Request{
+			NamespacedName: types.NamespacedName{Namespace: ingress.Namespace, Name: ingress.Name},
+		})
+	}
+	return requests
 }
 
 func (r *IngressReconciler) enqueueAllIngresses(ctx context.Context) []reconcile.Request {

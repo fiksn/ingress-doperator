@@ -18,8 +18,10 @@ package utils
 
 import (
 	"context"
+	"strings"
 	"testing"
 
+	corev1 "k8s.io/api/core/v1"
 	networkingv1 "k8s.io/api/networking/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
@@ -127,5 +129,54 @@ func TestApplyHTTPRoutes_UpdatesInPlaceAndDeletesObsolete(t *testing.T) {
 	}
 	if _, ok := exists("api-other"); !ok {
 		t.Error("route of another Ingress sharing the name prefix must be kept")
+	}
+}
+
+func TestWithResolvedNamedPorts(t *testing.T) {
+	scheme := runtime.NewScheme()
+	if err := corev1.AddToScheme(scheme); err != nil {
+		t.Fatalf("failed to add corev1 to scheme: %v", err)
+	}
+	service := &corev1.Service{
+		ObjectMeta: metav1.ObjectMeta{Namespace: "app", Name: "store"},
+		Spec:       corev1.ServiceSpec{Ports: []corev1.ServicePort{{Name: "api", Port: 9000}}},
+	}
+	manager := &HTTPRouteManager{Client: fake.NewClientBuilder().WithScheme(scheme).WithObjects(service).Build()}
+	path := func(serviceName string, port networkingv1.ServiceBackendPort) networkingv1.HTTPIngressPath {
+		return networkingv1.HTTPIngressPath{Path: "/", Backend: networkingv1.IngressBackend{
+			Service: &networkingv1.IngressServiceBackend{Name: serviceName, Port: port},
+		}}
+	}
+	ingress := &networkingv1.Ingress{
+		ObjectMeta: metav1.ObjectMeta{Namespace: "app", Name: "web"},
+		Spec: networkingv1.IngressSpec{Rules: []networkingv1.IngressRule{{
+			Host: "a.example.com",
+			IngressRuleValue: networkingv1.IngressRuleValue{HTTP: &networkingv1.HTTPIngressRuleValue{
+				Paths: []networkingv1.HTTPIngressPath{
+					path("store", networkingv1.ServiceBackendPort{Name: "api"}),
+					path("store", networkingv1.ServiceBackendPort{Name: "missing"}),
+					path("absent", networkingv1.ServiceBackendPort{Name: "api"}),
+					path("store", networkingv1.ServiceBackendPort{Number: 8080}),
+				},
+			}},
+		}}},
+	}
+
+	resolved, unresolved := manager.WithResolvedNamedPorts(context.Background(), ingress)
+
+	wantPorts := []networkingv1.ServiceBackendPort{{Number: 9000}, {Name: "missing"}, {Name: "api"}, {Number: 8080}}
+	for i, want := range wantPorts {
+		if got := resolved.Spec.Rules[0].HTTP.Paths[i].Backend.Service.Port; got != want {
+			t.Errorf("path %d port = %+v, want %+v", i, got, want)
+		}
+	}
+	if want := []string{"store:missing", "absent:api"}; strings.Join(unresolved, ",") != strings.Join(want, ",") {
+		t.Errorf("unresolved = %v, want %v", unresolved, want)
+	}
+	if ingress.Spec.Rules[0].HTTP.Paths[0].Backend.Service.Port.Name != "api" {
+		t.Error("WithResolvedNamedPorts modified the original Ingress")
+	}
+	if !ReferencesServiceByPortName(ingress, "store") || ReferencesServiceByPortName(ingress, "other") {
+		t.Error("ReferencesServiceByPortName() does not match the named-port backends")
 	}
 }

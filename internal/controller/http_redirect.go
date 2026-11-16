@@ -121,6 +121,9 @@ func (r *IngressReconciler) httpListenerRoutes(
 		return []*gatewayv1.HTTPRoute{httpRoute}
 	}
 	httpsHosts, httpHosts := classifyHostnames(ingress, trans.TransformHostname, r.WildcardListeners)
+	// An Ingress whose hosts have different paths has one HTTPRoute per group of hosts.
+	httpsHosts = keepRouteHostnames(httpsHosts, httpRoute)
+	httpHosts = keepRouteHostnames(httpHosts, httpRoute)
 
 	var routes []*gatewayv1.HTTPRoute
 	if len(httpHosts) > 0 {
@@ -137,6 +140,21 @@ func (r *IngressReconciler) httpListenerRoutes(
 		routes = append([]*gatewayv1.HTTPRoute{httpRoute}, routes...)
 	}
 	return routes
+}
+
+// keepRouteHostnames returns the hostnames that httpRoute serves.
+func keepRouteHostnames(hostnames []gatewayv1.Hostname, httpRoute *gatewayv1.HTTPRoute) []gatewayv1.Hostname {
+	served := make(map[gatewayv1.Hostname]bool, len(httpRoute.Spec.Hostnames))
+	for _, hostname := range httpRoute.Spec.Hostnames {
+		served[hostname] = true
+	}
+	kept := make([]gatewayv1.Hostname, 0, len(hostnames))
+	for _, hostname := range hostnames {
+		if served[hostname] {
+			kept = append(kept, hostname)
+		}
+	}
+	return kept
 }
 
 // restrictToHostnames keeps only hostnames on httpRoute, and only the parentRefs of their listeners.

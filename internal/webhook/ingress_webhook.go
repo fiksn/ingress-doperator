@@ -125,15 +125,26 @@ func (m *IngressMutator) Handle(ctx context.Context, req admission.Request) admi
 		return admission.Errored(http.StatusInternalServerError, err)
 	}
 
-	// Resolve any named ports
-	if err := m.HTTPRouteManager.ResolveNamedPorts(ctx, ingress, httpRoute); err != nil {
-		logger.Error(err, "failed to resolve named ports")
-		m.recordWarning(ingress, "ResolveNamedPortsFailed", "failed to resolve named ports")
-		// Continue anyway with fallback ports
+	// Built-in translation needs one HTTPRoute per group of hosts with identical paths, with named
+	// ports resolved per path; ingress2gateway produces its own single route.
+	routes := []*gatewayv1.HTTPRoute{httpRoute}
+	if !m.Translator.Config.UseIngress2Gateway {
+		// Unresolved ports are retried by the operator, which watches Services.
+		resolved, _ := m.HTTPRouteManager.WithResolvedNamedPorts(ctx, ingress)
+		routes = m.Translator.TranslateToHTTPRoutesWithCanaries(resolved, nil)
 	}
 
-	// Split HTTPRoute if it exceeds the Gateway API limit
-	httpRoutes := m.HTTPRouteManager.SplitHTTPRouteIfNeeded(httpRoute)
+	var httpRoutes []*gatewayv1.HTTPRoute
+	for _, route := range routes {
+		// Resolve named ports that could not be resolved per path
+		if err := m.HTTPRouteManager.ResolveNamedPorts(ctx, ingress, route); err != nil {
+			logger.Error(err, "failed to resolve named ports")
+			m.recordWarning(ingress, "ResolveNamedPortsFailed", "failed to resolve named ports")
+			// Continue anyway with fallback ports
+		}
+		// Split HTTPRoute if it exceeds the Gateway API limit
+		httpRoutes = append(httpRoutes, m.HTTPRouteManager.SplitHTTPRouteIfNeeded(route)...)
+	}
 
 	// Create the Gateway resource
 	if err := m.Client.Create(ctx, gateway); err != nil {
