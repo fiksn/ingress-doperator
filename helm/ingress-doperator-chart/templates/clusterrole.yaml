@@ -47,6 +47,19 @@ rules:
       - get
       - update
       - patch
+  # Generated for nginx.ingress.kubernetes.io/backend-protocol: HTTPS
+  - apiGroups:
+      - gateway.networking.k8s.io
+    resources:
+      - backendtlspolicies
+    verbs:
+      - get
+      - list
+      - watch
+      - create
+      - update
+      - patch
+      - delete
   # NGINX Gateway Fabric CRDs (snippets, auth, rate limit, etc.)
   - apiGroups:
       - gateway.nginx.org

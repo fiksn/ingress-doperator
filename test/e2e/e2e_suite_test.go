@@ -42,7 +42,7 @@ var (
 
 	// projectImage is the name of the image which will be build and loaded
 	// with the code source changes to be tested.
-	projectImage = "fiksn/ingress-doperator:v0.1.5"
+	projectImage = "fiksn/ingress-doperator:v0.1.6"
 )
 
 // TestE2E runs the end-to-end (e2e) test suite for the project. These tests execute in an isolated,

@@ -174,7 +174,7 @@ spec:
     spec:
       containers:
       - name: webhook
-        image: fiksn/ingress-doperator-webhook:v0.1.5
+        image: fiksn/ingress-doperator-webhook:v0.1.6
         imagePullPolicy: Always
         command:
           - /webhook
@@ -383,6 +383,82 @@ Notes and limitations:
 - `auth-proxy-set-headers` is resolved by the operator (the webhook fast-path
   does not read the ConfigMap). Editing the referenced ConfigMap does not by
   itself re-trigger reconciliation — touch the Ingress to apply header changes.
+
+### Upstream Host header (`upstream-vhost`)
+
+`nginx.ingress.kubernetes.io/upstream-vhost` becomes a `URLRewrite` filter with `hostname` on
+every rule of the Ingress's HTTPRoutes, so the backends receive that `Host` header:
+
+```yaml
+filters:
+- type: URLRewrite
+  urlRewrite:
+    hostname: backend.internal.example
+```
+
+Only a plain hostname can be translated. Values with NGINX variables (e.g. `$host`), a port or a
+wildcard are skipped with an `UnsupportedAnnotation` warning event on the Ingress, and the
+backends receive the original `Host` header.
+
+This sets only the `Host` header. TLS to the backend is configured separately, see
+[Backend TLS](#backend-tls-backend-protocol-https).
+
+### Backend TLS (`backend-protocol: HTTPS`)
+
+For an Ingress with `nginx.ingress.kubernetes.io/backend-protocol: HTTPS` the operator generates a
+`BackendTLSPolicy` for each backend Service, named `ingress-doperator-<service>` in the Service's
+namespace. It attaches to the Service, so it applies whichever Gateway (shared, shard or dedicated)
+routes to it:
+
+```yaml
+apiVersion: gateway.networking.k8s.io/v1
+kind: BackendTLSPolicy
+metadata:
+  name: ingress-doperator-kibana-kb-http
+  annotations:
+    ingress-doperator.fiction.si/managed-by: ingress-doperator
+    ingress-doperator.fiction.si/source: monitoring/kibana     # every Ingress using it
+    # from ingress-doperator.fiction.si/backend-tls-ca: "ConfigMap/kibana-kb-http-ca"
+spec:
+  targetRefs:
+  - group: ""
+    kind: Service
+    name: kibana-kb-http
+    sectionName: https                                      # the Service port name, if it has one
+  validation:
+    hostname: kibana-kb-http.monitoring.svc
+    caCertificateRefs:
+    - group: ""
+      kind: ConfigMap
+      name: kibana-kb-http-ca
+```
+
+Gateway API always verifies the backend certificate, so the policy needs a hostname and a CA:
+
+| Field | Taken from, in order |
+|-------|----------------------|
+| `validation.hostname` (SNI and certificate name) | `nginx.ingress.kubernetes.io/proxy-ssl-name`, `upstream-vhost`, `<service>.<namespace>.svc` |
+| CA (key `ca.crt`, same namespace) | `ingress-doperator.fiction.si/backend-tls-ca: "Secret/<name>"` or `"ConfigMap/<name>"`, `nginx.ingress.kubernetes.io/proxy-ssl-secret`, the system CAs (`wellKnownCACertificates: System`) |
+
+With the system CAs, backends with self-signed certificates fail with a 5xx; set
+`backend-tls-ca` for them.
+
+Prefer a ConfigMap. NGINX Gateway Fabric (v2.0+; 1.x supports ConfigMaps only) accepts a `Secret`
+CA only of type `kubernetes.io/tls`, i.e. with a valid `tls.crt`/`tls.key` pair. An `Opaque` Secret
+holding just `ca.crt`, such as ECK's `<name>-kb-http-certs-public`, is rejected with
+`unsupported secret type "Opaque"`. Reference a ConfigMap with the CA instead, or a
+`kubernetes.io/tls` Secret that also holds the CA in `ca.crt`.
+
+`BackendTLSSetting` warning events on the Ingress report what the policy cannot express:
+`proxy-ssl-verify: "off"` (the policy always verifies), a client certificate in `proxy-ssl-secret`
+(not sent), a `proxy-ssl-secret` in another namespace, and falling back to the system CAs.
+
+The policy is shared by all Ingresses using the Service. When their settings differ, it keeps the
+settings it already has (or those of the first Ingress by name) and the others get a
+`BackendTLSPolicyConflict` warning. It is updated as Ingresses stop using the Service and deleted
+when none does. A `BackendTLSPolicy` for the Service that ingress-doperator does not manage is left
+in charge (`BackendTLSPolicyNotManaged` warning). Without the BackendTLSPolicy CRD the operator
+records `BackendTLSPolicyUnavailable` and generates nothing.
 
 ### Canary traffic splitting
 
@@ -1196,7 +1272,7 @@ left uncommitted; commit and tag it yourself.
 **Build and push your image to the location specified by `IMG`:**
 
 ```sh
-make docker-build docker-push IMG=fiksn/ingress-doperator:v0.1.5
+make docker-build docker-push IMG=fiksn/ingress-doperator:v0.1.6
 ```
 
 **NOTE:** This image ought to be published in the personal registry you specified.
@@ -1255,7 +1331,7 @@ Following the options to release and provide this solution to the users.
 1. Build the installer for the image built and published in the registry:
 
 ```sh
-make build-installer IMG=fiksn/ingress-doperator:v0.1.5
+make build-installer IMG=fiksn/ingress-doperator:v0.1.6
 ```
 
 **NOTE:** The makefile target mentioned above generates an 'install.yaml'

@@ -117,6 +117,11 @@ func (m *IngressMutator) Handle(ctx context.Context, req admission.Request) admi
 		logger.Info("Ingress has allow annotation, will permit creation after translation")
 	}
 
+	for _, warning := range translator.UnsupportedAnnotationWarnings(ingress) {
+		logger.Info("Ingress annotation is not translated", "warning", warning)
+		m.recordWarning(ingress, "UnsupportedAnnotation", warning)
+	}
+
 	// Translate Ingress to Gateway API resources
 	gateway, httpRoute, err := m.Translator.Translate(ingress)
 	if err != nil {
@@ -243,7 +248,7 @@ func (m *IngressMutator) recordWarning(ingress *networkingv1.Ingress, reason, me
 	if m.Recorder == nil || ingress == nil {
 		return
 	}
-	m.Recorder.Eventf(ingress, nil, "Warning", reason, "Webhook", message)
+	m.Recorder.Eventf(ingress, nil, "Warning", reason, "Webhook", "%s", message)
 }
 
 func (m *IngressMutator) applyIngressClassSnippetsFilters(

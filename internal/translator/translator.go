@@ -720,6 +720,9 @@ func (t *Translator) TranslateToHTTPRouteWithCanaries(
 
 	requestHeaderFilter, responseHeaderFilter := buildHeaderModifierFilters(ingress.Annotations)
 	filters := collectFilters(requestHeaderFilter, responseHeaderFilter)
+	if upstreamVhostFilter := buildUpstreamVhostFilter(ingress.Annotations); upstreamVhostFilter != nil {
+		filters = append(filters, *upstreamVhostFilter)
+	}
 	canaryEntries := collectCanaryEntries(canaries, logger)
 
 	httpRoute.Spec.Rules = t.buildHTTPRouteRules(ingress, canaryEntries, filters, logger)

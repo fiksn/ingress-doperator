@@ -29,6 +29,7 @@ import (
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/apimachinery/pkg/util/intstr"
+	"k8s.io/client-go/tools/events"
 	"k8s.io/utils/ptr"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -556,5 +557,80 @@ func TestEnqueueIngressesForService_OnlyNamedPortUsers(t *testing.T) {
 
 	if len(requests) != 1 || requests[0].Name != named.Name {
 		t.Errorf("enqueueIngressesForService() = %v, want only %s", requests, named.Name)
+	}
+}
+
+func TestReconcile_WarnsAboutBackendProtocol(t *testing.T) {
+	ingress := multiHostIngress(hostRule(consoleHost, ingressPath("/", networkingv1.PathTypePrefix, "legacy", numberedPort(9000))))
+	ingress.Annotations = map[string]string{"nginx.ingress.kubernetes.io/backend-protocol": "FCGI"}
+	recorder := events.NewFakeRecorder(10)
+
+	translateIngressWith(t, func(r *IngressReconciler) { r.Recorder = recorder }, ingress)
+
+	for {
+		select {
+		case event := <-recorder.Events:
+			if strings.HasPrefix(event, "Warning UnsupportedAnnotation ") && strings.Contains(event, "FCGI") {
+				return
+			}
+		default:
+			t.Fatal("no UnsupportedAnnotation warning event for backend-protocol: FCGI")
+		}
+	}
+}
+
+// TestReconcile_UpstreamVhost checks that the upstream-vhost hostname reaches every rule of every
+// generated route, including the plain HTTP route of --http-redirect.
+func TestReconcile_UpstreamVhost(t *testing.T) {
+	const plainHost = "plain.example.com"
+	ingress := multiHostIngress(
+		hostRule(consoleHost, ingressPath("/", networkingv1.PathTypePrefix, "console", numberedPort(80))),
+		hostRule(apiHost, ingressPath("/", networkingv1.PathTypePrefix, "api", numberedPort(80))),
+		hostRule(plainHost, ingressPath("/", networkingv1.PathTypePrefix, "plain", numberedPort(80))),
+	)
+	ingress.Spec.TLS = []networkingv1.IngressTLS{{Hosts: []string{consoleHost, apiHost}, SecretName: "objects-tls"}}
+	ingress.Annotations = map[string]string{"nginx.ingress.kubernetes.io/upstream-vhost": "backend.internal.example"}
+
+	routes := translateIngressWith(t, func(r *IngressReconciler) { r.HTTPRedirect = true }, ingress)
+
+	if len(routes) < 3 {
+		t.Fatalf("got %d routes, want one per host group plus the plain HTTP route", len(routes))
+	}
+	for _, route := range routes {
+		for i, rule := range route.Spec.Rules {
+			found := false
+			for _, filter := range rule.Filters {
+				if filter.URLRewrite != nil && filter.URLRewrite.Hostname != nil &&
+					string(*filter.URLRewrite.Hostname) == "backend.internal.example" {
+					found = true
+				}
+			}
+			if !found {
+				t.Errorf("HTTPRoute %s rule %d has no URLRewrite to backend.internal.example: %+v",
+					route.Name, i, rule.Filters)
+			}
+		}
+	}
+}
+
+func TestReconcile_WarningKeepsPercentSigns(t *testing.T) {
+	ingress := multiHostIngress(hostRule(consoleHost, ingressPath("/", networkingv1.PathTypePrefix, "web", numberedPort(80))))
+	ingress.Annotations = map[string]string{"nginx.ingress.kubernetes.io/upstream-vhost": "100%host"}
+	recorder := events.NewFakeRecorder(10)
+
+	translateIngressWith(t, func(r *IngressReconciler) { r.Recorder = recorder }, ingress)
+
+	for {
+		select {
+		case event := <-recorder.Events:
+			if strings.Contains(event, "upstream-vhost") {
+				if !strings.Contains(event, `"100%host"`) || strings.Contains(event, "%!") {
+					t.Errorf("event garbled the annotation value: %s", event)
+				}
+				return
+			}
+		default:
+			t.Fatal("no warning event for an untranslatable upstream-vhost")
+		}
 	}
 }

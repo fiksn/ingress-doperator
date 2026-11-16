@@ -369,7 +369,7 @@ func (r *HTTPRouteReconciler) disableExternalDNSIfCutOver(
 	ctx context.Context,
 	ingress *networkingv1.Ingress,
 ) (waiting string, err error) {
-	if ingress != nil && ingress.Annotations[IgnoreIngressAnnotation] == "true" {
+	if ingress != nil && ingress.Annotations[IgnoreIngressAnnotation] == annotationTrue {
 		return "", nil
 	}
 	mode := resolveIngressPostProcessingMode(r.IngressPostProcessingMode, ingress)

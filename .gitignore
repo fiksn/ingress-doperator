@@ -34,3 +34,4 @@ reenabler
 !cmd/operator
 !cmd/webhook
 !cmd/reenabler
+dist/*

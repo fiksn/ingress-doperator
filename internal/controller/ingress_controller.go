@@ -57,6 +57,7 @@ const (
 	IngressRemovedAnnotation                 = "ingress-doperator.fiction.si/removed"
 	IgnoreIngressAnnotation                  = "ingress-doperator.fiction.si/ignore-ingress"
 	ShadowExternalDNSAnnotation              = "ingress-doperator.fiction.si/shadow-external-dns"
+	annotationTrue                           = "true"
 	OriginalIngressClassAnnotation           = "ingress-doperator.fiction.si/original-ingress-class"
 	OriginalIngressClassNameAnnotation       = "ingress-doperator.fiction.si/original-ingress-classname"
 	OriginalExternalDNSHostname              = "ingress-doperator.fiction.si/original-external-dns-hostname"
@@ -327,6 +328,12 @@ func (r *IngressReconciler) reconcileIngressToHTTPRoute(
 		return ctrl.Result{}, nil
 	}
 
+	for _, warning := range translator.UnsupportedAnnotationWarnings(ingress) {
+		logger.Info("Ingress annotation is not translated", "warning", warning,
+			"namespace", ingress.Namespace, "name", ingress.Name)
+		r.recordWarning(ingress, "UnsupportedAnnotation", warning)
+	}
+
 	// Handle source Ingress post-processing mode
 	effectiveMode := resolveIngressPostProcessingMode(r.IngressPostProcessingMode, ingress)
 
@@ -377,6 +384,12 @@ func (r *IngressReconciler) reconcileIngressToHTTPRoute(
 	}
 
 	logger.V(1).Info("HTTPRoutes applied successfully", "namespace", ingress.Namespace, "count", len(httpRoutes))
+
+	if err := r.reconcileBackendTLSPolicies(ctx, ingress); err != nil {
+		logger.Error(err, "failed to reconcile BackendTLSPolicies")
+		return ctrl.Result{}, err
+	}
+	r.warnBackendTLSSettings(ingress)
 
 	// Ensure Gateway listeners are updated from this Ingress change before post-processing
 	listenerReconciler := r.newGatewayListenerReconciler()
@@ -933,7 +946,7 @@ func resolveIngressPostProcessingMode(
 	case IngressDisabledReasonExternalDNS:
 		return IngressPostProcessingModeDisableExternalDNS
 	}
-	if ingress.Annotations[ShadowExternalDNSAnnotation] == "true" {
+	if ingress.Annotations[ShadowExternalDNSAnnotation] == annotationTrue {
 		return IngressPostProcessingModeShadowExternalDNS
 	}
 	return global
@@ -1232,6 +1245,10 @@ func (r *IngressReconciler) handleDeletion(ctx context.Context, ingress *network
 	}
 
 	if err := r.deleteManagedHTTPRoutes(ctx, ingress, logger); err != nil {
+		return ctrl.Result{}, err
+	}
+	// The Ingress is being deleted, so it no longer counts towards any BackendTLSPolicy.
+	if err := r.reconcileBackendTLSPolicies(ctx, ingress); err != nil {
 		return ctrl.Result{}, err
 	}
 
@@ -2099,14 +2116,14 @@ func (r *IngressReconciler) recordWarning(ingress *networkingv1.Ingress, reason,
 	if r.Recorder == nil || ingress == nil {
 		return
 	}
-	r.Recorder.Eventf(ingress, nil, "Warning", reason, "Reconcile", message)
+	r.Recorder.Eventf(ingress, nil, "Warning", reason, "Reconcile", "%s", message)
 }
 
 func (r *IngressReconciler) recordNormal(ingress *networkingv1.Ingress, reason, message string) {
 	if r.Recorder == nil || ingress == nil {
 		return
 	}
-	r.Recorder.Eventf(ingress, nil, "Normal", reason, "Reconcile", message)
+	r.Recorder.Eventf(ingress, nil, "Normal", reason, "Reconcile", "%s", message)
 }
 
 func (r *IngressReconciler) logErrorRateLimited(err error, key, message string) {
