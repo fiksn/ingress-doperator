@@ -174,7 +174,7 @@ spec:
     spec:
       containers:
       - name: webhook
-        image: fiksn/ingress-doperator-webhook:v0.1.6
+        image: fiksn/ingress-doperator-webhook:v0.1.7
         imagePullPolicy: Always
         command:
           - /webhook
@@ -460,6 +460,32 @@ when none does. A `BackendTLSPolicy` for the Service that ingress-doperator does
 in charge (`BackendTLSPolicyNotManaged` warning). Without the BackendTLSPolicy CRD the operator
 records `BackendTLSPolicyUnavailable` and generates nothing.
 
+### ExternalName backends
+
+NGINX Gateway Fabric only proxies to Services of type `ExternalName` when its `NginxProxy` has a DNS
+resolver (`spec.dnsResolver`). Without one, the route's backend is invalid and NGINX rejects the
+configuration of the whole Gateway (`host not found in upstream "invalid-backend-ref"`), so no
+route on that Gateway gets updated.
+
+By default (`--external-name-services=skip`) the operator therefore does not translate an Ingress
+whose backends (including those of its canary Ingresses) include an `ExternalName` Service. It
+records an `ExternalNameBackendUnsupported` warning event, deletes the HTTPRoutes it generated for
+the Ingress earlier and checks again every five minutes. In shadow mode ingress-nginx keeps serving
+the Ingress.
+
+Once NGINX Gateway Fabric has a resolver, e.g. the cluster DNS in its Helm values:
+
+```yaml
+nginx:
+  config:
+    dnsResolver:
+      addresses:
+      - type: IPAddress
+        value: 10.100.0.10   # kubectl get svc -n kube-system kube-dns -o jsonpath='{.spec.clusterIP}'
+```
+
+run the operator with `--external-name-services=allow` (Helm: `operator.externalNameServices: allow`).
+
 ### Canary traffic splitting
 
 ingress-nginx implements canary deployments as a **second Ingress** that shares a
@@ -686,6 +712,8 @@ The operator accepts the following command-line flags:
 --gateway-class-name string                   GatewayClass for created Gateway resources (default: "nginx")
 --watch-namespace string                      Comma-separated list of namespace glob patterns to watch for Ingresses
                                               (default: watch all namespaces)
+--ignore-namespace string                     Comma-separated list of namespace glob patterns whose Ingresses are
+                                              never translated; wins over --watch-namespace (default: none)
 --ingress-class-filter string                 Comma-separated list of glob patterns to filter which ingress classes to process
                                               (default: "*")
 --ingress-class-ignore string                 Comma-separated list of glob patterns for ingress classes to ignore
@@ -698,6 +726,8 @@ The operator accepts the following command-line flags:
                                               (default: "" - all Ingresses use shared Gateways)
 --gateway-sharding                            Spill shared Gateways over to <name>-2, <name>-3, ... when they
                                               reach the 64-listener limit (default: false)
+--external-name-services string               skip or allow Ingresses routing to ExternalName Services; see
+                                              "ExternalName backends" (default: "skip")
 --http-redirect                               Add a catch-all port 80 listener redirecting HTTP to HTTPS; hosts
                                               served over plain HTTP by ingress-nginx are served on it
                                               (default: false)
@@ -947,6 +977,17 @@ This is useful for:
 - Testing the operator on a subset of Ingresses
 - Gradual rollout in production
 - Multi-tenant clusters where different operators manage different namespaces
+
+To exclude namespaces instead, use `--ignore-namespace` with the same pattern syntax. Ingresses in a
+matching namespace are never translated, even when `--watch-namespace` also matches:
+
+```bash
+# Everything except kube-* and review-* namespaces
+./bin/operator --ignore-namespace=kube-*,review-*
+```
+
+HTTPRoutes and Gateways the operator generated for such Ingresses before are left in place; delete
+them (or use the reenabler) if they are no longer wanted.
 
 ## Migration Strategy
 
@@ -1272,7 +1313,7 @@ left uncommitted; commit and tag it yourself.
 **Build and push your image to the location specified by `IMG`:**
 
 ```sh
-make docker-build docker-push IMG=fiksn/ingress-doperator:v0.1.6
+make docker-build docker-push IMG=fiksn/ingress-doperator:v0.1.7
 ```
 
 **NOTE:** This image ought to be published in the personal registry you specified.
@@ -1331,7 +1372,7 @@ Following the options to release and provide this solution to the users.
 1. Build the installer for the image built and published in the registry:
 
 ```sh
-make build-installer IMG=fiksn/ingress-doperator:v0.1.6
+make build-installer IMG=fiksn/ingress-doperator:v0.1.7
 ```
 
 **NOTE:** The makefile target mentioned above generates an 'install.yaml'

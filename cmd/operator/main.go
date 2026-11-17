@@ -181,8 +181,10 @@ func main() {
 		GatewayName:                      cfg.GatewayName,
 		GatewayClassName:                 cfg.GatewayClassName,
 		WatchNamespaces:                  cfg.WatchNamespaces,
+		IgnoreNamespaces:                 cfg.IgnoreNamespaces,
 		OneGatewayPerIngress:             cfg.OneGatewayPerIngressPatterns,
 		GatewaySharding:                  cfg.GatewaySharding,
+		AllowExternalNameServices:        cfg.ExternalNameServices == externalNameServicesAllow,
 		WildcardListeners:                cfg.ParsedWildcardListeners,
 		HTTPRedirect:                     cfg.HTTPRedirect,
 		EnableDeletion:                   cfg.EnableDeletion,
@@ -244,6 +246,9 @@ func main() {
 		setupLog.Info("Watching Ingresses in specific namespaces only", "namespaces", cfg.WatchNamespaces)
 	} else {
 		setupLog.Info("Watching Ingresses in all namespaces")
+	}
+	if len(cfg.IgnoreNamespaces) > 0 {
+		setupLog.Info("Never translating Ingresses in ignored namespaces", "namespaces", cfg.IgnoreNamespaces)
 	}
 
 	if len(cfg.OneGatewayPerIngressPatterns) > 0 {
@@ -339,6 +344,7 @@ type operatorConfig struct {
 	WatchNamespace                  string
 	OneGatewayPerIngress            string
 	GatewaySharding                 bool
+	ExternalNameServices            string
 	WildcardListeners               string
 	HTTPRedirect                    bool
 	GatewayAnnotationFilters        string
@@ -376,6 +382,8 @@ type operatorConfig struct {
 	GatewayInfraAnnotationsMap       map[string]string
 	InfrastructureAnnotationsByClass []translator.IngressClassAnnotationsRule
 	WatchNamespaces                  []string
+	IgnoreNamespace                  string
+	IgnoreNamespaces                 []string
 	IngressClassFilters              []string
 	IngressClassIgnoreFilters        []string
 	OneGatewayPerIngressPatterns     []string
@@ -400,6 +408,9 @@ func parseOperatorConfig() (operatorConfig, zap.Options, error) {
 	flag.StringVar(&cfg.WatchNamespace, "watch-namespace", "",
 		"Comma-separated list of namespace glob patterns to watch for Ingresses "+
 			"(e.g., 'team-a,staging-*'). Default: watch all namespaces.")
+	flag.StringVar(&cfg.IgnoreNamespace, "ignore-namespace", "",
+		"Comma-separated list of namespace glob patterns whose Ingresses are never translated "+
+			"(e.g., 'kube-*,review-*'). Takes precedence over --watch-namespace.")
 	flag.StringVar(&cfg.IngressClassFilter, "ingress-class-filter", "*",
 		"Comma-separated list of glob patterns to filter which ingress classes to process "+
 			"(e.g., '*private*', 'nginx', '*'). Default '*' processes all classes.")
@@ -415,6 +426,10 @@ func parseOperatorConfig() (operatorConfig, zap.Options, error) {
 	flag.BoolVar(&cfg.GatewaySharding, "gateway-sharding", false,
 		"If true, a shared Gateway that reaches the Gateway API limit of 64 listeners spills over to "+
 			"Gateways named <name>-2, <name>-3, ... (each one gets its own load balancer)")
+	flag.StringVar(&cfg.ExternalNameServices, "external-name-services", externalNameServicesSkip,
+		"What to do with Ingresses routing to Services of type ExternalName: 'skip' (do not translate them, "+
+			"emit a warning event) or 'allow' (translate them; NGINX Gateway Fabric then needs a DNS resolver "+
+			"in its NginxProxy, otherwise one such route breaks the whole Gateway configuration)")
 	flag.StringVar(&cfg.WildcardListeners, "wildcard-listeners", "",
 		"Comma-separated '*.<domain>=<namespace>/<secret>' entries (e.g. "+
 			"'*.review.example.com=nginx-gateway/review-wildcard-tls'). Hostnames one label below <domain> "+
@@ -532,14 +547,22 @@ func parseOperatorConfig() (operatorConfig, zap.Options, error) {
 	if err != nil {
 		return cfg, opts, err
 	}
+	if cfg.ExternalNameServices != externalNameServicesSkip && cfg.ExternalNameServices != externalNameServicesAllow {
+		return cfg, opts, fmt.Errorf("invalid --external-name-services %q (allowed: %s, %s)",
+			cfg.ExternalNameServices, externalNameServicesSkip, externalNameServicesAllow)
+	}
 
 	cfg.GatewayFilters = splitCSV(cfg.GatewayAnnotationFilters)
 	cfg.HTTPRouteFilters = splitCSV(cfg.HTTPRouteAnnotationFilters)
 	cfg.IngressClassFilters = utils.ParseCommaSeparatedList(cfg.IngressClassFilter)
 	cfg.IngressClassIgnoreFilters = utils.ParseCommaSeparatedList(cfg.IngressClassIgnoreFilter)
-	cfg.WatchNamespaces, err = controller.ParseWatchNamespaces(cfg.WatchNamespace)
+	cfg.WatchNamespaces, err = controller.ParseNamespacePatterns(cfg.WatchNamespace)
 	if err != nil {
 		return cfg, opts, fmt.Errorf("invalid watch-namespace value: %w", err)
+	}
+	cfg.IgnoreNamespaces, err = controller.ParseNamespacePatterns(cfg.IgnoreNamespace)
+	if err != nil {
+		return cfg, opts, fmt.Errorf("invalid ignore-namespace value: %w", err)
 	}
 	cfg.ParsedWildcardListeners, err = controller.ParseWildcardListeners(cfg.WildcardListeners)
 	if err != nil {
@@ -595,6 +618,12 @@ func (f *boolOrStringFlag) Set(value string) error {
 func (f *boolOrStringFlag) IsBoolFlag() bool {
 	return true
 }
+
+// --external-name-services values.
+const (
+	externalNameServicesSkip  = "skip"
+	externalNameServicesAllow = "allow"
+)
 
 func parseIngressPostProcessingMode(value string) (controller.IngressPostProcessingMode, error) {
 	switch value {

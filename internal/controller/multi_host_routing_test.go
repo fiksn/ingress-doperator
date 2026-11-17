@@ -509,6 +509,9 @@ func TestNamedPorts_ServiceCreatedAfterIngress(t *testing.T) {
 	if len(r.ReconcileCache) != 0 {
 		t.Errorf("Ingress with unresolved named ports was recorded in the reconcile cache: %v", r.ReconcileCache)
 	}
+	if routes := routesOf(t, r, ingress); len(routes) != 0 {
+		t.Errorf("got %d HTTPRoutes while named ports were unresolved, want none (no fallback port)", len(routes))
+	}
 
 	service := storeService()
 	if err := r.Create(context.Background(), service); err != nil {
@@ -632,5 +635,63 @@ func TestReconcile_WarningKeepsPercentSigns(t *testing.T) {
 		default:
 			t.Fatal("no warning event for an untranslatable upstream-vhost")
 		}
+	}
+}
+
+// TestNamedPorts_ServiceRemovedKeepsRoutes covers a Service that disappears (e.g. during a
+// redeploy) after its Ingress was translated: the HTTPRoutes keep their last correct ports.
+func TestNamedPorts_ServiceRemovedKeepsRoutes(t *testing.T) {
+	ingress := minioShapedIngress()
+	service := storeService()
+	recorder := events.NewFakeRecorder(10)
+	r := newTranslationReconciler(t, ingress, service)
+	r.Recorder = recorder
+	reconcileIngress(t, r, ingress)
+	drainEvents(recorder)
+
+	if err := r.Delete(context.Background(), service); err != nil {
+		t.Fatalf("failed to delete Service: %v", err)
+	}
+	result := reconcileIngress(t, r, ingress)
+
+	if result.RequeueAfter == 0 {
+		t.Error("Reconcile() with unresolved named ports did not requeue")
+	}
+	routes := ingressRoutes(t, r, ingress)
+	assertRoutedTo(t, routes, consoleHost, "/", backend{"store", consolePortNumber})
+	assertRoutedTo(t, routes, apiHost, "/", backend{"store", apiPortNumber})
+	if got := drainEvents(recorder); !strings.Contains(got, "Warning NamedPortUnresolved") ||
+		!strings.Contains(got, "store:console") {
+		t.Errorf("no NamedPortUnresolved warning naming the port:\n%s", got)
+	}
+}
+
+// TestTranslateIngressRoutes_UnresolvedPortsTranslateNothing checks that nothing is translated (and
+// so no SnippetsFilter or other companion is created) while a named port cannot be resolved.
+func TestTranslateIngressRoutes_UnresolvedPortsTranslateNothing(t *testing.T) {
+	ingress := minioShapedIngress()
+	r := newTranslationReconciler(t, ingress)
+
+	routes, unresolved := r.translateIngressRoutes(context.Background(), ingress, r.getTranslator())
+
+	if len(routes) != 0 {
+		t.Errorf("translateIngressRoutes() returned %d routes with unresolved named ports, want none", len(routes))
+	}
+	if strings.Join(unresolved, ",") != "store:console,store:api" {
+		t.Errorf("unresolved = %v, want [store:console store:api]", unresolved)
+	}
+}
+
+// TestReconcile_IgnoredNamespace reconciles directly (bypassing the event filter, as reconciles of
+// canary primaries do): an Ingress in an ignored namespace still gets no HTTPRoute.
+func TestReconcile_IgnoredNamespace(t *testing.T) {
+	ingress := multiHostIngress(hostRule(consoleHost, ingressPath("/", networkingv1.PathTypePrefix, "web", numberedPort(80))))
+	r := newTranslationReconciler(t, ingress)
+	r.IgnoreNamespaces = []string{"stor*"}
+
+	reconcileIngress(t, r, ingress)
+
+	if routes := routesOf(t, r, ingress); len(routes) != 0 {
+		t.Errorf("got %d HTTPRoutes for an Ingress in an ignored namespace, want none", len(routes))
 	}
 }

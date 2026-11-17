@@ -226,7 +226,7 @@ func TestBackendTLSPolicy_Targets(t *testing.T) {
 		{"named port", namedPort("console"), storeService(), "console"},
 		{"numbered port resolved to its name", numberedPort(apiPortNumber), storeService(), "api"},
 		{"port without a name targets the Service", numberedPort(443), unnamed, ""},
-		{"missing Service targets the Service", namedPort("api"), nil, ""},
+		{"missing Service targets the Service", numberedPort(443), nil, ""},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {

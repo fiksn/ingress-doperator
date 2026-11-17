@@ -32,7 +32,7 @@ func namespacedIngress(namespace, name string) *networkingv1.Ingress {
 	return &networkingv1.Ingress{ObjectMeta: metav1.ObjectMeta{Namespace: namespace, Name: name}}
 }
 
-func TestParseWatchNamespaces(t *testing.T) {
+func TestParseNamespacePatterns(t *testing.T) {
 	tests := []struct {
 		value   string
 		want    []string
@@ -47,19 +47,19 @@ func TestParseWatchNamespaces(t *testing.T) {
 		{value: "ok,bad[", wantErr: true},
 	}
 	for _, tt := range tests {
-		got, err := ParseWatchNamespaces(tt.value)
+		got, err := ParseNamespacePatterns(tt.value)
 		if tt.wantErr {
 			if err == nil {
-				t.Errorf("ParseWatchNamespaces(%q) = %v, want error", tt.value, got)
+				t.Errorf("ParseNamespacePatterns(%q) = %v, want error", tt.value, got)
 			}
 			continue
 		}
 		if err != nil {
-			t.Errorf("ParseWatchNamespaces(%q) unexpected error: %v", tt.value, err)
+			t.Errorf("ParseNamespacePatterns(%q) unexpected error: %v", tt.value, err)
 			continue
 		}
 		if !slices.Equal(got, tt.want) {
-			t.Errorf("ParseWatchNamespaces(%q) = %v, want %v", tt.value, got, tt.want)
+			t.Errorf("ParseNamespacePatterns(%q) = %v, want %v", tt.value, got, tt.want)
 		}
 	}
 }
@@ -132,5 +132,73 @@ func TestEnqueueAllIngressesRespectsWatchNamespaces(t *testing.T) {
 				t.Errorf("enqueued namespaces = %v, want %v", got, tt.want)
 			}
 		})
+	}
+}
+
+func TestIgnoredNamespaceFilter(t *testing.T) {
+	tests := []struct {
+		name      string
+		ignored   []string
+		namespace string
+		want      bool
+	}{
+		{name: "no patterns ignores nothing", ignored: nil, namespace: "anything", want: true},
+		{name: "exact match is dropped", ignored: []string{"kube-system"}, namespace: "kube-system", want: false},
+		{name: "glob match is dropped", ignored: []string{"review-*"}, namespace: "review-mr-1", want: false},
+		{name: "glob miss is kept", ignored: []string{"review-*"}, namespace: "reviews", want: true},
+		{name: "any of many", ignored: []string{"a", "kube-*"}, namespace: "kube-public", want: false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := IgnoredNamespaceFilter(tt.ignored).Generic(event.GenericEvent{
+				Object: namespacedIngress(tt.namespace, "ing"),
+			})
+			if got != tt.want {
+				t.Errorf("IgnoredNamespaceFilter(%v) on %q = %v, want %v", tt.ignored, tt.namespace, got, tt.want)
+			}
+		})
+	}
+}
+
+func TestNamespaceTranslated_IgnoreWinsOverWatch(t *testing.T) {
+	tests := []struct {
+		watched, ignored []string
+		namespace        string
+		want             bool
+	}{
+		{nil, nil, "app", true},
+		{nil, []string{"review-*"}, "review-1", false},
+		{[]string{"review-*"}, []string{"review-*"}, "review-1", false},
+		{[]string{"team-*"}, []string{"team-legacy"}, "team-legacy", false},
+		{[]string{"team-*"}, []string{"team-legacy"}, "team-new", true},
+		{[]string{"team-*"}, nil, "other", false},
+	}
+	for _, tt := range tests {
+		if got := namespaceTranslated(tt.watched, tt.ignored, tt.namespace); got != tt.want {
+			t.Errorf("namespaceTranslated(%v, %v, %q) = %v, want %v", tt.watched, tt.ignored, tt.namespace, got, tt.want)
+		}
+	}
+}
+
+func TestEnqueueAllIngressesRespectsIgnoreNamespaces(t *testing.T) {
+	scheme := runtime.NewScheme()
+	if err := networkingv1.AddToScheme(scheme); err != nil {
+		t.Fatalf("failed to add networkingv1 to scheme: %v", err)
+	}
+	c := fake.NewClientBuilder().WithScheme(scheme).WithObjects(
+		namespacedIngress("app", "one"),
+		namespacedIngress("review-1", "two"),
+		namespacedIngress("review-2", "three"),
+	).Build()
+	r := &IngressReconciler{Client: c, IngressClassFilters: []string{"*"}, IgnoreNamespaces: []string{"review-*"}}
+
+	requests := r.enqueueAllIngresses(context.Background())
+	got := make([]string, 0, len(requests))
+	for _, req := range requests {
+		got = append(got, req.Namespace)
+	}
+
+	if !slices.Equal(got, []string{"app"}) {
+		t.Errorf("enqueued namespaces = %v, want [app]", got)
 	}
 }

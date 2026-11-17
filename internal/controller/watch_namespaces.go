@@ -26,9 +26,9 @@ import (
 	"github.com/fiksn/ingress-doperator/internal/utils"
 )
 
-// ParseWatchNamespaces parses the --watch-namespace value into namespace glob patterns.
-// An empty value yields nil, which watches all namespaces.
-func ParseWatchNamespaces(value string) ([]string, error) {
+// ParseNamespacePatterns parses a --watch-namespace or --ignore-namespace value into namespace
+// glob patterns. An empty value yields nil (all namespaces watched, none ignored).
+func ParseNamespacePatterns(value string) ([]string, error) {
 	patterns := utils.ParseCommaSeparatedList(value)
 	for _, pattern := range patterns {
 		if _, err := path.Match(pattern, ""); err != nil {
@@ -43,6 +43,30 @@ func NamespaceFilter(patterns []string) predicate.Predicate {
 	return predicate.NewPredicateFuncs(func(obj client.Object) bool {
 		return inWatchedNamespaces(patterns, obj.GetNamespace())
 	})
+}
+
+// IgnoredNamespaceFilter drops objects whose namespace matches one of the given patterns.
+func IgnoredNamespaceFilter(patterns []string) predicate.Predicate {
+	return predicate.NewPredicateFuncs(func(obj client.Object) bool {
+		return !inIgnoredNamespaces(patterns, obj.GetNamespace())
+	})
+}
+
+// inIgnoredNamespaces reports whether namespace matches one of the --ignore-namespace patterns.
+func inIgnoredNamespaces(patterns []string, namespace string) bool {
+	for _, pattern := range patterns {
+		// Patterns are validated at startup, so Match cannot fail here.
+		if matched, _ := path.Match(pattern, namespace); matched {
+			return true
+		}
+	}
+	return false
+}
+
+// namespaceTranslated reports whether Ingresses in namespace are translated: it is watched and
+// not ignored, so an ignore pattern wins over a watch pattern.
+func namespaceTranslated(watched, ignored []string, namespace string) bool {
+	return inWatchedNamespaces(watched, namespace) && !inIgnoredNamespaces(ignored, namespace)
 }
 
 // inWatchedNamespaces reports whether namespace matches a pattern; no patterns watches all.

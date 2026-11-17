@@ -38,6 +38,9 @@ spec:
             {{- with .Values.operator.watchNamespaces }}
             - --watch-namespace={{ join "," . }}
             {{- end }}
+            {{- with .Values.operator.ignoreNamespaces }}
+            - --ignore-namespace={{ join "," . }}
+            {{- end }}
             - --ingress-class-filter={{ .Values.operator.ingressClassFilter }}
             {{- if .Values.operator.ingressClassIgnoreFilter }}
             - --ingress-class-ignore={{ .Values.operator.ingressClassIgnoreFilter }}
@@ -55,6 +58,7 @@ spec:
             {{- if .Values.operator.gatewaySharding }}
             - --gateway-sharding=true
             {{- end }}
+            - --external-name-services={{ .Values.operator.externalNameServices | default "skip" }}
             {{- if .Values.operator.enableDeletion }}
             - --enable-deletion=true
             {{- end }}

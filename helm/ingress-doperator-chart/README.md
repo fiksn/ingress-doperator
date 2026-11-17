@@ -97,6 +97,7 @@ The following table lists the configurable parameters of the ingress-doperator c
 | `operator.gatewayName` | Name of the Gateway resource | `ingress-gateway` |
 | `operator.gatewayClassName` | GatewayClass to use | `nginx` |
 | `operator.watchNamespaces` | Namespaces to watch, names or glob patterns like `team-*` (empty = all namespaces) | `[]` |
+| `operator.ignoreNamespaces` | Namespaces whose Ingresses are never translated, names or glob patterns; wins over `watchNamespaces` | `[]` |
 | `operator.ingressClassFilter` | Comma-separated glob patterns to filter ingress classes | `"*"` |
 | `operator.ingressClassIgnoreFilter` | Comma-separated glob patterns for ingress classes to ignore | `""` |
 | `operator.ingressClassEmpty` | Value used when an Ingress has no class set | `"none"` |
@@ -104,6 +105,7 @@ The following table lists the configurable parameters of the ingress-doperator c
 | `operator.wildcardListeners` | Comma-separated `*.<domain>=<namespace>/<secret>` entries; matching hostnames share one wildcard listener | `""` |
 | `operator.httpRedirect` | Add a port 80 listener redirecting HTTP to HTTPS; HTTP-only hosts are served on it | `false` |
 | `operator.gatewaySharding` | Spill shared Gateways over to `<name>-2`, `<name>-3`, ... at the 64-listener limit | `false` |
+| `operator.externalNameServices` | `skip` or `allow` Ingresses whose backends are `ExternalName` Services (`allow` needs a DNS resolver in NGINX Gateway Fabric's `NginxProxy`) | `"skip"` |
 | `operator.enableDeletion` | Delete resources when Ingress is deleted | `false` |
 | `operator.hostnameRewriteFrom` | Comma-separated domain suffixes to match | `""` |
 | `operator.hostnameRewriteTo` | Comma-separated replacement domain suffixes | `""` |

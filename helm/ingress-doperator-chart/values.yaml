@@ -5,7 +5,7 @@ replicaCount: 1
 image:
   repository: fiksn/ingress-doperator
   pullPolicy: IfNotPresent
-  tag: v0.1.6
+  tag: v0.1.7
 
 imagePullSecrets: []
 nameOverride: ""
@@ -58,6 +58,10 @@ operator:
   # Namespaces to watch, as names or glob patterns (e.g. "team-*"); empty list means all namespaces
   watchNamespaces: []
 
+  # Namespaces whose Ingresses are never translated, as names or glob patterns (e.g. "review-*").
+  # Takes precedence over watchNamespaces.
+  ignoreNamespaces: []
+
   # Ingress class filter (comma-separated glob patterns, default "*" processes all)
   ingressClassFilter: "*"
 
@@ -75,6 +79,12 @@ operator:
   # If true, a shared Gateway at the Gateway API limit of 64 listeners spills over to
   # <name>-2, <name>-3, ... Each extra Gateway gets its own load balancer.
   gatewaySharding: false
+
+  # What to do with Ingresses routing to Services of type ExternalName: "skip" (do not translate
+  # them, emit a warning event) or "allow" (translate them). NGINX Gateway Fabric only supports
+  # ExternalName Services with a DNS resolver in its NginxProxy (spec.dnsResolver); without one,
+  # a single such route breaks the configuration of the whole Gateway.
+  externalNameServices: skip
 
   # Comma-separated '*.<domain>=<namespace>/<secret>' entries: hostnames one label below <domain>
   # share one listener serving that wildcard certificate,

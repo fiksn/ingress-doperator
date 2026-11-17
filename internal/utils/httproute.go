@@ -227,71 +227,11 @@ func (m *HTTPRouteManager) applyHTTPRoute(
 	return nil
 }
 
-// ResolveNamedPorts resolves named ports in HTTPRoute by looking up the actual Services
-// ResolveNamedPorts replaces placeholder port 0 backendRefs with the numeric port
-// resolved from the Service. The primary Ingress is searched first for the port name;
-// any extra Ingresses (e.g. canary siblings folded into the same HTTPRoute) are searched
-// too so their backends resolve correctly.
-func (m *HTTPRouteManager) ResolveNamedPorts(
-	ctx context.Context,
-	ingress *networkingv1.Ingress,
-	httpRoute *gatewayv1.HTTPRoute,
-	extra ...*networkingv1.Ingress,
-) error {
-	logger := log.FromContext(ctx)
-	sources := append([]*networkingv1.Ingress{ingress}, extra...)
-
-	for i := range httpRoute.Spec.Rules {
-		for j := range httpRoute.Spec.Rules[i].BackendRefs {
-			backendRef := &httpRoute.Spec.Rules[i].BackendRefs[j]
-
-			// Check if port is 0 (indicates named port)
-			if backendRef.Port != nil && *backendRef.Port == 0 {
-				serviceName := string(backendRef.Name)
-
-				// Find the named port from the source Ingress specs
-				portName := findPortNameInIngresses(sources, serviceName)
-				if portName == "" {
-					logger.Info("Could not find port name in Ingress for service, using fallback port 80",
-						"service", serviceName,
-						"namespace", ingress.Namespace)
-					fallbackPort := int32(80)
-					backendRef.Port = &fallbackPort
-					continue
-				}
-
-				// Look up the Service to resolve the named port
-				resolvedPort, err := m.resolveServicePort(ctx, ingress.Namespace, serviceName, portName)
-				if err != nil {
-					logger.Info("Could not resolve named port from Service, using fallback port 80",
-						"service", serviceName,
-						"portName", portName,
-						"namespace", ingress.Namespace,
-						"error", err.Error())
-					fallbackPort := int32(80)
-					backendRef.Port = &fallbackPort
-					continue
-				}
-
-				logger.Info("Resolved named port from Service",
-					"service", serviceName,
-					"portName", portName,
-					"resolvedPort", resolvedPort,
-					"namespace", ingress.Namespace)
-				backendRef.Port = &resolvedPort
-			}
-		}
-	}
-
-	return nil
-}
-
 // WithResolvedNamedPorts returns a copy of ingress whose named Service ports are replaced by the
 // port numbers of the Services, so every path keeps its own port: an HTTPRoute backend only
-// carries the Service name, so ResolveNamedPorts cannot tell apart paths that use the same Service
-// on different named ports. Ports whose Service or port cannot be found stay named (and fall back
-// to ResolveNamedPorts); they are returned as "service:port" in unresolved, so the caller can retry
-// once the Service exists.
+// carries the Service name, so paths using the same Service on different named ports could not be
+// told apart after translation. Ports whose Service or port cannot be found stay named and are
+// returned as "service:port" in unresolved; callers must not translate the Ingress then.
 func (m *HTTPRouteManager) WithResolvedNamedPorts(
 	ctx context.Context,
 	ingress *networkingv1.Ingress,
@@ -310,12 +250,13 @@ func (m *HTTPRouteManager) WithResolvedNamedPorts(
 			}
 			port, err := m.resolveServicePort(ctx, resolved.Namespace, service.Name, service.Port.Name)
 			if err != nil {
-				logger.V(1).Info("Could not resolve named port from Service",
-					"service", service.Name, "portName", service.Port.Name,
-					"namespace", resolved.Namespace, "error", err.Error())
+				logger.Info("Could not resolve named port from Service", "namespace", resolved.Namespace,
+					"service", service.Name, "portName", service.Port.Name, "error", err.Error())
 				unresolved = append(unresolved, service.Name+":"+service.Port.Name)
 				continue
 			}
+			logger.Info("Resolved named port from Service", "namespace", resolved.Namespace,
+				"service", service.Name, "portName", service.Port.Name, "port", port)
 			service.Port = networkingv1.ServiceBackendPort{Number: port}
 		}
 	}
@@ -337,26 +278,6 @@ func ReferencesServiceByPortName(ingress *networkingv1.Ingress, serviceName stri
 		}
 	}
 	return false
-}
-
-// findPortNameInIngresses finds the port name for a given service across the Ingress specs.
-func findPortNameInIngresses(ingresses []*networkingv1.Ingress, serviceName string) string {
-	for _, ingress := range ingresses {
-		if ingress == nil {
-			continue
-		}
-		for _, rule := range ingress.Spec.Rules {
-			if rule.HTTP == nil {
-				continue
-			}
-			for _, path := range rule.HTTP.Paths {
-				if path.Backend.Service != nil && path.Backend.Service.Name == serviceName {
-					return path.Backend.Service.Port.Name
-				}
-			}
-		}
-	}
-	return ""
 }
 
 // resolveServicePort looks up a Service and resolves a named port to its numeric value
