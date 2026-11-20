@@ -1,5 +1,5 @@
 # Image URL to use all building/pushing image targets
-IMG ?= fiksn/ingress-doperator:v0.1.7
+IMG ?= fiksn/ingress-doperator:v0.1.8
 IMAGE_REPO = $(firstword $(subst :, ,$(IMG)))
 WEBHOOK_IMG = $(IMAGE_REPO)-webhook:$(lastword $(subst :, ,$(IMG)))
 

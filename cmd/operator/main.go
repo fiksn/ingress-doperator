@@ -427,9 +427,10 @@ func parseOperatorConfig() (operatorConfig, zap.Options, error) {
 		"If true, a shared Gateway that reaches the Gateway API limit of 64 listeners spills over to "+
 			"Gateways named <name>-2, <name>-3, ... (each one gets its own load balancer)")
 	flag.StringVar(&cfg.ExternalNameServices, "external-name-services", externalNameServicesSkip,
-		"What to do with Ingresses routing to Services of type ExternalName: 'skip' (do not translate them, "+
-			"emit a warning event) or 'allow' (translate them; NGINX Gateway Fabric then needs a DNS resolver "+
-			"in its NginxProxy, otherwise one such route breaks the whole Gateway configuration)")
+		"Whether NGINX Gateway Fabric has a DNS resolver (NginxProxy spec.dnsResolver): 'skip' (no resolver: "+
+			"Ingresses routing to ExternalName Services are not translated and mirror-target is ignored, with "+
+			"warning events) or 'allow' (resolver configured: translate ExternalName backends and mirror-target). "+
+			"Without a resolver, one ExternalName route breaks the whole Gateway configuration.")
 	flag.StringVar(&cfg.WildcardListeners, "wildcard-listeners", "",
 		"Comma-separated '*.<domain>=<namespace>/<secret>' entries (e.g. "+
 			"'*.review.example.com=nginx-gateway/review-wildcard-tls'). Hostnames one label below <domain> "+

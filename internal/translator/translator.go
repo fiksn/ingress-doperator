@@ -877,11 +877,14 @@ func parseHeaderNameList(raw string) []string {
 	return out
 }
 
+// parseHeaderNameValueList parses comma-separated Name=Value entries. A value in double quotes may
+// contain commas, with \" and \\ escaping a quote and a backslash; e.g.
+// X-Robots-Tag="noindex, nofollow",X-Env=prod.
 func parseHeaderNameValueList(raw string) []gatewayv1.HTTPHeader {
 	if strings.TrimSpace(raw) == "" {
 		return nil
 	}
-	parts := strings.Split(raw, ",")
+	parts := splitHeaderEntries(raw)
 	out := make([]gatewayv1.HTTPHeader, 0, len(parts))
 	seen := make(map[string]struct{})
 	for _, part := range parts {
@@ -894,7 +897,7 @@ func parseHeaderNameValueList(raw string) []gatewayv1.HTTPHeader {
 			continue
 		}
 		name := strings.TrimSpace(kv[0])
-		value := strings.TrimSpace(kv[1])
+		value := unquoteHeaderValue(strings.TrimSpace(kv[1]))
 		if name == "" {
 			continue
 		}
@@ -909,6 +912,52 @@ func parseHeaderNameValueList(raw string) []gatewayv1.HTTPHeader {
 		})
 	}
 	return out
+}
+
+// splitHeaderEntries splits raw on commas outside double-quoted values. If a quote is left open,
+// raw is split on every comma, as before quoting was supported.
+func splitHeaderEntries(raw string) []string {
+	var entries []string
+	var current strings.Builder
+	quoted, escaped := false, false
+	for _, r := range raw {
+		switch {
+		case escaped:
+			escaped = false
+		case quoted && r == '\\':
+			escaped = true
+		case r == '"':
+			quoted = !quoted
+		case r == ',' && !quoted:
+			entries = append(entries, current.String())
+			current.Reset()
+			continue
+		}
+		current.WriteRune(r)
+	}
+	if quoted {
+		return strings.Split(raw, ",")
+	}
+	return append(entries, current.String())
+}
+
+// unquoteHeaderValue removes the double quotes around a header value and resolves \" and \\
+// inside them; other values are returned unchanged.
+func unquoteHeaderValue(value string) string {
+	if len(value) < 2 || value[0] != '"' || value[len(value)-1] != '"' {
+		return value
+	}
+	var out strings.Builder
+	escaped := false
+	for _, r := range value[1 : len(value)-1] {
+		if r == '\\' && !escaped {
+			escaped = true
+			continue
+		}
+		escaped = false
+		out.WriteRune(r)
+	}
+	return out.String()
 }
 
 func isValidHostname(hostname string) bool {

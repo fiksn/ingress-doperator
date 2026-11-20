@@ -57,6 +57,7 @@ const (
 	ingressAnnotationPrefix      = "ingress.kubernetes.io/"
 	maxK8sNameLength             = 253
 	schemeHTTPS                  = "https"
+	nginxInternalDirective       = "internal;"
 )
 
 const (
@@ -108,6 +109,9 @@ type AuthInputs struct {
 	// ProxySetHeaders holds headers resolved from the auth-proxy-set-headers
 	// ConfigMap, forwarded to the external auth service on the subrequest.
 	ProxySetHeaders map[string]string
+	// DNSResolver tells that NGINX has a resolver (NGINX Gateway Fabric's NginxProxy
+	// dnsResolver), so snippets may proxy to hosts resolved per request (mirror-target).
+	DNSResolver bool
 }
 
 var nginxIngressDirectiveWhitelist = map[string]struct{}{
@@ -558,7 +562,13 @@ func BuildNginxIngressSnippets(
 	authHTTP, authServer, authLocation, authWarnings := buildAuthRequestConfig(state.auth, auth)
 	warnings = append(warnings, authWarnings...)
 	id := sanitizeNginxIdentifier(auth.Identifier)
-	authLines := authSnippetLines{http: authHTTP, server: authServer, location: authLocation}
+	mirrorServer, mirrorLocation, mirrorWarnings := buildMirrorConfig(state.mirror, auth.DNSResolver, id)
+	warnings = append(warnings, mirrorWarnings...)
+	authLines := authSnippetLines{
+		http:     authHTTP,
+		server:   append(authServer, mirrorServer...),
+		location: append(authLocation, mirrorLocation...),
+	}
 	snippets := buildNginxSnippetBlocks(state, lines, authLines, id)
 
 	if len(snippets) == 0 {
@@ -596,6 +606,7 @@ type nginxIngressSnippetState struct {
 	rewriteTarget         string
 	useRegex              bool
 	auth                  authState
+	mirror                mirrorState
 	warnings              []string
 }
 
@@ -661,7 +672,7 @@ func ingestNginxIngressAnnotations(
 }
 
 func applyIngressAnnotationValue(state *nginxIngressSnippetState, suffix, value string) bool {
-	if applyAuthIngressAnnotationValue(state, suffix, value) {
+	if applyAuthIngressAnnotationValue(state, suffix, value) || applyMirrorIngressAnnotationValue(state, suffix, value) {
 		return true
 	}
 
@@ -1143,7 +1154,7 @@ func buildAuthSignin(auth authState, id string) (locationLine, serverBlock strin
 	}
 	signinLoc := "@doperator_signin_" + id
 	locationLine = fmt.Sprintf("error_page 401 = %s;", signinLoc)
-	lines := append([]string{"internal;"}, authProxyBufferLines...)
+	lines := append([]string{nginxInternalDirective}, authProxyBufferLines...)
 	lines = append(lines, fmt.Sprintf("return 302 %s;", signin))
 	serverBlock = fmt.Sprintf("location %s {\n    %s\n}", signinLoc, strings.Join(lines, "\n    "))
 	return locationLine, serverBlock, warnings
@@ -1153,7 +1164,7 @@ func buildAuthLocationBlock(
 	auth authState, inputs AuthInputs, parsed *url.URL, id string,
 ) (block string, httpLines, warnings []string) {
 	lines := []string{
-		"internal;",
+		nginxInternalDirective,
 		"proxy_pass_request_body off;",
 		"proxy_set_header Content-Length \"\";",
 		"proxy_set_header X-Original-URL $scheme://$http_host$request_uri;",

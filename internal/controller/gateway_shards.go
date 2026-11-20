@@ -255,7 +255,16 @@ func (r *IngressReconciler) applyGatewaySharding(
 	gatewayName string,
 	httpRoutes []*gatewayv1.HTTPRoute,
 ) (string, error) {
-	if !r.GatewaySharding || r.wantsDedicatedGateway(ingress) {
+	if r.wantsDedicatedGateway(ingress) {
+		return gatewayName, nil
+	}
+	if pinned, ok := r.pinnedGatewayShard(ingress, gatewayName); ok {
+		for _, httpRoute := range httpRoutes {
+			setParentGateway(httpRoute, pinned)
+		}
+		return pinned, nil
+	}
+	if !r.GatewaySharding {
 		return gatewayName, nil
 	}
 	var hostnames []gatewayv1.Hostname
@@ -272,6 +281,24 @@ func (r *IngressReconciler) applyGatewaySharding(
 		setParentGateway(httpRoute, shard)
 	}
 	return shard, nil
+}
+
+// pinnedGatewayShard returns the Gateway the GatewayShardAnnotation pins the Ingress to: the shared
+// Gateway base itself or one of its shards (<base>-2, <base>-3, ...), which is created if it does
+// not exist. Any other value is ignored with a warning, so a route cannot be moved to the Gateway of
+// another ingress class.
+func (r *IngressReconciler) pinnedGatewayShard(ingress *networkingv1.Ingress, base string) (string, bool) {
+	pinned := strings.TrimSpace(ingress.Annotations[GatewayShardAnnotation])
+	if pinned == "" {
+		return "", false
+	}
+	if gatewayShardIndex(base, pinned) == 0 {
+		r.recordWarning(ingress, "GatewayShardIgnored", fmt.Sprintf(
+			"%s %q is not Gateway %s or one of its shards (%s-2, %s-3, ...); ignoring it",
+			GatewayShardAnnotation, pinned, base, base, base))
+		return "", false
+	}
+	return pinned, true
 }
 
 // setParentGateway points every parentRef of httpRoute at the Gateway name.

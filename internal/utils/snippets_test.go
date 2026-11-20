@@ -451,3 +451,110 @@ func TestBuildNginxIngressSnippets_ValidatesProxyBuffersNumber(t *testing.T) {
 		t.Errorf("missing warning for proxy-buffers-number; warnings: %v", warnings)
 	}
 }
+
+func mirrorSnippets(t *testing.T, annotations map[string]string, dnsResolver bool) (location, server string, warnings []string) {
+	t.Helper()
+	full := map[string]string{}
+	for key, value := range annotations {
+		full[authPrefix+key] = value
+	}
+	snippets, warnings, _ := BuildNginxIngressSnippets(full, AuthInputs{Identifier: "x", DNSResolver: dnsResolver}, nil)
+	return snippetValue(snippets, "http.server.location"), snippetValue(snippets, "http.server"), warnings
+}
+
+func TestBuildNginxIngressSnippets_MirrorNeedsResolver(t *testing.T) {
+	location, server, warnings := mirrorSnippets(t, map[string]string{"mirror-target": "https://mirror.example.com$request_uri"}, false)
+
+	if strings.Contains(location+server, "mirror") {
+		t.Errorf("mirror translated without a resolver:\n%s\n%s", location, server)
+	}
+	if !containsWarning(warnings, "--external-name-services=allow") {
+		t.Errorf("missing warning pointing to --external-name-services=allow: %v", warnings)
+	}
+}
+
+func TestBuildNginxIngressSnippets_Mirror(t *testing.T) {
+	location, server, warnings := mirrorSnippets(t, map[string]string{"mirror-target": "https://mirror.example.com:8443$request_uri"}, true)
+
+	if len(warnings) != 0 {
+		t.Errorf("unexpected warnings: %v", warnings)
+	}
+	if !strings.Contains(location, "mirror /_doperator_mirror_x;") || strings.Contains(location, "mirror_request_body") {
+		t.Errorf("location does not mirror to the internal location (with body):\n%s", location)
+	}
+	for _, want := range []string{
+		"location = /_doperator_mirror_x {",
+		"internal;",
+		"set $doperator_mirror_x https://mirror.example.com:8443$request_uri;",
+		"proxy_set_header Host mirror.example.com:8443;",
+		"proxy_ssl_server_name on;",
+		"proxy_ssl_name mirror.example.com;",
+		"proxy_pass $doperator_mirror_x;",
+	} {
+		if !strings.Contains(server, want) {
+			t.Errorf("server snippet does not contain %q:\n%s", want, server)
+		}
+	}
+	if strings.Contains(server, "proxy_pass http") {
+		t.Errorf("target proxied by literal URL, which NGINX resolves at load time:\n%s", server)
+	}
+}
+
+func TestBuildNginxIngressSnippets_MirrorWithoutBody(t *testing.T) {
+	location, server, _ := mirrorSnippets(t, map[string]string{
+		"mirror-target":       "http://mirror.example.com/copy",
+		"mirror-request-body": "off",
+	}, true)
+
+	if !strings.Contains(location, "mirror_request_body off;") {
+		t.Errorf("location does not disable mirroring the body:\n%s", location)
+	}
+	for _, want := range []string{"proxy_pass_request_body off;", "proxy_set_header Content-Length \"\";"} {
+		if !strings.Contains(server, want) {
+			t.Errorf("server snippet does not contain %q:\n%s", want, server)
+		}
+	}
+	if strings.Contains(server, "proxy_ssl") {
+		t.Errorf("http target got TLS settings:\n%s", server)
+	}
+}
+
+func TestBuildNginxIngressSnippets_MirrorRejectsUnsafeTargets(t *testing.T) {
+	for _, target := range []string{
+		"$scheme://mirror.example.com",
+		"https://$host/copy",
+		"ftp://mirror.example.com",
+		"mirror.example.com",
+		"https://mirror.example.com/a;b",
+		"https://mirror.example.com/\"x",
+		"https://mirror example.com",
+		"https://",
+		"https://user@mirror.example.com/copy",
+		"https://-bad.example.com",
+	} {
+		t.Run(target, func(t *testing.T) {
+			location, server, warnings := mirrorSnippets(t, map[string]string{"mirror-target": target}, true)
+
+			if strings.Contains(location+server, "mirror") {
+				t.Errorf("unsafe target %q translated:\n%s\n%s", target, location, server)
+			}
+			if len(warnings) == 0 {
+				t.Errorf("no warning for target %q", target)
+			}
+		})
+	}
+}
+
+func TestBuildNginxIngressSnippets_MirrorInvalidBodyKeepsBody(t *testing.T) {
+	location, _, warnings := mirrorSnippets(t, map[string]string{
+		"mirror-target":       "http://mirror.example.com",
+		"mirror-request-body": "maybe",
+	}, true)
+
+	if !strings.Contains(location, "mirror /_doperator_mirror_x;") || strings.Contains(location, "mirror_request_body off") {
+		t.Errorf("expected mirroring with body:\n%s", location)
+	}
+	if !containsWarning(warnings, "mirror-request-body") {
+		t.Errorf("missing warning for invalid mirror-request-body: %v", warnings)
+	}
+}

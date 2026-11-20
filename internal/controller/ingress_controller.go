@@ -57,6 +57,7 @@ const (
 	IngressRemovedAnnotation                 = "ingress-doperator.fiction.si/removed"
 	IgnoreIngressAnnotation                  = "ingress-doperator.fiction.si/ignore-ingress"
 	ShadowExternalDNSAnnotation              = "ingress-doperator.fiction.si/shadow-external-dns"
+	GatewayShardAnnotation                   = "ingress-doperator.fiction.si/gateway-shard"
 	annotationTrue                           = "true"
 	OriginalIngressClassAnnotation           = "ingress-doperator.fiction.si/original-ingress-class"
 	OriginalIngressClassNameAnnotation       = "ingress-doperator.fiction.si/original-ingress-classname"
@@ -365,10 +366,7 @@ func (r *IngressReconciler) reconcileIngressToHTTPRoute(
 	singleTrans := translator.New(transConfig)
 
 	if skipped, err := r.skipForExternalNameBackends(ctx, ingress); err != nil || skipped {
-		if err != nil {
-			return ctrl.Result{}, err
-		}
-		return ctrl.Result{RequeueAfter: externalNameRetryInterval}, nil
+		return skippedResult(err, externalNameRetryInterval)
 	}
 
 	// Translate to HTTPRoutes (we no longer create Gateway here)
@@ -403,6 +401,10 @@ func (r *IngressReconciler) reconcileIngressToHTTPRoute(
 	var httpRoutes []*gatewayv1.HTTPRoute
 	for _, route := range routes {
 		httpRoutes = append(httpRoutes, r.HTTPRouteManager.SplitHTTPRouteIfNeeded(route)...)
+	}
+
+	if skipped, err := r.skipForFullGateway(ctx, gatewayName, ingress, httpRoutes); err != nil || skipped {
+		return skippedResult(err, requeueAfterError)
 	}
 
 	// Apply all HTTPRoute(s) with proper cleanup of obsolete split routes
@@ -478,6 +480,15 @@ func (r *IngressReconciler) reconcileIngressToHTTPRoute(
 
 	r.recordNormal(ingress, "ReconcileSuccess", "Ingress reconciled to HTTPRoute successfully")
 	return ctrl.Result{}, nil
+}
+
+// skippedResult is the reconcile result for an Ingress a guard did not translate: the guard's error,
+// or a retry after retryAfter.
+func skippedResult(err error, retryAfter time.Duration) (ctrl.Result, error) {
+	if err != nil {
+		return ctrl.Result{}, err
+	}
+	return ctrl.Result{RequeueAfter: retryAfter}, nil
 }
 
 // translateIngressRoutes translates the Ingress, with its canary siblings folded in, into the
@@ -1211,7 +1222,8 @@ func (r *IngressReconciler) buildAuthInputs(
 	ingress *networkingv1.Ingress,
 ) utils.AuthInputs {
 	inputs := utils.AuthInputs{
-		Identifier: utils.AuthIdentifier(ingress.Namespace, ingress.Name),
+		Identifier:  utils.AuthIdentifier(ingress.Namespace, ingress.Name),
+		DNSResolver: r.AllowExternalNameServices,
 	}
 	if ingress.Annotations == nil {
 		return inputs

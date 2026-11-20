@@ -174,7 +174,7 @@ spec:
     spec:
       containers:
       - name: webhook
-        image: fiksn/ingress-doperator-webhook:v0.1.7
+        image: fiksn/ingress-doperator-webhook:v0.1.8
         imagePullPolicy: Always
         command:
           - /webhook
@@ -384,6 +384,27 @@ Notes and limitations:
   does not read the ConfigMap). Editing the referenced ConfigMap does not by
   itself re-trigger reconciliation — touch the Ingress to apply header changes.
 
+### Header annotations
+
+These ingress-doperator annotations become Gateway API header filters on every rule of the
+Ingress's HTTPRoutes:
+
+| Annotation | Filter |
+|------------|--------|
+| `ingress-doperator.fiction.si/request-header-add` / `request-header-set` / `request-header-remove` | `RequestHeaderModifier` `add` / `set` / `remove` |
+| `ingress-doperator.fiction.si/response-header-add` / `response-header-set` / `response-header-remove` | `ResponseHeaderModifier` `add` / `set` / `remove` |
+
+`add` and `set` take comma-separated `Name=Value` entries (only the first `=` separates name and
+value, so base64 padding is kept); `remove` takes comma-separated names. A value containing commas
+goes in double quotes, with `\"` and `\\` escaping a quote and a backslash:
+
+```yaml
+ingress-doperator.fiction.si/response-header-set: 'X-Robots-Tag="noindex, nofollow",X-Env=prod'
+```
+
+NGINX Gateway Fabric rejects header values containing a double quote, and the request header names
+`Host`, `Connection` and `Upgrade`.
+
 ### Upstream Host header (`upstream-vhost`)
 
 `nginx.ingress.kubernetes.io/upstream-vhost` becomes a `URLRewrite` filter with `hostname` on
@@ -485,6 +506,34 @@ nginx:
 ```
 
 run the operator with `--external-name-services=allow` (Helm: `operator.externalNameServices: allow`).
+The setting then means "NGINX Gateway Fabric has a DNS resolver" and also enables request mirroring
+(see below).
+
+### Request mirroring (`mirror-target`)
+
+With `--external-name-services=allow`, `nginx.ingress.kubernetes.io/mirror-target` (an `http(s)` URL
+with a plain host, e.g. `https://mirror.example.com$request_uri`) and `mirror-request-body: "off"`
+are translated into the Ingress's SnippetsFilter, like ingress-nginx does it:
+
+```nginx
+# location
+mirror /_doperator_mirror_<id>;
+# server
+location = /_doperator_mirror_<id> {
+    internal;
+    set $doperator_mirror_<id> https://mirror.example.com$request_uri;
+    proxy_set_header Host mirror.example.com;
+    proxy_ssl_server_name on;
+    proxy_ssl_name mirror.example.com;
+    proxy_pass $doperator_mirror_<id>;
+}
+```
+
+The target is proxied through a variable, so NGINX resolves its host per request with NGINX Gateway
+Fabric's resolver instead of when loading the configuration, where an unresolvable host would
+reject the whole Gateway's configuration. Without the resolver (the default `skip`), and for targets
+with a variable host, quotes or `;`, the annotations are ignored with a `SnippetAnnotationWarning`
+event.
 
 ### Canary traffic splitting
 
@@ -726,8 +775,9 @@ The operator accepts the following command-line flags:
                                               (default: "" - all Ingresses use shared Gateways)
 --gateway-sharding                            Spill shared Gateways over to <name>-2, <name>-3, ... when they
                                               reach the 64-listener limit (default: false)
---external-name-services string               skip or allow Ingresses routing to ExternalName Services; see
-                                              "ExternalName backends" (default: "skip")
+--external-name-services string               allow once NGINX Gateway Fabric has a DNS resolver: translates
+                                              ExternalName backends and mirror-target; see "ExternalName
+                                              backends" (default: "skip")
 --http-redirect                               Add a catch-all port 80 listener redirecting HTTP to HTTPS; hosts
                                               served over plain HTTP by ingress-nginx are served on it
                                               (default: false)
@@ -840,9 +890,10 @@ HTTPRoute's listeners live on is tracked in the
 ### Listener Limit and Gateway Sharding
 
 Gateway API allows at most 64 listeners per Gateway, and the operator creates one listener per
-hostname. When a Gateway is full, the operator adds the listeners that fit and records a
-`GatewayListenerLimit` warning event on the Ingress listing the hostnames left without a
-listener.
+hostname. Before updating an Ingress's HTTPRoutes, the operator checks that the Gateway can take
+every listener they need. If it cannot, the HTTPRoutes are not created or updated (existing ones
+keep working as they are), the Ingress gets a `GatewayListenerLimit` warning event listing the
+hostnames without room, and it is retried every 30 seconds.
 
 With `--gateway-sharding`, shared Gateways spill over instead:
 
@@ -862,6 +913,21 @@ With `--gateway-sharding`, shared Gateways spill over instead:
   moves to another shard changes the address its hostnames resolve to.
 - Gateways named like a shard but not managed by ingress-doperator are skipped.
 - Dedicated Gateways (`--one-gateway-per-ingress`) are not sharded.
+
+**Moving an Ingress to a shard manually:** annotate it with the Gateway to use, which must be the
+Ingress's own shared Gateway or one of its shards (it is created if it does not exist yet). This
+works with and without `--gateway-sharding` and bypasses the automatic selection; any other value
+is ignored with a `GatewayShardIgnored` warning:
+
+```yaml
+metadata:
+  annotations:
+    ingress-doperator.fiction.si/gateway-shard: traefik-public-2
+```
+
+The hostnames then move to that Gateway and its load balancer address. The
+`ingress-doperator.fiction.si/listener-gateway` annotation on HTTPRoutes is internal bookkeeping;
+changing it does not move a route.
 
 ### Wildcard Listeners
 
@@ -1313,7 +1379,7 @@ left uncommitted; commit and tag it yourself.
 **Build and push your image to the location specified by `IMG`:**
 
 ```sh
-make docker-build docker-push IMG=fiksn/ingress-doperator:v0.1.7
+make docker-build docker-push IMG=fiksn/ingress-doperator:v0.1.8
 ```
 
 **NOTE:** This image ought to be published in the personal registry you specified.
@@ -1372,7 +1438,7 @@ Following the options to release and provide this solution to the users.
 1. Build the installer for the image built and published in the registry:
 
 ```sh
-make build-installer IMG=fiksn/ingress-doperator:v0.1.7
+make build-installer IMG=fiksn/ingress-doperator:v0.1.8
 ```
 
 **NOTE:** The makefile target mentioned above generates an 'install.yaml'

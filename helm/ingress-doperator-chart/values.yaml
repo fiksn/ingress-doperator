@@ -5,7 +5,7 @@ replicaCount: 1
 image:
   repository: fiksn/ingress-doperator
   pullPolicy: IfNotPresent
-  tag: v0.1.7
+  tag: v0.1.8
 
 imagePullSecrets: []
 nameOverride: ""
@@ -80,10 +80,11 @@ operator:
   # <name>-2, <name>-3, ... Each extra Gateway gets its own load balancer.
   gatewaySharding: false
 
-  # What to do with Ingresses routing to Services of type ExternalName: "skip" (do not translate
-  # them, emit a warning event) or "allow" (translate them). NGINX Gateway Fabric only supports
-  # ExternalName Services with a DNS resolver in its NginxProxy (spec.dnsResolver); without one,
-  # a single such route breaks the configuration of the whole Gateway.
+  # Whether NGINX Gateway Fabric has a DNS resolver in its NginxProxy (spec.dnsResolver).
+  # "skip" (no resolver): Ingresses routing to Services of type ExternalName are not translated
+  # and nginx.ingress.kubernetes.io/mirror-target is ignored, both with warning events.
+  # "allow" (resolver configured): both are translated. Without a resolver, a single ExternalName
+  # route breaks the configuration of the whole Gateway.
   externalNameServices: skip
 
   # Comma-separated '*.<domain>=<namespace>/<secret>' entries: hostnames one label below <domain>

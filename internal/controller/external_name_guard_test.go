@@ -120,3 +120,17 @@ func TestExternalNameBackend_InCanarySibling(t *testing.T) {
 		t.Errorf("primary with an ExternalName canary backend was translated (result %+v)", result)
 	}
 }
+
+// TestBuildAuthInputs_DNSResolverFollowsExternalNameServices checks that
+// --external-name-services=allow, which asserts a DNS resolver in NGINX Gateway Fabric, also
+// enables snippets that need one (mirror-target).
+func TestBuildAuthInputs_DNSResolverFollowsExternalNameServices(t *testing.T) {
+	ingress := multiHostIngress(hostRule(consoleHost, ingressPath("/", networkingv1.PathTypePrefix, "web", numberedPort(80))))
+	for _, allow := range []bool{false, true} {
+		r := newTranslationReconciler(t, ingress)
+		r.AllowExternalNameServices = allow
+		if got := r.buildAuthInputs(context.Background(), ingress).DNSResolver; got != allow {
+			t.Errorf("AllowExternalNameServices=%v: DNSResolver = %v", allow, got)
+		}
+	}
+}
