@@ -25,6 +25,7 @@ import (
 
 	corev1 "k8s.io/api/core/v1"
 	networkingv1 "k8s.io/api/networking/v1"
+	apiextensionsv1 "k8s.io/apiextensions-apiserver/pkg/apis/apiextensions/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
@@ -138,6 +139,7 @@ func newTranslationReconciler(t *testing.T, objs ...client.Object) *IngressRecon
 	scheme := runtime.NewScheme()
 	for _, add := range []func(*runtime.Scheme) error{
 		corev1.AddToScheme, networkingv1.AddToScheme, gatewayv1.Install, gatewayv1beta1.Install,
+		apiextensionsv1.AddToScheme,
 	} {
 		if err := add(scheme); err != nil {
 			t.Fatalf("failed to build scheme: %v", err)

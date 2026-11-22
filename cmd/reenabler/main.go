@@ -373,7 +373,12 @@ func processIngress(
 		if err := removeManagedHTTPRoutes(ctx, manager, ingress); err != nil {
 			return err
 		}
-		if err := removeAutomaticSnippetsFilter(ctx, cli, ingress); err != nil {
+		if err := removeAutomaticFilter(ctx, cli, ingress, utils.SnippetsFilterKind,
+			utils.SnippetsFilterCRDName, utils.AutomaticSnippetsFilterName(ingress.Name)); err != nil {
+			return err
+		}
+		if err := removeAutomaticFilter(ctx, cli, ingress, utils.AuthenticationFilterKind,
+			utils.AuthenticationFilterCRDName, utils.BasicAuthFilterName(ingress.Name)); err != nil {
 			return err
 		}
 		if err := removeManagedGatewaysIfEmpty(ctx, cli, ingress); err != nil {
@@ -1031,12 +1036,18 @@ func parentRefKey(defaultNamespace string, ref gatewayv1.ParentReference) (strin
 	return fmt.Sprintf("%s/%s", namespace, ref.Name), true
 }
 
-func removeAutomaticSnippetsFilter(ctx context.Context, cli client.Client, ingress *networkingv1.Ingress) error {
+// removeAutomaticFilter deletes the NGINX Gateway Fabric filter of the given kind that
+// ingress-doperator generated for the Ingress, if it exists.
+func removeAutomaticFilter(
+	ctx context.Context,
+	cli client.Client,
+	ingress *networkingv1.Ingress,
+	kind, crdName, filterName string,
+) error {
 	if ingress == nil {
 		return nil
 	}
-	filterName := utils.AutomaticSnippetsFilterName(ingress.Name)
-	version, ok, err := utils.GetCRDVersion(ctx, cli, utils.SnippetsFilterCRDName)
+	version, ok, err := utils.GetCRDVersion(ctx, cli, crdName)
 	if err != nil || !ok {
 		return err
 	}
@@ -1044,7 +1055,7 @@ func removeAutomaticSnippetsFilter(ctx context.Context, cli client.Client, ingre
 	filter.SetGroupVersionKind(schema.GroupVersionKind{
 		Group:   utils.NginxGatewayGroup,
 		Version: version,
-		Kind:    utils.SnippetsFilterKind,
+		Kind:    kind,
 	})
 	if err := cli.Get(ctx, client.ObjectKey{Namespace: ingress.Namespace, Name: filterName}, filter); err != nil {
 		if apierrors.IsNotFound(err) {

@@ -109,7 +109,7 @@ func parseMirrorTarget(target string) (scheme, host string, ok bool) {
 		return "", "", false
 	}
 	scheme, rest, found := strings.Cut(target, "://")
-	if !found || (scheme != "http" && scheme != schemeHTTPS) {
+	if !found || (scheme != schemeHTTP && scheme != schemeHTTPS) {
 		return "", "", false
 	}
 	host = rest

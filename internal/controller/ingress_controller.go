@@ -368,6 +368,10 @@ func (r *IngressReconciler) reconcileIngressToHTTPRoute(
 	if skipped, err := r.skipForExternalNameBackends(ctx, ingress); err != nil || skipped {
 		return skippedResult(err, externalNameRetryInterval)
 	}
+	basicAuthFilter, skipped, err := r.prepareBasicAuth(ctx, ingress)
+	if err != nil || skipped {
+		return skippedResult(err, basicAuthRetryInterval)
+	}
 
 	// Translate to HTTPRoutes (we no longer create Gateway here)
 	routes, unresolvedPorts := r.translateIngressRoutes(ctx, ingress, singleTrans)
@@ -385,13 +389,10 @@ func (r *IngressReconciler) reconcileIngressToHTTPRoute(
 		return ctrl.Result{RequeueAfter: r.namedPortBackoff.next(ingressKey)}, nil
 	}
 	r.namedPortBackoff.reset(ingressKey)
-	if effectiveMode == IngressPostProcessingModeShadowExternalDNS {
-		for _, route := range routes {
-			ShadowExternalDNS(route)
-		}
-	}
+	requireBasicAuth(routes, basicAuthFilter)
+	shadowExternalDNSIfRequested(routes, effectiveMode)
 
-	gatewayName, err := r.applyGatewaySharding(ctx, ingress, gatewayName, routes)
+	gatewayName, err = r.applyGatewaySharding(ctx, ingress, gatewayName, routes)
 	if err != nil {
 		logger.Error(err, "failed to select Gateway shard")
 		return ctrl.Result{}, err
@@ -484,6 +485,16 @@ func (r *IngressReconciler) reconcileIngressToHTTPRoute(
 
 // skippedResult is the reconcile result for an Ingress a guard did not translate: the guard's error,
 // or a retry after retryAfter.
+// shadowExternalDNSIfRequested applies ShadowExternalDNS to the routes in the shadow-external-dns mode.
+func shadowExternalDNSIfRequested(routes []*gatewayv1.HTTPRoute, mode IngressPostProcessingMode) {
+	if mode != IngressPostProcessingModeShadowExternalDNS {
+		return
+	}
+	for _, route := range routes {
+		ShadowExternalDNS(route)
+	}
+}
+
 func skippedResult(err error, retryAfter time.Duration) (ctrl.Result, error) {
 	if err != nil {
 		return ctrl.Result{}, err

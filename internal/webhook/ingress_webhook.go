@@ -110,6 +110,15 @@ func (m *IngressMutator) Handle(ctx context.Context, req admission.Request) admi
 		return admission.Allowed("canary handled by operator")
 	}
 
+	// Basic authentication needs a generated AuthenticationFilter, and when it cannot be translated
+	// the Ingress must get no HTTPRoute rather than one without authentication; the operator does
+	// both, so the Ingress is let through untranslated.
+	if utils.RequestsAuthentication(ingress.Annotations) {
+		logger.Info("Ingress uses ingress-nginx authentication, deferring to the operator",
+			"namespace", ingress.Namespace, "name", ingress.Name)
+		return admission.Allowed("authentication handled by operator")
+	}
+
 	// Check if this Ingress should be allowed to be created (for compatibility)
 	allowIngress := false
 	if ingress.Annotations != nil && ingress.Annotations[AllowIngressAnnotation] == fmt.Sprintf("%t", true) {

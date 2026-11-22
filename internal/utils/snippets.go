@@ -56,6 +56,7 @@ const (
 	nginxIngressAnnotationPrefix = "nginx.ingress.kubernetes.io/"
 	ingressAnnotationPrefix      = "ingress.kubernetes.io/"
 	maxK8sNameLength             = 253
+	schemeHTTP                   = "http"
 	schemeHTTPS                  = "https"
 	nginxInternalDirective       = "internal;"
 )
@@ -564,12 +565,21 @@ func BuildNginxIngressSnippets(
 	id := sanitizeNginxIdentifier(auth.Identifier)
 	mirrorServer, mirrorLocation, mirrorWarnings := buildMirrorConfig(state.mirror, auth.DNSResolver, id)
 	warnings = append(warnings, mirrorWarnings...)
-	authLines := authSnippetLines{
-		http:     authHTTP,
-		server:   append(authServer, mirrorServer...),
-		location: append(authLocation, mirrorLocation...),
+	corsLocation, corsWarnings := buildCORSConfig(state.cors, id)
+	warnings = append(warnings, corsWarnings...)
+	limitHTTP, limitLocation, limitWarnings := buildRateLimitConfig(state.rateLimit, id)
+	warnings = append(warnings, limitWarnings...)
+	redirectServer, redirectLocation, redirectWarnings := buildRedirectConfig(state.redirect)
+	warnings = append(warnings, redirectWarnings...)
+	extra := extraSnippetLines{
+		http:   append(authHTTP, limitHTTP...),
+		server: append(append(redirectServer, authServer...), mirrorServer...),
+		// CORS preflight answers and redirects come before the other rewrite-phase directives
+		// (force-ssl-redirect), as in ingress-nginx.
+		leadingLocation: append(corsLocation, redirectLocation...),
+		location:        append(append(limitLocation, authLocation...), mirrorLocation...),
 	}
-	snippets := buildNginxSnippetBlocks(state, lines, authLines, id)
+	snippets := buildNginxSnippetBlocks(state, lines, extra, id)
 
 	if len(snippets) == 0 {
 		return nil, warnings, false
@@ -578,11 +588,13 @@ func BuildNginxIngressSnippets(
 	return snippets, warnings, true
 }
 
-// authSnippetLines groups the auth_request configuration lines by nginx context.
-type authSnippetLines struct {
-	http     []string
-	server   []string
-	location []string
+// extraSnippetLines groups the lines of the multi-directive emulations (auth_request, mirroring,
+// CORS, rate limiting, redirects) by nginx context.
+type extraSnippetLines struct {
+	http            []string
+	server          []string
+	leadingLocation []string
+	location        []string
 }
 
 type nginxIngressSnippetState struct {
@@ -607,6 +619,9 @@ type nginxIngressSnippetState struct {
 	useRegex              bool
 	auth                  authState
 	mirror                mirrorState
+	cors                  corsState
+	rateLimit             rateLimitState
+	redirect              redirectState
 	warnings              []string
 }
 
@@ -671,8 +686,19 @@ func ingestNginxIngressAnnotations(
 	return state
 }
 
+// applyEmulatedIngressAnnotationValue records the inputs of the features emulated with several
+// directives (external auth, mirroring, CORS, rate limiting, redirects). Returns true when it
+// consumes the annotation.
+func applyEmulatedIngressAnnotationValue(state *nginxIngressSnippetState, suffix, value string) bool {
+	return applyAuthIngressAnnotationValue(state, suffix, value) ||
+		applyMirrorIngressAnnotationValue(state, suffix, value) ||
+		applyCORSIngressAnnotationValue(state, suffix, value) ||
+		applyRateLimitIngressAnnotationValue(state, suffix, value) ||
+		applyRedirectIngressAnnotationValue(state, suffix, value)
+}
+
 func applyIngressAnnotationValue(state *nginxIngressSnippetState, suffix, value string) bool {
-	if applyAuthIngressAnnotationValue(state, suffix, value) || applyMirrorIngressAnnotationValue(state, suffix, value) {
+	if applyEmulatedIngressAnnotationValue(state, suffix, value) {
 		return true
 	}
 
@@ -876,14 +902,15 @@ func buildNginxDirectiveLines(state nginxIngressSnippetState) ([]string, []strin
 func buildNginxSnippetBlocks(
 	state nginxIngressSnippetState,
 	lines []string,
-	auth authSnippetLines,
+	extra extraSnippetLines,
 	id string,
 ) []map[string]interface{} {
 	snippets := make([]map[string]interface{}, 0, 3)
-	snippets = appendSnippet(snippets, "http", buildHTTPContextLines(state, auth.http))
-	snippets = appendSnippet(snippets, "http.server", buildServerContextLines(state, auth.server, id))
+	snippets = appendSnippet(snippets, "http", buildHTTPContextLines(state, extra.http))
+	snippets = appendSnippet(snippets, "http.server", buildServerContextLines(state, extra.server, id))
+	location := append(append([]string{}, extra.leadingLocation...), lines...)
 	snippets = appendSnippet(snippets, "http.server.location",
-		buildLocationContextLines(state, lines, auth.location, id))
+		buildLocationContextLines(state, location, extra.location, id))
 	return snippets
 }
 
@@ -1325,7 +1352,7 @@ func validateAuthURL(raw string) (*url.URL, bool) {
 	if err != nil {
 		return nil, false
 	}
-	if parsed.Scheme != "http" && parsed.Scheme != schemeHTTPS {
+	if parsed.Scheme != schemeHTTP && parsed.Scheme != schemeHTTPS {
 		return nil, false
 	}
 	if parsed.Host == "" {
@@ -1353,12 +1380,15 @@ func NginxIngressSnippetWarningAnnotations(annotations map[string]string) []stri
 
 // AutomaticSnippetsFilterName returns a stable name for annotation-based SnippetsFilter resources.
 func AutomaticSnippetsFilterName(ingressName string) string {
-	base := fmt.Sprintf("automatic-%s-annotations", ingressName)
-	if len(base) <= maxK8sNameLength {
-		return base
+	return truncateK8sName(fmt.Sprintf("automatic-%s-annotations", ingressName))
+}
+
+// truncateK8sName shortens name to the maximum length of a Kubernetes object name.
+func truncateK8sName(name string) string {
+	if len(name) <= maxK8sNameLength {
+		return name
 	}
-	trimmed := base[:maxK8sNameLength]
-	return strings.TrimRight(trimmed, "-")
+	return strings.TrimRight(name[:maxK8sNameLength], "-")
 }
 
 // EnsureSnippetsFilterForIngress creates or updates a SnippetsFilter for the given Ingress.
@@ -1374,73 +1404,70 @@ func EnsureSnippetsFilterForIngress(
 	filterName string,
 	snippets []map[string]interface{},
 ) (bool, error) {
-	logger := log.FromContext(ctx)
-	if httpRoute == nil {
+	if httpRoute == nil || len(snippets) == 0 {
 		return false, nil
 	}
-	if len(snippets) == 0 {
-		return false, nil
-	}
-	crdName, ok := snippetsCRDNameForKind(SnippetsFilterKind)
-	if !ok {
-		return false, nil
-	}
-	version, ok, err := getCRDVersion(ctx, c, crdName)
+	version, ok, err := getCRDVersion(ctx, c, SnippetsFilterCRDName)
 	if err != nil || !ok {
 		return false, err
 	}
-
-	gvk := schema.GroupVersionKind{Group: NginxGatewayGroup, Version: version, Kind: SnippetsFilterKind}
 	desired := &unstructured.Unstructured{}
-	desired.SetGroupVersionKind(gvk)
+	desired.SetGroupVersionKind(schema.GroupVersionKind{Group: NginxGatewayGroup, Version: version, Kind: SnippetsFilterKind})
 	desired.SetName(filterName)
 	desired.SetNamespace(httpRoute.Namespace)
+	desired.Object["spec"] = map[string]interface{}{"snippets": snippets}
+	return applyManagedResource(ctx, c, scheme, owner, desired, ingressNamespace+"/"+ingressName)
+}
 
+// applyManagedResource creates desired, or updates it when ingress-doperator manages the existing
+// object, marking it as generated from source and owned by owner (when set). It returns false
+// without changes when an object of that name exists that ingress-doperator does not manage.
+func applyManagedResource(
+	ctx context.Context,
+	c client.Client,
+	scheme *runtime.Scheme,
+	owner client.Object,
+	desired *unstructured.Unstructured,
+	source string,
+) (bool, error) {
+	logger := log.FromContext(ctx)
+	kind, namespace, name := desired.GetKind(), desired.GetNamespace(), desired.GetName()
 	if scheme != nil && owner != nil {
 		if err := controllerutil.SetControllerReference(owner, desired, scheme); err != nil {
 			return false, err
 		}
 	}
-
 	annotations := desired.GetAnnotations()
 	if annotations == nil {
 		annotations = make(map[string]string)
 	}
 	annotations[ManagedByAnnotation] = ManagedByValue
-	annotations[SourceAnnotation] = fmt.Sprintf("%s/%s", ingressNamespace, ingressName)
+	annotations[SourceAnnotation] = source
 	desired.SetAnnotations(annotations)
 
-	desired.Object["spec"] = map[string]interface{}{
-		"snippets": snippets,
-	}
-
 	existing := &unstructured.Unstructured{}
-	existing.SetGroupVersionKind(gvk)
-	err = c.Get(ctx, types.NamespacedName{Namespace: httpRoute.Namespace, Name: filterName}, existing)
-	if err != nil {
-		if apierrors.IsNotFound(err) {
-			logger.Info("Creating SnippetsFilter", "namespace", httpRoute.Namespace, "name", filterName)
-			if err := c.Create(ctx, desired); err != nil {
-				return false, fmt.Errorf("failed to create SnippetsFilter %s/%s: %w", httpRoute.Namespace, filterName, err)
-			}
-			return true, nil
+	existing.SetGroupVersionKind(desired.GroupVersionKind())
+	err := c.Get(ctx, types.NamespacedName{Namespace: namespace, Name: name}, existing)
+	if apierrors.IsNotFound(err) {
+		logger.Info("Creating "+kind, "namespace", namespace, "name", name)
+		if err := c.Create(ctx, desired); err != nil {
+			return false, fmt.Errorf("failed to create %s %s/%s: %w", kind, namespace, name, err)
 		}
+		return true, nil
+	}
+	if err != nil {
 		return false, err
 	}
-
 	if !IsManagedByUs(existing) {
-		logger.Info("SnippetsFilter exists but is not managed by us, skipping",
-			"namespace", httpRoute.Namespace,
-			"name", filterName)
+		logger.Info(kind+" exists but is not managed by us, skipping", "namespace", namespace, "name", name)
 		return false, nil
 	}
-
 	existing.SetAnnotations(desired.GetAnnotations())
 	existing.SetOwnerReferences(desired.GetOwnerReferences())
 	existing.Object["spec"] = desired.Object["spec"]
-	logger.Info("Updating SnippetsFilter", "namespace", httpRoute.Namespace, "name", filterName)
+	logger.Info("Updating "+kind, "namespace", namespace, "name", name)
 	if err := c.Update(ctx, existing); err != nil {
-		return false, fmt.Errorf("failed to update SnippetsFilter %s/%s: %w", httpRoute.Namespace, filterName, err)
+		return false, fmt.Errorf("failed to update %s %s/%s: %w", kind, namespace, name, err)
 	}
 	return true, nil
 }
